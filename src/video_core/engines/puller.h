@@ -78,6 +78,7 @@ public:
         u32 value;
         u32 operation;
         std::chrono::steady_clock::time_point since;
+        std::chrono::steady_clock::time_point last_fences; ///< When it last released fences
         bool reported;
         /// Polls that found the word current but unmet (CanResumeAcquire).
         u32 unmet_polls{};
