@@ -353,7 +353,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     for (const auto& desc : info.storage_buffers_descriptors) {
         ASSERT(desc.count == 1);
         buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
-                                              desc.is_written, desc.indirect_offset);
+                                              desc.is_written, desc.indirect_offset,
+
+                                              desc.write_extent);
         ++ssbo_index;
     }
 
