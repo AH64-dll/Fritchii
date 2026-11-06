@@ -7,6 +7,8 @@
 #pragma once
 
 #include <array>
+#include <utility>
+#include <vector>
 #include "common/container/unordered_map.h"
 
 #include "common/common_types.h"
@@ -89,6 +91,11 @@ public:
     /// a mapped GPU address (a pointer table the program loads its buffer pointer from).
     [[nodiscard]] virtual bool IsCbufIndirectStorageBufferPointer(u32, u32, u32) {
         return true;
+    }
+
+    /// Native programs: (index, offset) slots classified as non-pointers because they were null.
+    [[nodiscard]] virtual std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const {
+        return {};
     }
 
     [[nodiscard]] virtual u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) = 0;
