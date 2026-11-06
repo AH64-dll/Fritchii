@@ -1108,6 +1108,8 @@ ComputePipeline* ComputePipelineCacheEntry::Get(bool native, GPUVAddr address,
     return pipeline.get();
 }
 
+constexpr u32 MaxComputeRebuilds = 4;
+
 bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const {
     const auto& qmd{kepler_compute->launch_description};
     for (const auto& [index, offset] : entry.null_pointer_slots) {
@@ -1152,15 +1154,23 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     auto& entry{pair->second};
     if (is_new) {
         entry = CreateComputePipeline(key, shader);
-    } else if (!entry.null_pointer_slots.empty() && entry.rebuilds < 4 &&
+    } else if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
                StaleNullPointerSlot(entry)) {
         // The translation dropped accesses through a pointer that was null back then.
-        if (entry.pipeline) {
-            retired_compute_pipelines.push_back(std::move(entry.pipeline));
+        auto rebuilt{CreateComputePipeline(key, shader)};
+        if (rebuilt.pipeline) {
+            if (entry.pipeline) {
+                retired_compute_pipelines.push_back(std::move(entry.pipeline));
+            }
+            rebuilt.rebuilds = entry.rebuilds + 1;
+            entry = std::move(rebuilt);
+        } else {
+            // Keep the working translation when the new one cannot be built (for example a
+            // narrow access that now stays global across two buffers), and stop retrying.
+            LOG_WARNING(Render_Vulkan, "Keeping compute shader {:016x}: rebuild failed: {}",
+                        key.unique_hash, rebuilt.failure);
+            entry.rebuilds = MaxComputeRebuilds;
         }
-        const u32 rebuilds = entry.rebuilds + 1;
-        entry = CreateComputePipeline(key, shader);
-        entry.rebuilds = rebuilds;
     }
     return entry.Get(kepler_compute->IsNativeMode(),
                      kepler_compute->regs.code_loc.Address() + qmd.program_start, key);
@@ -1265,14 +1275,20 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             std::scoped_lock lock{state.mutex};
             if (entry.pipeline) {
                 // A rebuilt translation is cached beside the stale one. Keep the one that binds
-                // more pointers; on a tie keep the earlier entry, as before.
+                // more pointers; on a tie keep the earlier entry, as before. An entry built at run
+                // time before a cache reload stays (marked with the largest order).
+                constexpr size_t runtime_entry = ~size_t{0};
                 auto [it, inserted]{state.compute_order.try_emplace(key, order)};
                 const auto current{compute_cache.find(key)};
+                if (inserted && current != compute_cache.end()) {
+                    it->second = runtime_entry;
+                }
                 const bool replace =
-                    inserted || current == compute_cache.end() ||
-                    entry.mapped_pointers > current->second.mapped_pointers ||
-                    (entry.mapped_pointers == current->second.mapped_pointers &&
-                     order < it->second);
+                    it->second != runtime_entry &&
+                    (current == compute_cache.end() || inserted ||
+                     entry.mapped_pointers > current->second.mapped_pointers ||
+                     (entry.mapped_pointers == current->second.mapped_pointers &&
+                      order < it->second));
                 if (replace) {
                     it->second = order;
                     compute_cache.insert_or_assign(key, std::move(entry));
