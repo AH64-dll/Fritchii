@@ -1257,9 +1257,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         size_t built{};
         bool has_loaded{};
         std::unique_ptr<PipelineStatistics> statistics;
-        size_t compute_entries{};
-        ::Common::unordered_map<ComputePipelineCacheKey, size_t> compute_order;
     } state;
+    // A rebuilt translation is cached beside the stale one. Choose between them before building, so
+    // loading only ever adds entries: the one that binds more pointers first, on a tie the earlier
+    // one, and the next when a translation fails.
+    ::Common::unordered_map<ComputePipelineCacheKey, std::vector<FileEnvironment>> compute_envs;
 
     if (device.IsKhrPipelineExecutablePropertiesEnabled()) {
         state.statistics = std::make_unique<PipelineStatistics>(device);
@@ -1267,32 +1269,28 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
         ComputePipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
-
-        const size_t order{state.compute_entries++};
-        workers.QueueWork([this, key, order, env_ = std::move(env), &state, &callback]() mutable {
+        auto& candidates{compute_envs[key]};
+        const auto position{std::ranges::find_if(candidates, [&](const FileEnvironment& other) {
+            return env.MappedStoragePointerCount() > other.MappedStoragePointerCount();
+        })};
+        candidates.insert(position, std::move(env));
+    }};
+    const auto queue_compute{[&](const ComputePipelineCacheKey& key,
+                                 std::vector<FileEnvironment> candidates) {
+        workers.QueueWork([this, key, envs_ = std::move(candidates), &state,
+                           &callback]() mutable {
             ShaderPools pools;
-            auto entry{CreateComputePipeline(pools, key, env_, state.statistics.get(), false)};
+            ComputePipelineCacheEntry entry;
+            for (auto& env : envs_) {
+                pools.ReleaseContents();
+                entry = CreateComputePipeline(pools, key, env, state.statistics.get(), false);
+                if (entry.pipeline) {
+                    break;
+                }
+            }
             std::scoped_lock lock{state.mutex};
             if (entry.pipeline) {
-                // A rebuilt translation is cached beside the stale one. Keep the one that binds
-                // more pointers; on a tie keep the earlier entry, as before. An entry built at run
-                // time before a cache reload stays (marked with the largest order).
-                constexpr size_t runtime_entry = ~size_t{0};
-                auto [it, inserted]{state.compute_order.try_emplace(key, order)};
-                const auto current{compute_cache.find(key)};
-                if (inserted && current != compute_cache.end()) {
-                    it->second = runtime_entry;
-                }
-                const bool replace =
-                    it->second != runtime_entry &&
-                    (current == compute_cache.end() || inserted ||
-                     entry.mapped_pointers > current->second.mapped_pointers ||
-                     (entry.mapped_pointers == current->second.mapped_pointers &&
-                      order < it->second));
-                if (replace) {
-                    it->second = order;
-                    compute_cache.insert_or_assign(key, std::move(entry));
-                }
+                compute_cache.emplace(key, std::move(entry));
             }
             ++state.built;
             if (state.has_loaded) {
@@ -1378,6 +1376,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }};
     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
                                load_graphics);
+    for (auto& [key, candidates] : compute_envs) {
+        queue_compute(key, std::move(candidates));
+    }
+    compute_envs.clear();
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
     if (skipped_pipelines != 0) {
@@ -2119,8 +2121,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                 descriptor_buffer_ring, thread_worker, statistics, &shader_notify, program.info,
                 std::move(spv_module), key.unique_hash),
             .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
-                                                        : std::vector<std::pair<u32, u32>>{},
-            .mapped_pointers = env.MappedStoragePointerCount()};
+                                                        : std::vector<std::pair<u32, u32>>{}};
 
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "Compute pipeline compilation failed shader={:#016x} pipeline={:#016x}: {}",
