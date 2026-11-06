@@ -1836,10 +1836,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     const int snapshot_mode =
         VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_dma_snapshot, "EDEN_NX2_DMA_SNAPSHOT",
                                          9);
+    // Waits until pending reports in the range have landed (#215), as the drained path below.
     const auto flush_queries = [&](GPUVAddr begin, size_t bytes) {
         split.Run(
-            [memory = &memory_manager, begin, bytes] {
-                memory->FlushRegion(begin, bytes, VideoCommon::CacheType::QueryCache);
+            [this, begin, bytes] {
+                VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, begin, bytes);
             },
             VideoCommon::DrainSite::MacroDmaFlush);
     };
@@ -1968,13 +1969,10 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         split.Drain(VideoCommon::DrainSite::MacroDmaCheck);
         flush_if_dirty();
     }
-    // Reports and semaphore writes held in the query cache are written out (and waited on
-    // through the fence manager) on the thread that owns it: without this, macro DMA reads of
-    // occlusion reports return stale counts and the guest culls visible objects. The non-split
-    // path in macro.cpp has the matching flush.
+    // Write out the reports held in the query cache, or the read returns stale occlusion counts.
     split.Run(
-        [memory = &memory_manager, source, read_bytes] {
-            memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
+        [this, source, read_bytes] {
+            VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
         },
         VideoCommon::DrainSite::MacroDmaFlush);
     u32 changed{};

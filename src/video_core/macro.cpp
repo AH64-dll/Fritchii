@@ -1449,7 +1449,8 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                                                      source, read_bytes);
                     }
                     if (owns_caches) {
-                        memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
+                        VideoCommon::QueryDma::FlushPending(memory, maxwell3d.Rasterizer(), source,
+                                                            read_bytes);
                     }
                     if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
