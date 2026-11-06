@@ -112,6 +112,7 @@ struct ComputePipelineCacheEntry {
     std::string failure;
     /// Constant buffer slots that were null pointers at translation (see NullStoragePointerSlots)
     std::vector<std::pair<u32, u32>> null_pointer_slots;
+    size_t mapped_pointers{};
     u32 rebuilds{};
 
     [[nodiscard]] ComputePipeline* Get(bool native, GPUVAddr address,

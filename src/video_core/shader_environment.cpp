@@ -251,6 +251,11 @@ std::vector<std::pair<u32, u32>> GenericEnvironment::NullStoragePointerSlots() c
     return VideoCommon::NullStoragePointerSlots(cbuf_values, storage_pointer_types);
 }
 
+size_t GenericEnvironment::MappedStoragePointerCount() const {
+    return static_cast<size_t>(std::ranges::count_if(
+        storage_pointer_types, [](const auto& pair) { return pair.second != 0; }));
+}
+
 std::optional<u64> GenericEnvironment::Analyze() {
     if (native_source_size) {
         // Include the converted header and a version tag to isolate this experimental ABI.
@@ -1169,6 +1174,11 @@ bool FileEnvironment::IsNativeProgram() const {
 
 std::vector<std::pair<u32, u32>> FileEnvironment::NullStoragePointerSlots() const {
     return VideoCommon::NullStoragePointerSlots(cbuf_values, storage_pointer_types);
+}
+
+size_t FileEnvironment::MappedStoragePointerCount() const {
+    return static_cast<size_t>(std::ranges::count_if(
+        storage_pointer_types, [](const auto& pair) { return pair.second != 0; }));
 }
 
 bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {

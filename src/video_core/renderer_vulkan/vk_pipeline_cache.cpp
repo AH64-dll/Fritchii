@@ -1264,9 +1264,16 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             auto entry{CreateComputePipeline(pools, key, env_, state.statistics.get(), false)};
             std::scoped_lock lock{state.mutex};
             if (entry.pipeline) {
-                // A rebuilt translation is appended after the stale one; keep the later entry.
+                // A rebuilt translation is cached beside the stale one. Keep the one that binds
+                // more pointers; on a tie keep the earlier entry, as before.
                 auto [it, inserted]{state.compute_order.try_emplace(key, order)};
-                if (inserted || order > it->second) {
+                const auto current{compute_cache.find(key)};
+                const bool replace =
+                    inserted || current == compute_cache.end() ||
+                    entry.mapped_pointers > current->second.mapped_pointers ||
+                    (entry.mapped_pointers == current->second.mapped_pointers &&
+                     order < it->second);
+                if (replace) {
                     it->second = order;
                     compute_cache.insert_or_assign(key, std::move(entry));
                 }
@@ -2096,7 +2103,8 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                 descriptor_buffer_ring, thread_worker, statistics, &shader_notify, program.info,
                 std::move(spv_module), key.unique_hash),
             .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
-                                                        : std::vector<std::pair<u32, u32>>{}};
+                                                        : std::vector<std::pair<u32, u32>>{},
+            .mapped_pointers = env.MappedStoragePointerCount()};
 
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "Compute pipeline compilation failed shader={:#016x} pipeline={:#016x}: {}",

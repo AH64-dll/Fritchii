@@ -74,6 +74,8 @@ public:
 
     [[nodiscard]] std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override;
 
+    [[nodiscard]] size_t MappedStoragePointerCount() const override;
+
     [[nodiscard]] std::optional<u64> Analyze();
 
     void SetCachedSize(size_t size_bytes);
@@ -234,6 +236,8 @@ public:
                                                           u32 indirect) override;
 
     [[nodiscard]] std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override;
+
+    [[nodiscard]] size_t MappedStoragePointerCount() const override;
 
     [[nodiscard]] u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
 

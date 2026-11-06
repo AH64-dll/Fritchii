@@ -98,6 +98,11 @@ public:
         return {};
     }
 
+    /// Native programs: how many classified slots were bound as storage buffer pointers.
+    [[nodiscard]] virtual size_t MappedStoragePointerCount() const {
+        return 0;
+    }
+
     [[nodiscard]] virtual u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) = 0;
 
     [[nodiscard]] virtual TextureType ReadTextureType(u32 raw_handle) = 0;
