@@ -711,3 +711,20 @@ jobs:
             --prerelease \
             --title "Lichii ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
             --notes-file notes.md
+
+      # LICHII_BUILD_TAG is baked into every binary as build-<run number>, and the update checker
+      # compares release tags against it. A release whose tag or title names another run would be
+      # skipped or offered wrongly, so fail the run instead of leaving it published.
+      - name: Verify the release tag matches the run number
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          expected="build-${GITHUB_RUN_NUMBER}"
+          published_tag=$(gh release view "$expected" --repo "${GITHUB_REPOSITORY}" --json tagName --jq '.tagName')
+          published_title=$(gh release view "$expected" --repo "${GITHUB_REPOSITORY}" --json name --jq '.name')
+          if [ "$published_tag" != "$expected" ] || [[ "$published_title" != *" build ${GITHUB_RUN_NUMBER} ("* ]]; then
+            echo "Release is tagged '$published_tag' and titled '$published_title', expected tag $expected and a title naming build ${GITHUB_RUN_NUMBER}"
+            exit 1
+          fi

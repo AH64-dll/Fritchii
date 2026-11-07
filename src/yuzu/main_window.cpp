@@ -448,8 +448,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
 #ifdef ENABLE_UPDATE_CHECKER
     if (UISettings::values.check_for_updates) {
-        update_future = QtConcurrent::run(
-            []() -> std::optional<Common::Net::Release> { return UpdateChecker::GetUpdate(); });
+        update_future = QtConcurrent::run([]() { return UpdateChecker::Check(); });
         update_watcher.connect(&update_watcher, &QFutureWatcher<QString>::finished, this,
                                &MainWindow::OnEmulatorUpdateAvailable);
         update_watcher.setFuture(update_future);
@@ -4684,12 +4683,43 @@ void MainWindow::OnCaptureScreenshot() {
 
 #ifdef ENABLE_UPDATE_CHECKER
 void MainWindow::OnEmulatorUpdateAvailable() {
-    std::optional<Common::Net::Release> version = update_future.result();
-    if (!version)
+    const auto result = update_future.result();
+    if (result.failure == UpdateChecker::Failure::RateLimited) {
+        statusBar()->showMessage(
+            tr("Could not check for updates: GitHub rate limit reached. Lichii will try again at "
+               "the next start."),
+            15000);
         return;
+    }
+    if (result.failure == UpdateChecker::Failure::Http) {
+        statusBar()->showMessage(
+            tr("Could not check for updates: GitHub answered with HTTP %1.").arg(result.status),
+            15000);
+        return;
+    }
+    if (!result.update) {
+        return;
+    }
 
-    UpdateDialog dialog(version.value(), this);
-    dialog.exec();
+    const auto& release = *result.update;
+    const auto now = static_cast<unsigned long long>(QDateTime::currentSecsSinceEpoch());
+    if (UISettings::values.skipped_update_tag.GetValue() == release.tag ||
+        UISettings::values.update_remind_at.GetValue() > now) {
+        return;
+    }
+
+    UpdateDialog dialog(release, this);
+    switch (dialog.exec()) {
+    case UpdateDialog::SkipVersion:
+        UISettings::values.skipped_update_tag = release.tag;
+        break;
+    case QDialog::Rejected:
+        UISettings::values.update_remind_at = now + 24 * 60 * 60;
+        break;
+    default:
+        return;
+    }
+    OnSaveConfig();
 }
 #endif
 

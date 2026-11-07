@@ -40,7 +40,7 @@
 #ifdef ENABLE_UPDATE_CHECKER
 #include <QFuture>
 #include <QFutureWatcher>
-#include "common/net/net.h"
+#include "frontend_common/update_checker.h"
 #endif
 
 class QtConfig;
@@ -507,8 +507,8 @@ private:
     std::shared_ptr<InputCommon::InputSubsystem> input_subsystem;
 
 #ifdef ENABLE_UPDATE_CHECKER
-    QFuture<std::optional<Common::Net::Release>> update_future;
-    QFutureWatcher<std::optional<Common::Net::Release>> update_watcher;
+    QFuture<UpdateChecker::CheckResult> update_future;
+    QFutureWatcher<UpdateChecker::CheckResult> update_watcher;
 #endif
 
     MultiplayerState* multiplayer_state = nullptr;

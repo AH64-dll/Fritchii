@@ -15,6 +15,9 @@ class UpdateDialog : public QDialog {
     Q_OBJECT
 
 public:
+    // exec() returns QDialog::Accepted to download, QDialog::Rejected to be reminded later.
+    static constexpr int SkipVersion = 2;
+
     explicit UpdateDialog(const Common::Net::Release& release, QWidget* parent = nullptr);
     ~UpdateDialog();
 

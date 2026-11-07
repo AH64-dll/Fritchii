@@ -84,12 +84,100 @@ TEST_CASE("Lichii skips releases without its asset and falls back to Linux archi
         MakeRelease("build-71", "lichii-linux-x86_64-pgo.tar.gz"),
         MakeRelease("build-72", "lichii-linux-aarch64-pgo.AppImage"),
     };
-    const auto update = UpdateChecker::SelectUpdate(releases, "build-70", "linux-x86_64-pgo");
+    const auto update = UpdateChecker::SelectUpdate(releases, "build-70", "linux-x86_64");
     REQUIRE(update);
-    CHECK(update->tag == "build-71");
-    CHECK(update->GetPlatformAssets("linux-x86_64-pgo")[0].filename ==
-          "lichii-linux-x86_64-pgo.tar.gz");
+    CHECK(update->tag == "build-73");
+    CHECK(update->GetPlatformAssets("linux-x86_64")[0].filename == "lichii-linux-x86_64.AppImage");
     CHECK_FALSE(UpdateChecker::SelectUpdate(releases, "build-70", "windows-x86_64"));
+
+    const auto archive = UpdateChecker::SelectUpdate(releases, "build-70", "linux-x86_64-pgo",
+                                                     Common::Net::LinuxPackage::Archive);
+    REQUIRE(archive);
+    CHECK(archive->tag == "build-71");
+    CHECK(archive->GetPlatformAssets("linux-x86_64-pgo", Common::Net::LinuxPackage::Archive)[0]
+              .filename == "lichii-linux-x86_64-pgo.tar.gz");
+}
+
+TEST_CASE("PGO builds fall back to the standard asset, standard builds never get PGO", "[updater]") {
+    auto release = MakeRelease("build-71", "lichii-windows-x86_64.zip");
+    const auto pgo = release.GetPlatformAssets("windows-x86_64-pgo");
+    REQUIRE(pgo.size() == 1);
+    CHECK(pgo[0].name == "Standard");
+    CHECK(pgo[0].filename == "lichii-windows-x86_64.zip");
+
+    release.assets.push_back(
+        "https://github.com/zortos293/Lichii/releases/download/build-71/lichii-windows-x86_64-pgo.zip");
+    const auto preferred = release.GetPlatformAssets("windows-x86_64-pgo");
+    REQUIRE(preferred.size() == 1);
+    CHECK(preferred[0].name == "PGO");
+    CHECK(preferred[0].filename == "lichii-windows-x86_64-pgo.zip");
+    CHECK(release.GetPlatformAssets("windows-x86_64")[0].filename == "lichii-windows-x86_64.zip");
+
+    const auto pgo_only = MakeRelease("build-72", "lichii-windows-x86_64-pgo.zip");
+    CHECK(pgo_only.GetPlatformAssets("windows-x86_64").empty());
+    CHECK_FALSE(UpdateChecker::SelectUpdate(std::array{pgo_only}, "build-70", "windows-x86_64"));
+    CHECK(UpdateChecker::SelectUpdate(std::array{pgo_only}, "build-70", "windows-x86_64-pgo"));
+    CHECK(release.GetPlatformAssets("macos-arm64-pgo").empty());
+}
+
+TEST_CASE("Linux installs only get the package they were installed from", "[updater]") {
+    auto release = MakeRelease("build-71", "lichii-linux-x86_64.AppImage");
+    release.assets.push_back(
+        "https://github.com/zortos293/Lichii/releases/download/build-71/lichii-linux-x86_64.tar.gz");
+    CHECK(release.GetPlatformAssets("linux-x86_64", Common::Net::LinuxPackage::AppImage)[0]
+              .filename == "lichii-linux-x86_64.AppImage");
+    CHECK(release.GetPlatformAssets("linux-x86_64", Common::Net::LinuxPackage::Archive)[0]
+              .filename == "lichii-linux-x86_64.tar.gz");
+
+    const auto appimage_only = MakeRelease("build-72", "lichii-linux-x86_64.AppImage");
+    CHECK(appimage_only.GetPlatformAssets("linux-x86_64", Common::Net::LinuxPackage::Archive)
+              .empty());
+}
+
+TEST_CASE("Asset digest and size come from the release JSON", "[updater]") {
+    const std::string sha(64, 'A');
+    const nlohmann::json json{
+        {"tag_name", "build-71"},
+        {"assets",
+         {{{"browser_download_url",
+            "https://github.com/zortos293/Lichii/releases/download/build-71/"
+            "lichii-windows-x86_64.zip"},
+           {"size", u64{1234}},
+           {"digest", "sha256:" + sha}},
+          {{"browser_download_url",
+            "https://github.com/zortos293/Lichii/releases/download/build-71/"
+            "lichii-linux-x86_64.AppImage"},
+           {"size", u64{5}},
+           {"digest", "sha256:zz"}},
+          {{"browser_download_url",
+            "https://github.com/zortos293/Lichii/releases/download/build-71/"
+            "lichii-linux-x86_64.tar.gz"},
+           {"digest", "md5:abc"}}}},
+    };
+    const auto release =
+        Common::Net::Release::FromJson(json, "https://api.github.com", "zortos293/Lichii").value();
+    const auto windows = release.GetPlatformAssets("windows-x86_64");
+    REQUIRE(windows.size() == 1);
+    CHECK(windows[0].sha256 == std::string(64, 'a'));
+    CHECK(windows[0].size == 1234);
+    const auto appimage = release.GetPlatformAssets("linux-x86_64");
+    REQUIRE(appimage.size() == 1);
+    CHECK(appimage[0].sha256.empty());
+    CHECK(appimage[0].size == 5);
+    const auto archive =
+        release.GetPlatformAssets("linux-x86_64", Common::Net::LinuxPackage::Archive);
+    REQUIRE(archive.size() == 1);
+    CHECK(archive[0].sha256.empty());
+    CHECK(archive[0].size == 0);
+}
+
+TEST_CASE("Failed release requests are classified by status", "[updater]") {
+    CHECK(UpdateChecker::ClassifyFailure(403) == UpdateChecker::Failure::RateLimited);
+    CHECK(UpdateChecker::ClassifyFailure(429) == UpdateChecker::Failure::RateLimited);
+    CHECK(UpdateChecker::ClassifyFailure(404) == UpdateChecker::Failure::Http);
+    CHECK(UpdateChecker::ClassifyFailure(500) == UpdateChecker::Failure::Http);
+    CHECK(UpdateChecker::ClassifyFailure(0) == UpdateChecker::Failure::Network);
+    CHECK(UpdateChecker::ClassifyFailure(200) == UpdateChecker::Failure::Network);
 }
 
 TEST_CASE("Lichii does not select Eden or lookalike download URLs", "[updater]") {
