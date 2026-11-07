@@ -92,6 +92,10 @@ inline std::atomic<int> g_experiments[ExperimentCount]{};
 
 inline void LoadExperiments() {
     static const bool loaded = [] {
+        // Kept experiments: on unless their variable says otherwise. EXP8 = 15: Ocarina of Time
+        // walking through Hyrule Field, fresh launches: 1% low 30.3 -> 35.1 fps, frames over
+        // 25 ms 68 -> 38 of ~1650.
+        g_experiments[8].store(15, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {
