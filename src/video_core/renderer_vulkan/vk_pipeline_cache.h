@@ -15,6 +15,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
+#include <stop_token>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <type_traits>
@@ -246,6 +248,12 @@ private:
     /// stages costs a link.
     void StartGraphicsWarm(u64 title_id);
     std::vector<std::jthread> graphics_warm_threads;
+
+    /// Set as soon as emulation is asked to stop (the loading stop token): the warm-ups end
+    /// after their current build instead of compiling on until the cache is destroyed, which
+    /// kept shutdown waiting on driver compiles.
+    std::atomic<bool> warm_cancel{false};
+    std::unique_ptr<std::stop_callback<std::function<void()>>> warm_stop_callback;
 
     const Device& device;
     Scheduler& scheduler;
