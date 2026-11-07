@@ -976,11 +976,13 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     using DefPtr = Id StorageDefinitions::*;
     // Each helper scans every global storage buffer. Inlined at every call site, a compute shader
     // with many global accesses takes NVIDIA's compiler seconds (Ocarina of Time: up to 7.6 s each).
-    // EDEN_NX2_SPIRV_INLINE_GLOBALS=1 lets the driver inline them again (for A/B tests).
+    // DontInline only with EDEN_NX2_SPIRV_INLINE_GLOBALS=0: it builds those shaders faster, but
+    // cost ~2.6 fps walking through Hyrule Field on an RTX 4080 (fresh launches, 55.2/55.3 vs
+    // 57.9/57.8 inlined), and a shader is built once before the driver's cache has it.
     static const spv::FunctionControlMask function_control = [] {
         const char* value = std::getenv("EDEN_NX2_SPIRV_INLINE_GLOBALS");
-        return value != nullptr && value[0] == '1' ? spv::FunctionControlMask::MaskNone
-                                                   : spv::FunctionControlMask::DontInline;
+        return value != nullptr && value[0] == '0' ? spv::FunctionControlMask::DontInline
+                                                   : spv::FunctionControlMask::MaskNone;
     }();
     const Id zero{u32_zero_value};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
