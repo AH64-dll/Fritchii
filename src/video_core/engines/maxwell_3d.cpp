@@ -1789,6 +1789,11 @@ bool Maxwell3D::FrontMacroCountsDraw(Core::System& system, VideoCommon::GpuSplit
 #endif
 }
 
+// Not inlined on GCC (zortos293/Lichii#491): GCC 13 -O3 unswitched a per-word loop on this
+// switch there and dropped the macro upload cases from it (an empty macro RAM on the front).
+#if defined(__GNUC__) && !defined(__clang__)
+[[gnu::noinline]]
+#endif
 void Maxwell3D::FrontTrackInstanceLoop(FrontState& fs, u32 method, u32 value) {
     switch (method) {
     case MAXWELL3D_REG_INDEX(draw.begin):
