@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <functional>
@@ -173,5 +174,55 @@ private:
     std::vector<TransformAddress> back_buffer;
     std::vector<TransformAddress> front_buffer;
 };
+
+/// One bit per device page of the 36-bit device address space (2 MiB), set by writers and taken
+/// by the native uniform bank check (BufferCache, EDEN_NX2_EXP9).
+class DevicePageFlags {
+public:
+    static constexpr u64 AddressBits = 36;
+
+    void Mark(u64 address, u64 size) noexcept {
+        constexpr u64 limit = u64{1} << AddressBits;
+        if (size == 0 || address >= limit) {
+            return;
+        }
+        u64 page = address >> DEVICE_PAGEBITS;
+        const u64 last = ((std::min)(address + size, limit) - 1) >> DEVICE_PAGEBITS;
+        while (page <= last) {
+            const u64 first_bit = page % 64;
+            const u64 bits = (std::min<u64>)(64 - first_bit, last - page + 1);
+            const u64 mask = (bits == 64 ? ~u64{0} : (u64{1} << bits) - 1) << first_bit;
+            std::atomic<u64>& word = words[page / 64];
+            if ((word.load(std::memory_order_relaxed) & mask) != mask) {
+                word.fetch_or(mask, std::memory_order_seq_cst);
+            }
+            page += bits;
+        }
+    }
+
+    /// Clears the bit of the page holding `address`, returning whether it was set.
+    bool Take(u64 address) noexcept {
+        if (address >= (u64{1} << AddressBits)) {
+            return false;
+        }
+        const u64 page = address >> DEVICE_PAGEBITS;
+        const u64 bit = u64{1} << (page % 64);
+        std::atomic<u64>& word = words[page / 64];
+        if ((word.load(std::memory_order_relaxed) & bit) == 0) {
+            return false;
+        }
+        return (word.fetch_and(~bit, std::memory_order_seq_cst) & bit) != 0;
+    }
+
+private:
+    std::array<std::atomic<u64>, (u64{1} << (AddressBits - DEVICE_PAGEBITS)) / 64> words{};
+};
+
+/// Pages guest CPU writes went to through the dirty memory managers: the buffer cache sees them
+/// only at the next InvalidateGPUCache.
+inline DevicePageFlags g_collected_write_pages;
+/// Pages whose guest memory the buffer cache saw change (WriteMemory, uploads in place,
+/// downloads).
+inline DevicePageFlags g_buffer_write_pages;
 
 } // namespace Core

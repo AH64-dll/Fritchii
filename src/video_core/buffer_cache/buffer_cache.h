@@ -181,6 +181,7 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data) {
     Nx2NoteListHostWrite(device_addr, size);
+    Core::g_buffer_write_pages.Mark(device_addr, size);
     // The written range lies within its pages: when they hold no GPU-written data, both lookups
     // below find nothing, so one lookup answers them.
     if (Nx2Perf::On(Nx2Perf::Opt::WriteIntersections) && keep_page_gpu_data) {
@@ -1151,6 +1152,7 @@ Common::RangeSet<DAddr> BufferCache<P>::PendingCpuWriteRanges() {
 template <class P>
 void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
                                            DAddr device_addr, const u8* data, u64 size) {
+    Core::g_buffer_write_pages.Mark(device_addr, size);
     if (!cpu_written.Intersects(device_addr, size)) {
         device_memory.WriteBlockUnsafe(device_addr, data, size);
         return;
@@ -1521,9 +1523,14 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     // the memory tracker, leaving stale host contents, so check such a bank on every bind: games
     // rewrite per-draw data between draws, and checking once per frame left it stale for a frame
     // now and then (white flashes in Ocarina of Time, Eglantine 031e07436c).
-    if (has_host_buffer && (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
-        size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
-        !memory_tracker.IsRegionGpuModified(device_addr, size)) {
+    const bool native_bank = has_host_buffer &&
+                             (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
+                             size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
+                             !memory_tracker.IsRegionGpuModified(device_addr, size);
+    if (const int tracked_mode = native_bank ? VideoCore::Nx2Debug::Experiment(9) : 0;
+        tracked_mode != 0) {
+        CheckNativeBankPagesTracked(device_addr, size, tracked_mode);
+    } else if (native_bank) {
         // The bank size is only an upper limit: stop at the end of the mapped memory.
         u64 mapped_size = 0;
         while (mapped_size < size &&
@@ -1800,6 +1807,102 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
     } else {
         return false;
     }
+}
+
+template <class P>
+void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, int mode) {
+    // EDEN_NX2_EXP9 (experiment, 0 = off): compare only the pages whose guest memory may have
+    // changed since their last compare. 1: pages guest CPU writes were collected for (applied
+    // only at the next InvalidateGPUCache, while the tracker holds the page clean), pages the
+    // buffer cache saw written, pages flagged at the previous bind, CPU-modified pages, and each
+    // page once per frame for writers none of these see. 3: the same without the frame check.
+    // 2: every page as with 0, counting the changed pages the rules of 1 and 3 would have skipped.
+    static_assert(Core::DevicePageFlags::AddressBits >=
+                  Tegra::MaxwellDeviceTraits::device_virtual_bits);
+    u64 mapped_size = 0;
+    while (mapped_size < size &&
+           device_memory.template GetPointer<u8>(device_addr + mapped_size) != nullptr) {
+        mapped_size += Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
+    }
+    if (native_indirect_page_snapshots.size() >= 16384) {
+        native_indirect_page_snapshots.clear();
+    }
+    const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+    const DAddr end = device_addr + (std::min<u64>)(mapped_size, size);
+    const bool verify = mode == 2;
+    const bool frame_check = mode != 3;
+    // Most banks have no CPU-modified page: ask per page only when one has.
+    const bool any_cpu_dirty = memory_tracker.IsRegionCpuModified(first_page, end - first_page);
+    auto& stats = native_bank_tracked_stats;
+    ++stats.binds;
+    for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
+        const u8* const guest = device_memory.template GetPointer<u8>(page);
+        if (guest == nullptr) {
+            continue;
+        }
+        // Take the flags before reading the page: a write flagged later is compared next bind.
+        const bool collected = Core::g_collected_write_pages.Take(page);
+        const bool written = Core::g_buffer_write_pages.Take(page);
+        auto [it, inserted] = native_indirect_page_snapshots.try_emplace(page);
+        NativeBankPage& snapshot = it->second;
+        if (inserted) {
+            ++stats.pages_new;
+            std::memcpy(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE);
+            snapshot.checked_frame = frame_tick;
+            snapshot.recheck = collected || written;
+            memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
+            continue;
+        }
+        // A flagged write's bytes may land after this compare: compare again at the next bind.
+        const bool recheck = std::exchange(snapshot.recheck, collected || written);
+        NativeBankReason reason = BankNone;
+        if (collected) {
+            reason = BankCollected;
+        } else if (written) {
+            reason = BankWritten;
+        } else if (recheck) {
+            reason = BankRecheck;
+        } else if (any_cpu_dirty &&
+                   memory_tracker.IsRegionCpuModified(page, Core::DEVICE_PAGESIZE)) {
+            reason = BankCpuDirty;
+        } else if (frame_check && snapshot.checked_frame != frame_tick) {
+            reason = BankFrame;
+        }
+        if (reason != BankNone) {
+            snapshot.checked_frame = frame_tick;
+        } else if (!verify) {
+            ++stats.pages_skipped;
+            continue;
+        }
+        ++stats.compared[reason];
+        if (std::memcmp(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE) == 0) {
+            continue;
+        }
+        ++stats.changed[reason];
+        std::memcpy(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE);
+        memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - stats.last_log < std::chrono::seconds{5}) {
+        return;
+    }
+    // With EXP9=2 the frame check runs too: "missed" counts what 1 would have skipped, and
+    // "missed without the frame check" adds what only the frame check found (3's misses).
+    const auto& compared = stats.compared;
+    const auto& changed = stats.changed;
+    LOG_INFO(HW_GPU,
+             "Native bank check (EXP9={}, 5 s): {} binds, {} new pages, {} skipped; compared / "
+             "changed: collected CPU writes {} / {}, buffer cache writes {} / {}, recheck {} / {}, "
+             "CPU-modified {} / {}, frame check {} / {}, verify only {} / {}; missed {}, missed "
+             "without the frame check {}",
+             mode, stats.binds, stats.pages_new, stats.pages_skipped, compared[BankCollected],
+             changed[BankCollected], compared[BankWritten], changed[BankWritten],
+             compared[BankRecheck], changed[BankRecheck], compared[BankCpuDirty],
+             changed[BankCpuDirty], compared[BankFrame], changed[BankFrame], compared[BankNone],
+             changed[BankNone], verify ? changed[BankNone] : 0,
+             verify ? changed[BankNone] + changed[BankFrame] : 0);
+    stats = {};
+    stats.last_log = now;
 }
 
 template <class P>
@@ -2912,6 +3015,7 @@ bool BufferCache<P>::InlineMemory(DAddr dest_address, size_t copy_size,
 template <class P>
 void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                                 std::span<const u8> inlined_buffer) {
+    Core::g_buffer_write_pages.Mark(dest_address, copy_size);
     ClearDownload(dest_address, copy_size);
     gpu_modified_ranges.Subtract(dest_address, copy_size);
     MarkVertexBuffersStale(dest_address, copy_size);

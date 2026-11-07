@@ -34,6 +34,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
+#include "core/gpu_dirty_memory_manager.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
@@ -485,6 +486,10 @@ public:
         u64 checked_draw = 0;
         u32 checked_begin = 0;
         u32 checked_end = 0;
+        /// EDEN_NX2_EXP9: frame_tick of the page's last compare, and whether the next bind
+        /// compares it again (a flagged write's bytes may land after the compare that took it).
+        u64 checked_frame = ~u64{0};
+        bool recheck = false;
     };
     std::unordered_map<DAddr, NativeBankPage> native_indirect_page_snapshots;
     /// Counts graphics draws (UpdateGraphicsBuffers) for EDEN_NX2_EXP4 & 2.
@@ -499,6 +504,25 @@ public:
         u64 pages_changed = 0;
         std::chrono::steady_clock::time_point last_log{};
     } native_bank_stats;
+    /// EDEN_NX2_EXP9 != 0: why bank pages were compared and which of them had changed, by the
+    /// first reason that applies (NativeBankReason), logged every 5 s.
+    enum NativeBankReason : size_t {
+        BankCollected, ///< Collected CPU writes (Core::g_collected_write_pages)
+        BankWritten,   ///< Writes the buffer cache saw (Core::g_buffer_write_pages)
+        BankRecheck,   ///< Flagged at the previous bind
+        BankCpuDirty,  ///< CPU-modified in the tracker
+        BankFrame,     ///< Not compared yet this frame
+        BankNone,      ///< No reason: EXP9=2 compares these only to verify
+        BankReasons,
+    };
+    struct NativeBankTrackedStats {
+        u64 binds = 0;
+        u64 pages_new = 0;
+        u64 pages_skipped = 0;
+        std::array<u64, BankReasons> compared{};
+        std::array<u64, BankReasons> changed{};
+        std::chrono::steady_clock::time_point last_log{};
+    } native_bank_tracked_stats;
 
 private:
     template <typename Mask, typename Func>
@@ -544,6 +568,9 @@ private:
     void BindHostGraphicsUniformBuffers(size_t stage);
 
     void BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 binding_index, bool needs_bind);
+
+    /// EDEN_NX2_EXP9: the native uniform bank check of a bind of [device_addr, device_addr + size).
+    void CheckNativeBankPagesTracked(DAddr device_addr, u32 size, int mode);
 
     void BindHostGraphicsStorageBuffers(size_t stage);
 
