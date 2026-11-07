@@ -54,6 +54,7 @@ enum class DrainSite : u32 {
     FrontStart,     ///< The front takes an engine's macros over
     FrontVerify,    ///< EDEN_NX2_FRONT_VERIFY
     MacroDmaCheck,  ///< EDEN_NX2_CMDPAGE_DIAG: a macro's memory read repeated after a full drain
+    DispatchWait,   ///< EXP10: a macro memory read waits for the dispatches sent since it flushed
     Count,
 };
 
@@ -62,6 +63,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma writes",
     "macro dma flush",
     "gp sync fence", "map",           "front start", "front verify",  "macro dma check",
+    "macro dma dispatch",
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -286,15 +288,16 @@ public:
 
     /// What sent compute or copy work that may write any memory (EXP10's log line).
     enum class WriterKind : u32 {
-        Dispatch, ///< QMD launches and inline QMDs
-        Compute,  ///< Other compute methods (uploads, unknown methods)
-        Copy,     ///< Copies the front could not bound
-        Other,    ///< Writers no engine front classified
+        Upload,  ///< Compute inline uploads the front could not bound
+        Release, ///< Compute report semaphores the front could not translate
+        Compute, ///< Other compute methods (unknown methods)
+        Copy,    ///< Copies the front could not bound
+        Other,   ///< Writers no engine front classified
         Count,
     };
     /// Compute or copy work was just sent: what can write GPU-written command lists.
-    /// `classified`: the engine's front noted what that work writes (NoteWriterRange and
-    /// NoteUnboundedWriter); otherwise it may write anything.
+    /// `classified`: the engine's front noted what that work writes (NoteWriterRange,
+    /// NoteUnboundedWriter, NoteDispatchWriter); otherwise it may write anything.
     void NoteWriter(bool classified = false) {
         last_writer_position = write_position;
         if (!classified) {
@@ -307,32 +310,52 @@ public:
         ++unbounded_writers[static_cast<size_t>(kind)];
     }
     /// Compute or copy work just sent writes only [address, address + size) of `memory` (a copy's
-    /// destination, a release); counts as unbounded when the front can't translate it as the
-    /// back will.
+    /// destination, a release, an inline upload); counts as unbounded when the front can't
+    /// translate it as the back will.
     void NoteWriterRange(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
                          WriterKind kind);
+    /// The noted ranges so far: a check made now covers those below it (WritersMayWriteSince).
+    [[nodiscard]] u64 WriterRangeCount() const {
+        writer_range_sealed = writer_range_count;
+        return writer_range_count;
+    }
     /// Whether compute or copy work sent after position `since` may write device bytes
     /// [begin, begin + size): an unbounded writer, or a noted range that overlaps them.
-    [[nodiscard]] bool WritersMayWriteSince(u64 since, u64 begin, u64 size) const {
+    /// `checked` (optional): the noted ranges below it were found to miss these bytes before;
+    /// set to WriterRangeCount() when nothing does.
+    [[nodiscard]] bool WritersMayWriteSince(u64 since, u64 begin, u64 size,
+                                            u64* checked = nullptr) const {
         if (last_unbounded_writer_position > since) {
             return true;
         }
         // At most MaxWriterScan ranges are compared (a drained read takes a new snapshot), and
         // more than are remembered count as overlapping.
         const u64 end = begin + size;
-        const u64 remembered = (std::min<u64>)(writer_range_count, writer_ranges.size());
-        const u64 limit = (std::min<u64>)(remembered, MaxWriterScan);
-        for (u64 scanned = 0; scanned < limit; ++scanned) {
-            const WriterRange& range =
-                writer_ranges[(writer_range_count - 1 - scanned) % writer_ranges.size()];
+        const u64 oldest =
+            writer_range_count - (std::min<u64>)(writer_range_count, writer_ranges.size());
+        const u64 known = checked != nullptr ? *checked : 0;
+        u64 index = writer_range_count;
+        bool reached = false;
+        for (u64 scanned = 0; index > (std::max)(known, oldest); --index, ++scanned) {
+            if (scanned == MaxWriterScan) {
+                return true;
+            }
+            const WriterRange& range = writer_ranges[(index - 1) % writer_ranges.size()];
             if (range.position <= since) {
-                return false;
+                reached = true;
+                break;
             }
             if (range.begin < end && begin < range.end) {
                 return true;
             }
         }
-        return limit == MaxWriterScan || remembered == writer_ranges.size();
+        if (!reached && oldest > known) {
+            return true;
+        }
+        if (checked != nullptr) {
+            *checked = WriterRangeCount();
+        }
+        return false;
     }
     [[nodiscard]] u64 LastUnboundedWriterPosition() const {
         return last_unbounded_writer_position;
@@ -341,6 +364,81 @@ public:
     UnboundedWriters() const {
         return unbounded_writers;
     }
+
+    // EXP10: what native compute dispatches write. The front can't tell (their storage buffers
+    // and images come from constant buffers and descriptor pools queued work may still write),
+    // so the back records, for each dispatch it runs, the device ranges it marks GPU-written in
+    // the buffer cache (BufferCache::MarkWrittenBuffer: the storage and texture buffers' write
+    // marks, all a flush or fence download brings to guest memory), its written images' guest
+    // ranges, its indirect arguments and its QMD releases. A front read checks those once the
+    // back ran every dispatch sent since its snapshot, waiting for that when asked (only that
+    // far, not for what was sent after).
+
+    /// Native compute work that may dispatch was just sent (a QMD launch or an inline QMD).
+    void NoteDispatchWriter();
+    /// Why a dispatch the back ran counts as writing anything.
+    enum class DispatchUnbounded : u32 {
+        Unconfirmed, ///< The rasterizer did not report its writes (another path or backend)
+        Replaced,    ///< Replaced by other work (a network bypass, an upscaler)
+        Image,       ///< A written image without a guest range
+        Count,
+    };
+    enum class DispatchCheck : u32 {
+        Miss,      ///< Every dispatch sent since ran, and none writes the bytes
+        Queued,    ///< One is still queued (without the wait)
+        Overlap,   ///< One writes the bytes
+        Unbounded, ///< One may write anything (DispatchUnbounded, or sent with EXP10 off)
+        ScanLimit, ///< Too many writes recorded since to compare
+        Count,
+    };
+    /// Whether the native compute dispatches sent after position `since` may write device bytes
+    /// [begin, begin + size). `checked`: the recorded writes below it were found to miss these
+    /// bytes before (DispatchWriteCount() at the snapshot); updated on a miss. With `wait`, waits
+    /// for the back to run the newest of those dispatches first (`waited` then set).
+    DispatchCheck DispatchesMayWriteSince(u64 since, u64 begin, u64 size, bool wait, u64& checked,
+                                          bool& waited);
+    /// The writes the back recorded so far.
+    [[nodiscard]] u64 DispatchWriteCount() const {
+        return dispatch_write_count.load(std::memory_order_acquire);
+    }
+    /// For EXP10's log line: native compute work sent that may dispatch, the dispatches the back
+    /// ran whose writes it recorded, and why the others count as writing anything.
+    struct DispatchStats {
+        u64 sent;
+        u64 bounded;
+        std::array<u64, static_cast<size_t>(DispatchUnbounded::Count)> unbounded;
+    };
+    [[nodiscard]] DispatchStats GetDispatchStats() const;
+
+    /// Back: whether the dispatches being run record their writes (BeginDispatchRecord).
+    [[nodiscard]] static bool RecordingDispatch() {
+        return recording_dispatch;
+    }
+    /// Back, around a QMD action that may dispatch and release (KeplerCompute).
+    void BeginDispatchRecord() {
+        recording_dispatch = on_back_thread && back_dispatch_records;
+    }
+    void EndDispatchRecord() {
+        recording_dispatch = false;
+    }
+    /// Back, while recording: a dispatch starts; the rasterizer recorded all it writes; it ended
+    /// (`ran`: it reached the rasterizer, `replaced`: other work ran instead).
+    void StartDispatch() {
+        dispatch_confirmed = false;
+        dispatch_unbounded = false;
+    }
+    void ConfirmDispatch() {
+        dispatch_confirmed = true;
+    }
+    void FinishDispatch(bool ran, bool replaced);
+    /// Back, while recording: the dispatch writes device bytes [begin, begin + size).
+    void RecordDispatchWrite(u64 begin, u64 size) {
+        if (size != 0) {
+            AppendDispatchWrite(begin, begin + size);
+        }
+    }
+    /// Back, while recording: the dispatch may write anything.
+    void RecordDispatchUnbounded(DispatchUnbounded reason);
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
     bool WaitForWriters();
@@ -638,11 +736,40 @@ private:
         u64 begin;
         u64 end;
     };
-    std::array<WriterRange, 256> writer_ranges{};
-    static constexpr u64 MaxWriterScan = 128;
+    std::array<WriterRange, 1024> writer_ranges{};
+    static constexpr u64 MaxWriterScan = 512;
     u64 writer_range_count{};
     u64 last_unbounded_writer_position{};
     std::array<u64, static_cast<size_t>(WriterKind::Count)> unbounded_writers{};
+    /// NoteWriterRange's last range and the function position its translation holds for: the
+    /// same range again (an inline upload's data words) only moves the newest range's position,
+    /// unless a check may have kept what it found for it (below writer_range_sealed).
+    mutable u64 writer_range_sealed{};
+    const Tegra::MemoryManager* writer_range_memory{};
+    GPUVAddr writer_range_address{};
+    u64 writer_range_size{};
+    u64 writer_range_function{~u64{0}};
+    /// Front, EXP10 dispatches (NoteDispatchWriter): the newest sent, the newest sent while the
+    /// back did not record (EXP10 off), whether the back was last told to record, and how many.
+    u64 last_dispatch_position{};
+    u64 last_unrecorded_dispatch_position{};
+    bool dispatch_records{};
+    u64 dispatches_sent{};
+    /// Dispatch writes the back recorded (begin, end; 0, ~0 for anything) with the position of
+    /// the entry that ran them, newest last; written by the back, read by the front.
+    struct DispatchWrite {
+        std::atomic<u64> position;
+        std::atomic<u64> begin;
+        std::atomic<u64> end;
+    };
+    static constexpr u64 DispatchWriteSlots = 8192;
+    static constexpr u64 MaxDispatchScan = 2048;
+    std::array<DispatchWrite, DispatchWriteSlots> dispatch_writes{};
+    alignas(64) std::atomic<u64> dispatch_write_count{};
+    std::atomic<u64> dispatches_bounded{};
+    std::array<std::atomic<u64>, static_cast<size_t>(DispatchUnbounded::Count)>
+        dispatches_unbounded{};
+    void AppendDispatchWrite(u64 begin, u64 end);
     u64 last_sync_position{};
     u64 last_memory_write_position{};
     static constexpr u32 DeferredWrite = ~0U;
@@ -695,6 +822,14 @@ private:
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};
+    /// The position of the entry being run (dispatch writes record it).
+    u64 back_entry_position{};
+    /// EXP10: the front asked the back to record dispatch writes (NoteDispatchWriter).
+    bool back_dispatch_records{};
+    /// The dispatch being run: the rasterizer recorded its writes, it recorded an unbounded one.
+    bool dispatch_confirmed{};
+    bool dispatch_unbounded{};
+    static inline thread_local bool recording_dispatch{};
 
     static GpuSplit instance;
     static inline thread_local bool on_back_thread{};

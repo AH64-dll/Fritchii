@@ -24,6 +24,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_null/null_rasterizer.h"
 
 namespace VideoCommon {
@@ -45,6 +46,22 @@ struct GpuSplitTestAccess {
     /// As if `words` more were sent.
     static void Advance(GpuSplit& split, u64 words) {
         split.write_position += words;
+    }
+
+    /// As if the back had run everything before `position`.
+    static void Consume(GpuSplit& split, u64 position) {
+        split.consumed.store(position, std::memory_order_release);
+    }
+
+    /// As if the back ran, in the entry at `position`, a dispatch writing [begin, begin + size).
+    static void RunDispatch(GpuSplit& split, u64 position, u64 begin, u64 size) {
+        split.back_entry_position = position;
+        GpuSplit::recording_dispatch = true;
+        split.StartDispatch();
+        split.RecordDispatchWrite(begin, size);
+        split.ConfirmDispatch();
+        split.FinishDispatch(true, false);
+        GpuSplit::recording_dispatch = false;
     }
 
     static u64 NearWrap() {
@@ -409,6 +426,75 @@ TEST_CASE("GpuSplit compute and copy write ranges count only for reads they over
     REQUIRE_FALSE(split.WritersMayWriteSince(120, 0x40180, 4));
     REQUIRE(split.UnboundedWriters()[static_cast<size_t>(Kind::Copy)] == 1);
     REQUIRE(split.UnboundedWriters()[static_cast<size_t>(Kind::Other)] == 1);
+
+    // An inline upload's words write one range: noted once, moved along while nobody kept a
+    // check of it, noted anew after one.
+    Access::Advance(split, 10);
+    split.NoteWriterRange(f.memory, 0x100400, 0x80, Kind::Upload);
+    Access::Advance(split, 1);
+    split.NoteWriterRange(f.memory, 0x100400, 0x80, Kind::Upload);
+    REQUIRE(split.WriterRangeCount() == 2);
+    REQUIRE(split.WritersMayWriteSince(130, 0x40400, 4));
+    const u64 since = Access::End(split);
+    u64 checked = split.WriterRangeCount();
+    REQUIRE_FALSE(split.WritersMayWriteSince(since, 0x40000, 0x1000, &checked));
+    Access::Advance(split, 1);
+    split.NoteWriterRange(f.memory, 0x100400, 0x80, Kind::Upload);
+    REQUIRE(split.WriterRangeCount() == 3);
+    REQUIRE(split.WritersMayWriteSince(since, 0x40000, 0x1000, &checked));
+    u64 other_page = checked;
+    REQUIRE_FALSE(split.WritersMayWriteSince(since, 0x80000, 0x1000, &other_page));
+    REQUIRE(other_page == 3);
+}
+
+TEST_CASE("GpuSplit dispatches count where the back recorded their writes",
+          "[video_core][maxwell_fast_method][gpu_split_dispatch_writes]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using Check = VideoCommon::GpuSplit::DispatchCheck;
+    Fixture f;
+    VideoCore::Nx2Debug::LoadExperiments();
+    const int previous = VideoCore::Nx2Debug::g_experiments[10].exchange(1);
+    SCOPE_EXIT {
+        VideoCore::Nx2Debug::g_experiments[10].store(previous);
+    };
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    bool waited = false;
+
+    // Sent before the back was told to record (EXP10 just turned on): may write anything.
+    Access::Advance(split, 2);
+    split.NoteDispatchWriter();
+    u64 checked = split.DispatchWriteCount();
+    REQUIRE(split.DispatchesMayWriteSince(100, 0x40000, 0x1000, false, checked, waited) ==
+            Check::Unbounded);
+
+    const u64 since = Access::End(split);
+    Access::Consume(split, since);
+    REQUIRE(split.DispatchesMayWriteSince(since, 0x40000, 0x1000, false, checked, waited) ==
+            Check::Miss);
+
+    // Queued: unknown until the back ran it.
+    const u64 entry = Access::End(split);
+    Access::Advance(split, 2);
+    split.NoteDispatchWriter();
+    REQUIRE(split.DispatchesMayWriteSince(since, 0x40000, 0x1000, false, checked, waited) ==
+            Check::Queued);
+    Access::RunDispatch(split, entry, 0x80000, 0x100);
+    Access::Consume(split, Access::End(split));
+    REQUIRE(split.DispatchesMayWriteSince(since, 0x40000, 0x1000, false, checked, waited) ==
+            Check::Miss);
+    REQUIRE(checked == split.DispatchWriteCount());
+    u64 fresh = 0;
+    REQUIRE(split.DispatchesMayWriteSince(since, 0x80000, 0x1000, false, fresh, waited) ==
+            Check::Overlap);
+    // A snapshot taken after it ran.
+    const u64 later = Access::End(split);
+    fresh = split.DispatchWriteCount();
+    REQUIRE(split.DispatchesMayWriteSince(later, 0x80000, 0x1000, false, fresh, waited) ==
+            Check::Miss);
+    REQUIRE_FALSE(waited);
+    REQUIRE(split.GetDispatchStats().sent == 2);
+    REQUIRE(split.GetDispatchStats().bounded == 1);
 }
 
 TEST_CASE("GpuSplit dispatch preserves mapped uploads and macro boundaries",
