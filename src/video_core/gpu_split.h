@@ -314,6 +314,30 @@ public:
     /// translate it as the back will.
     void NoteWriterRange(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
                          WriterKind kind);
+    /// How the front noted a compute report semaphore (NoteReleaseWriter, EXP10's log line).
+    enum class ReleaseNote : u32 {
+        Ranged,       ///< Its bytes, as one device range
+        Unmapped,     ///< Translated when the back runs it, to nothing: writes nothing
+        NoWrite,      ///< An operation the back ignores (KeplerCompute::FrontNoteWriter)
+        PendingMap,   ///< Unbounded: a queued function may still remap it
+        Sparse,       ///< Unbounded: in a lazily backed sparse span
+        LateUnmapped, ///< Unbounded: unmapped now, translated only when its fence signals
+        Split,        ///< Unbounded: not one device range
+        Count,
+    };
+    /// A compute report semaphore just sent writes [address, address + size). `at_run`: the back
+    /// translates it when it runs the method and writes nothing when that fails (the query
+    /// cache's payload reports), so an address without a mapping (Ocarina of Time releases to GPU
+    /// address 0) needs no range; otherwise as NoteWriterRange.
+    void NoteReleaseWriter(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
+                           bool at_run);
+    void CountRelease(ReleaseNote note) {
+        ++release_notes[static_cast<size_t>(note)];
+    }
+    [[nodiscard]] const std::array<u64, static_cast<size_t>(ReleaseNote::Count)>&
+    ReleaseNotes() const {
+        return release_notes;
+    }
     /// The noted ranges so far: a check made now covers those below it (WritersMayWriteSince).
     [[nodiscard]] u64 WriterRangeCount() const {
         writer_range_sealed = writer_range_count;
@@ -741,6 +765,10 @@ private:
     u64 writer_range_count{};
     u64 last_unbounded_writer_position{};
     std::array<u64, static_cast<size_t>(WriterKind::Count)> unbounded_writers{};
+    std::array<u64, static_cast<size_t>(ReleaseNote::Count)> release_notes{};
+    /// NoteWriterRange's translation: noted, or why not (a ReleaseNote past Ranged).
+    ReleaseNote TryNoteWriterRange(const Tegra::MemoryManager& memory, GPUVAddr address,
+                                   u64 size);
     /// NoteWriterRange's last range and the function position its translation holds for: the
     /// same range again (an inline upload's data words) only moves the newest range's position,
     /// unless a check may have kept what it found for it (below writer_range_sealed).

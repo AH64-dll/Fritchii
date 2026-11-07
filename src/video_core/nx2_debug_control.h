@@ -91,7 +91,8 @@ inline std::atomic<int> g_host_pace{-1};
 /// copies sent since whose write ranges miss the pages read (Maxwell3D::FrontDmaRead): copies,
 /// inline uploads and releases as the front notes them, native dispatches as the back records
 /// them once it ran them (the read waits for that much); 2 = the same, but a dispatch still
-/// queued drains as before.
+/// queued drains as before. +4 (5, 6): compute report semaphores noted as before, 16 bytes or
+/// anything when unmapped (GpuSplit::NoteReleaseWriter).
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 

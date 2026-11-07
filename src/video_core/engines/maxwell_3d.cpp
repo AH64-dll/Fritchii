@@ -2028,7 +2028,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     // Last: the only check that may wait.
                     bool waited = false;
                     const DispatchCheck check = split.DispatchesMayWriteSince(
-                        since, page << 12, 0x1000, exp10 != 2, snapshot.dispatch_writes, waited);
+                        since, page << 12, 0x1000, (exp10 & 3) != 2, snapshot.dispatch_writes,
+                        waited);
                     dispatch_waits += waited ? 1 : 0;
                     if (check != DispatchCheck::Miss) {
                         reason = 1;
@@ -2126,6 +2127,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                         for (const u64 count : dispatches.unbounded) {
                             dispatches_unbounded += count;
                         }
+                        using Release = VideoCommon::GpuSplit::ReleaseNote;
+                        const auto& releases = split.ReleaseNotes();
+                        const auto release = [&releases](Release note) {
+                            return releases[static_cast<size_t>(note)];
+                        };
                         LOG_INFO(HW_GPU,
                                  "DMA snapshot EXP10: compute/copy: {} drained ({} unbounded "
                                  "writer, {} overlapping range; dispatches: {} queued, {} "
@@ -2133,7 +2139,10 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                  "ranges ({} differed), {} waited for dispatches only; dispatch "
                                  "launches sent: {}, dispatches run: {} bounded, {} unbounded ({} "
                                  "unconfirmed, {} replaced, {} image); unbounded writers sent: "
-                                 "{} upload, {} release, {} compute, {} copy, {} other",
+                                 "{} upload, {} release, {} compute, {} copy, {} other; compute "
+                                 "releases: {} ranged, {} unmapped (write nothing), {} write "
+                                 "nothing, unbounded: {} pending map, {} sparse, {} unmapped "
+                                 "reduction, {} split",
                                  writer_unbounded + writer_overlaps + dispatch_drains,
                                  writer_unbounded, writer_overlaps, checks(DispatchCheck::Queued),
                                  checks(DispatchCheck::Overlap), checks(DispatchCheck::Unbounded),
@@ -2141,7 +2150,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                  dispatch_waits, dispatches.sent, dispatches.bounded,
                                  dispatches_unbounded, unbounded(Unbounded::Unconfirmed),
                                  unbounded(Unbounded::Replaced), unbounded(Unbounded::Image),
-                                 sent[0], sent[1], sent[2], sent[3], sent[4]);
+                                 sent[0], sent[1], sent[2], sent[3], sent[4],
+                                 release(Release::Ranged), release(Release::Unmapped),
+                                 release(Release::NoWrite), release(Release::PendingMap),
+                                 release(Release::Sparse), release(Release::LateUnmapped),
+                                 release(Release::Split));
                     }
                 }
                 for (u32 i = 0; i < words; ++i) {

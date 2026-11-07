@@ -702,9 +702,26 @@ void GpuSplit::NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u
 
 void GpuSplit::NoteWriterRange(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
                                WriterKind kind) {
-    if (size == 0) {
-        return;
+    if (size != 0 && TryNoteWriterRange(memory, address, size) != ReleaseNote::Ranged) {
+        NoteUnboundedWriter(kind);
     }
+}
+
+void GpuSplit::NoteReleaseWriter(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
+                                 bool at_run) {
+    ReleaseNote note = TryNoteWriterRange(memory, address, size);
+    if (note == ReleaseNote::Unmapped && !at_run) {
+        // A fence callback translates it later, after functions queued meanwhile may map it.
+        note = ReleaseNote::LateUnmapped;
+    }
+    CountRelease(note);
+    if (note != ReleaseNote::Ranged && note != ReleaseNote::Unmapped) {
+        NoteUnboundedWriter(WriterKind::Release);
+    }
+}
+
+GpuSplit::ReleaseNote GpuSplit::TryNoteWriterRange(const Tegra::MemoryManager& memory,
+                                                   GPUVAddr address, u64 size) {
     // As NoteWrite: a queued function may still remap the range, sparse pages are written through
     // their own backing. One device range only, as the reads compare device addresses.
     if (last_function_position > consumed_cache) {
@@ -715,18 +732,25 @@ void GpuSplit::NoteWriterRange(const Tegra::MemoryManager& memory, GPUVAddr addr
         writer_range_function == last_function_position &&
         last_function_position <= consumed_cache) {
         writer_ranges[(writer_range_count - 1) % writer_ranges.size()].position = write_position;
-        return;
+        return ReleaseNote::Ranged;
     }
     writer_range_memory = nullptr;
-    const bool sparse = address < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed) &&
-                        Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) < address + size;
-    const std::optional<DAddr> device =
-        last_function_position > consumed_cache || sparse || size > (u64{64} << 20)
-            ? std::nullopt
-            : memory.GpuToCpuAddress(address);
-    if (!device || memory.MaxContinuousRange(address, size) < size) {
-        NoteUnboundedWriter(kind);
-        return;
+    if (last_function_position > consumed_cache) {
+        return ReleaseNote::PendingMap;
+    }
+    if (address < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed) &&
+        Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) < address + size) {
+        return ReleaseNote::Sparse;
+    }
+    if (size > (u64{64} << 20)) {
+        return ReleaseNote::Split;
+    }
+    const std::optional<DAddr> device = memory.GpuToCpuAddress(address);
+    if (!device) {
+        return ReleaseNote::Unmapped;
+    }
+    if (memory.MaxContinuousRange(address, size) < size) {
+        return ReleaseNote::Split;
     }
     writer_ranges[writer_range_count++ % writer_ranges.size()] = {write_position, *device,
                                                                   *device + size};
@@ -734,6 +758,7 @@ void GpuSplit::NoteWriterRange(const Tegra::MemoryManager& memory, GPUVAddr addr
     writer_range_address = address;
     writer_range_size = size;
     writer_range_function = last_function_position;
+    return ReleaseNote::Ranged;
 }
 
 void GpuSplit::NoteDispatchWriter() {

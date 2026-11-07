@@ -28,6 +28,7 @@
 #include "video_core/fire_emblem_upscale.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/nx2_indirect_grid.h"
@@ -1509,7 +1510,7 @@ VideoCommon::SplitWriteTracker::Effect KeplerCompute::FrontEffect(u32 method) co
 void KeplerCompute::FrontNoteWriter(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                                     u32 argument) {
     // What ProcessNativeMethod writes memory for: QMD launches and inline QMDs dispatch, a report
-    // semaphore writes its 16 bytes, the inline upload its destination. The other registers
+    // semaphore up to 16 bytes, the inline upload its destination. The other registers
     // below the macros (plain or not), the macro code and bindings and the QMD actions it
     // ignores write nothing.
     using Kind = VideoCommon::GpuSplit::WriterKind;
@@ -1527,12 +1528,28 @@ void KeplerCompute::FrontNoteWriter(VideoCommon::GpuSplit& split, FrontState& fs
     case 0x107:
         split.NoteDispatchWriter();
         return;
-    case 0x6c3:
-        split.NoteWriterRange(memory_manager,
-                              (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) |
-                                  fs.registers[0x6c1],
-                              16, Kind::Release);
+    case 0x6c3: {
+        const GPUVAddr address =
+            (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
+        if ((VideoCore::Nx2Debug::Experiment(10) & 4) != 0) {
+            split.NoteWriterRange(memory_manager, address, 16, Kind::Release); // As before (A/B)
+            return;
+        }
+        // ProcessNativeReportSemaphore: operations 1 and 3 write nothing; a reduction writes 4
+        // bytes from a fence callback, translated then; a release goes to the query cache, which
+        // translates it at once (nothing when unmapped) and writes 4 bytes for a one-word report
+        // (a fence), else the 8-byte value and its timestamp.
+        const u32 operation = argument & 3;
+        if (operation != 0 && operation != 2) {
+            split.CountRelease(VideoCommon::GpuSplit::ReleaseNote::NoWrite);
+            return;
+        }
+        const bool reduction = ((argument >> 3) & 1) != 0;
+        const bool one_word = ((argument >> 28) & 1) != 0;
+        split.NoteReleaseWriter(memory_manager, address, reduction || one_word ? 4 : 16,
+                                !reduction);
         return;
+    }
     case KEPLER_COMPUTE_REG_INDEX(exec_upload):
         FrontNoteUpload(fs, argument);
         return;

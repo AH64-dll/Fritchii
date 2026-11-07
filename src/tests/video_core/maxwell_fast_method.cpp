@@ -447,6 +447,40 @@ TEST_CASE("GpuSplit compute and copy write ranges count only for reads they over
     REQUIRE(other_page == 3);
 }
 
+TEST_CASE("GpuSplit compute releases to unmapped memory write nothing",
+          "[video_core][maxwell_fast_method][gpu_split_writer_ranges]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using Kind = VideoCommon::GpuSplit::WriterKind;
+    using Note = VideoCommon::GpuSplit::ReleaseNote;
+    Fixture f;
+    f.memory.BindRasterizer(&f.rasterizer);
+    f.memory.Map(0x100000, 0x40000, 0x1000, Tegra::PTEKind::PITCH, false);
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+    const auto notes = [&split](Note note) {
+        return split.ReleaseNotes()[static_cast<size_t>(note)];
+    };
+
+    // Translated when the back runs it: GPU address 0 has no mapping, so nothing is written.
+    split.NoteReleaseWriter(f.memory, 0, 4, true);
+    REQUIRE_FALSE(split.WritersMayWriteSince(50, 0x40000, 0x1000));
+    REQUIRE(notes(Note::Unmapped) == 1);
+
+    // A reduction is translated when its fence signals: it may write anything.
+    Access::Advance(split, 10);
+    split.NoteReleaseWriter(f.memory, 0, 4, false);
+    REQUIRE(split.WritersMayWriteSince(105, 0x12345000, 4));
+    REQUIRE(notes(Note::LateUnmapped) == 1);
+
+    // Mapped: only its bytes.
+    Access::Advance(split, 10);
+    split.NoteReleaseWriter(f.memory, 0x100010, 16, true);
+    REQUIRE(split.WritersMayWriteSince(115, 0x4001c, 4));
+    REQUIRE_FALSE(split.WritersMayWriteSince(115, 0x40020, 4));
+    REQUIRE(notes(Note::Ranged) == 1);
+    REQUIRE(split.UnboundedWriters()[static_cast<size_t>(Kind::Release)] == 1);
+}
+
 TEST_CASE("GpuSplit dispatches count where the back recorded their writes",
           "[video_core][maxwell_fast_method][gpu_split_dispatch_writes]") {
     using Access = VideoCommon::GpuSplitTestAccess;
