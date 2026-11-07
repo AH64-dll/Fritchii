@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <bit>
 #include <climits>
@@ -975,7 +976,12 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     using DefPtr = Id StorageDefinitions::*;
     // Each helper scans every global storage buffer. Inlined at every call site, a compute shader
     // with many global accesses takes NVIDIA's compiler seconds (Ocarina of Time: up to 7.6 s each).
-    constexpr spv::FunctionControlMask function_control = spv::FunctionControlMask::DontInline;
+    // EDEN_NX2_SPIRV_INLINE_GLOBALS=1 lets the driver inline them again (for A/B tests).
+    static const spv::FunctionControlMask function_control = [] {
+        const char* value = std::getenv("EDEN_NX2_SPIRV_INLINE_GLOBALS");
+        return value != nullptr && value[0] == '1' ? spv::FunctionControlMask::MaskNone
+                                                   : spv::FunctionControlMask::DontInline;
+    }();
     const Id zero{u32_zero_value};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
                                auto&& callback) {
