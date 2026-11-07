@@ -1170,6 +1170,20 @@ bool Device::GetSuitability(bool requires_swapchain) {
     FOR_EACH_VK_FEATURE_EXT(FEATURE_EXTENSION);
     FOR_EACH_VK_EXTENSION(EXTENSION);
 
+    // EDEN_NX2_GPL=1: graphics pipelines linked from per-stage libraries (vk_pipeline_library).
+    graphics_pipeline_library_requested = [] {
+        const char* value = std::getenv("EDEN_NX2_GPL");
+        return value && *value && *value != '0';
+    }();
+    if (graphics_pipeline_library_requested &&
+        supported_extensions.contains(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+        supported_extensions.contains(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+        loaded_extensions.insert(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+        loaded_extensions.insert(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+    } else {
+        graphics_pipeline_library_requested = false;
+    }
+
     extensions.depth_stencil_resolve =
         extensions.depth_stencil_resolve &&
         (instance_version >= VK_API_VERSION_1_2 || extensions.create_renderpass2);
@@ -1282,6 +1296,12 @@ bool Device::GetSuitability(bool requires_swapchain) {
 #undef EXT_FEATURE
 #undef FEATURE
 
+    if (graphics_pipeline_library_requested) {
+        graphics_pipeline_library_features.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT;
+        SetNext(next, graphics_pipeline_library_features);
+    }
+
     // Perform the feature test.
     physical.GetFeatures2(features2);
 
@@ -1382,6 +1402,12 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.integer_dot_product.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES;
         SetNext(next, properties.integer_dot_product);
+    }
+
+    if (graphics_pipeline_library_requested) {
+        properties.graphics_pipeline_library.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT;
+        SetNext(next, properties.graphics_pipeline_library);
     }
 
     // Perform the property fetch.
@@ -1658,6 +1684,30 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.mesh_shader = features.mesh_shader.taskShader && features.mesh_shader.meshShader;
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,
                                        VK_EXT_MESH_SHADER_EXTENSION_NAME);
+
+    // VK_EXT_graphics_pipeline_library (EDEN_NX2_GPL): used only with fast linking, which makes
+    // a link cost a fraction of a millisecond.
+    if (graphics_pipeline_library_requested) {
+        const bool usable =
+            graphics_pipeline_library_features.graphicsPipelineLibrary &&
+            properties.graphics_pipeline_library.graphicsPipelineLibraryFastLinking;
+        if (!usable) {
+            LOG_WARNING(Render_Vulkan,
+                        "Nx2Perf gpl: the device has no graphics pipeline library fast linking, "
+                        "EDEN_NX2_GPL ignored");
+            loaded_extensions.erase(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+            loaded_extensions.erase(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+            graphics_pipeline_library_features.graphicsPipelineLibrary = VK_FALSE;
+        }
+        graphics_pipeline_library_enabled = usable;
+        if (usable) {
+            LOG_INFO(Render_Vulkan,
+                     "Nx2Perf gpl: graphics pipeline libraries on (fast linking, independent "
+                     "interpolation decoration {})",
+                     properties.graphics_pipeline_library
+                         .graphicsPipelineLibraryIndependentInterpolationDecoration);
+        }
+    }
 
     // VK_KHR_shader_quad_control
     // Quad control depends on maximal reconvergence; advertise neither unless
