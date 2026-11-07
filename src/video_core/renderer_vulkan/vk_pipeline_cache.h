@@ -112,6 +112,8 @@ struct ComputePipelineCacheEntry {
     std::string failure;
     /// Constant buffer slots that were null pointers at translation (see NullStoragePointerSlots)
     std::vector<std::pair<u32, u32>> null_pointer_slots;
+    /// Constant buffer slots bound as storage buffer pointers (see MappedStoragePointerKeys)
+    std::vector<u64> mapped_pointers;
     u32 rebuilds{};
 
     [[nodiscard]] ComputePipeline* Get(bool native, GPUVAddr address,
@@ -181,8 +183,11 @@ private:
 
     [[nodiscard]] bool StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const;
 
+    /// Translates the current compute program, binding the pointers in keep_pointers whatever
+    /// their slots hold now (see GenericEnvironment::KeepStoragePointers)
     ComputePipelineCacheEntry CreateComputePipeline(const ComputePipelineCacheKey& key,
-                                                     const ShaderInfo* shader);
+                                                    const ShaderInfo* shader,
+                                                    std::span<const u64> keep_pointers = {});
 
     ComputePipelineCacheEntry CreateComputePipeline(ShaderPools& pools,
                                                      const ComputePipelineCacheKey& key,

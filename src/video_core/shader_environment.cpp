@@ -72,6 +72,18 @@ static std::vector<std::pair<u32, u32>> NullStoragePointerSlots(
     return slots;
 }
 
+static std::vector<u64> MappedStoragePointerKeys(
+    const ::Common::unordered_map<u64, u8>& storage_pointer_types) {
+    std::vector<u64> keys;
+    for (const auto& [key, type] : storage_pointer_types) {
+        if (type != 0) {
+            keys.push_back(key);
+        }
+    }
+    std::ranges::sort(keys);
+    return keys;
+}
+
 static u64 NativeShaderHash(std::span<const u64> code) {
     return Common::CityHash64(reinterpret_cast<const char*>(code.data()), code.size() * sizeof(u64)) ^
            0x4f554e4345000002ULL;
@@ -251,9 +263,14 @@ std::vector<std::pair<u32, u32>> GenericEnvironment::NullStoragePointerSlots() c
     return VideoCommon::NullStoragePointerSlots(cbuf_values, storage_pointer_types);
 }
 
-size_t GenericEnvironment::MappedStoragePointerCount() const {
-    return static_cast<size_t>(std::ranges::count_if(
-        storage_pointer_types, [](const auto& pair) { return pair.second != 0; }));
+std::vector<u64> GenericEnvironment::MappedStoragePointerKeys() const {
+    return VideoCommon::MappedStoragePointerKeys(storage_pointer_types);
+}
+
+void GenericEnvironment::KeepStoragePointers(std::span<const u64> keys) {
+    for (const u64 key : keys) {
+        storage_pointer_types.insert_or_assign(key, u8{1});
+    }
 }
 
 std::optional<u64> GenericEnvironment::Analyze() {
@@ -1176,9 +1193,8 @@ std::vector<std::pair<u32, u32>> FileEnvironment::NullStoragePointerSlots() cons
     return VideoCommon::NullStoragePointerSlots(cbuf_values, storage_pointer_types);
 }
 
-size_t FileEnvironment::MappedStoragePointerCount() const {
-    return static_cast<size_t>(std::ranges::count_if(
-        storage_pointer_types, [](const auto& pair) { return pair.second != 0; }));
+std::vector<u64> FileEnvironment::MappedStoragePointerKeys() const {
+    return VideoCommon::MappedStoragePointerKeys(storage_pointer_types);
 }
 
 bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
