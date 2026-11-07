@@ -672,6 +672,7 @@ void BufferCache<P>::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
 
 template <class P>
 void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
+    ++native_bank_draw;
     do {
         channel_state->has_deleted_buffers = false;
         DoUpdateGraphicsBuffers(is_indexed);
@@ -1537,14 +1538,57 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = device_addr + check_size;
+        // EDEN_NX2_EXP4 (experiment, 0 = off): & 1 compares only the bytes of each page the
+        // binding covers; & 2 compares each byte at most once per draw. The guest writes a
+        // draw's data before it submits the draw, so comparing again within the same draw only
+        // finds writes meant for later draws, which their own binds check. A changed page is
+        // still copied and marked whole.
+        const int cost_mode = VideoCore::Nx2Debug::Experiment(4);
+        const bool trim = (cost_mode & 1) != 0;
+        const bool once_per_draw = (cost_mode & 2) != 0;
+        auto& cost = native_bank_stats;
+        if (cost_mode != 0) {
+            ++cost.binds;
+        }
         for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
             const u8* const guest = device_memory.template GetPointer<u8>(page);
             if (guest == nullptr) {
                 continue;
             }
+            const u32 begin =
+                trim ? static_cast<u32>((std::max)(page, device_addr) - page) : 0;
+            const u32 stop = trim ? static_cast<u32>((std::min<DAddr>)(page + Core::DEVICE_PAGESIZE,
+                                                                      end) - page)
+                                  : static_cast<u32>(Core::DEVICE_PAGESIZE);
             auto [it, inserted] = native_indirect_page_snapshots.try_emplace(page);
-            const bool same =
-                !inserted && std::memcmp(it->second.data(), guest, Core::DEVICE_PAGESIZE) == 0;
+            NativeBankPage& snapshot = it->second;
+            if (once_per_draw && !inserted && snapshot.checked_draw == native_bank_draw &&
+                snapshot.checked_begin <= begin && stop <= snapshot.checked_end) {
+                ++cost.pages_skipped;
+                continue;
+            }
+            const bool same = !inserted && std::memcmp(snapshot.words.data() + begin,
+                                                       guest + begin, stop - begin) == 0;
+            if (cost_mode != 0 && !inserted) {
+                ++cost.pages_compared;
+                cost.bytes_compared += stop - begin;
+                cost.bytes_trimmed += Core::DEVICE_PAGESIZE - (stop - begin);
+            }
+            if (once_per_draw && same) {
+                if (snapshot.checked_draw != native_bank_draw ||
+                    begin > snapshot.checked_end || stop < snapshot.checked_begin) {
+                    // Disjoint from what this draw compared before: keep the larger range.
+                    if (snapshot.checked_draw != native_bank_draw ||
+                        stop - begin > snapshot.checked_end - snapshot.checked_begin) {
+                        snapshot.checked_begin = begin;
+                        snapshot.checked_end = stop;
+                    }
+                } else {
+                    snapshot.checked_begin = (std::min)(snapshot.checked_begin, begin);
+                    snapshot.checked_end = (std::max)(snapshot.checked_end, stop);
+                }
+                snapshot.checked_draw = native_bank_draw;
+            }
             // EDEN_NX2_MME_DMA_STATS: how many checked pages had changed.
             if (static const bool stats = std::getenv("EDEN_NX2_MME_DMA_STATS") != nullptr;
                 stats) {
@@ -1571,8 +1615,29 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             if (same) {
                 continue;
             }
-            std::memcpy(it->second.data(), guest, Core::DEVICE_PAGESIZE);
+            std::memcpy(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE);
             memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
+            if (once_per_draw) {
+                snapshot.checked_draw = native_bank_draw;
+                snapshot.checked_begin = 0;
+                snapshot.checked_end = static_cast<u32>(Core::DEVICE_PAGESIZE);
+            }
+            if (cost_mode != 0 && !inserted) {
+                ++cost.pages_changed;
+            }
+        }
+        if (cost_mode != 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - cost.last_log >= std::chrono::seconds{5}) {
+                LOG_INFO(HW_GPU,
+                         "Native bank check (EXP4={}, 5 s): {} binds, {} pages compared ({} KiB), "
+                         "{} KiB outside the bindings not compared, {} pages skipped (compared "
+                         "earlier in the draw), {} pages changed",
+                         cost_mode, cost.binds, cost.pages_compared, cost.bytes_compared / 1024,
+                         cost.bytes_trimmed / 1024, cost.pages_skipped, cost.pages_changed);
+                cost = {};
+                cost.last_log = now;
+            }
         }
     }
     const bool use_fast_buffer = needs_alignment_stream

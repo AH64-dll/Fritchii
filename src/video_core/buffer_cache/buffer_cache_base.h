@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -478,7 +479,26 @@ public:
     /// The guest words of each page of native programs' indirectly read banks when last checked:
     /// unchanged pages keep their tracking (marking them CPU-modified costs two mprotect calls
     /// per page).
-    std::unordered_map<DAddr, std::array<u8, Core::DEVICE_PAGESIZE>> native_indirect_page_snapshots;
+    struct NativeBankPage {
+        std::array<u8, Core::DEVICE_PAGESIZE> words;
+        /// EDEN_NX2_EXP4 & 2: the bytes of the page compared during draw `checked_draw`.
+        u64 checked_draw = 0;
+        u32 checked_begin = 0;
+        u32 checked_end = 0;
+    };
+    std::unordered_map<DAddr, NativeBankPage> native_indirect_page_snapshots;
+    /// Counts graphics draws (UpdateGraphicsBuffers) for EDEN_NX2_EXP4 & 2.
+    u64 native_bank_draw = 0;
+    /// EDEN_NX2_EXP4 != 0: bank check cost, logged every 5 s.
+    struct NativeBankCheckStats {
+        u64 binds = 0;
+        u64 bytes_compared = 0;
+        u64 bytes_trimmed = 0;
+        u64 pages_compared = 0;
+        u64 pages_skipped = 0;
+        u64 pages_changed = 0;
+        std::chrono::steady_clock::time_point last_log{};
+    } native_bank_stats;
 
 private:
     template <typename Func>
