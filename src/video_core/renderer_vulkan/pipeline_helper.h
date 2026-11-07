@@ -269,7 +269,8 @@ public:
         return device->GetLogical().CreatePipelineLayout({
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             .pNext = nullptr,
-            .flags = independent_sets ? VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT
+            .flags = independent_sets ? static_cast<VkPipelineLayoutCreateFlags>(
+                                            VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT)
                                       : VkPipelineLayoutCreateFlags{},
             .setLayoutCount = static_cast<u32>(set_layouts.size()),
             .pSetLayouts = set_layouts.data(),

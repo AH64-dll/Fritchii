@@ -78,6 +78,14 @@ class RescalingPushConstant;
 class RenderAreaPushConstant;
 class Scheduler;
 
+/// Graphics pipeline libraries (EDEN_NX2_GPL): non-null `library_cache` builds the pipeline
+/// from shared per-stage libraries; `libraries_only` builds only the libraries (warm-up).
+struct GraphicsPipelineLibraryParams {
+    GraphicsPipelineLibraryCache* library_cache{};
+    std::array<u128, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> spirv_hashes{};
+    bool libraries_only{};
+};
+
 class GraphicsPipeline {
     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
 
@@ -90,11 +98,9 @@ public:
     /// Graphics pipeline libraries (EDEN_NX2_GPL): non-null `library_cache` builds the pipeline
     /// from per-stage libraries; the stages were emitted with one descriptor set per stage.
     /// `libraries_only` builds the shader libraries and nothing else (warm-up, no draw).
-    struct LibraryParams {
-        GraphicsPipelineLibraryCache* library_cache{};
-        std::array<u128, NUM_STAGES> spirv_hashes{};
-        bool libraries_only{};
-    };
+    // Declared outside the class: GCC rejects a default argument `= {}` of a nested struct
+    // with member initializers inside its enclosing class.
+    using LibraryParams = GraphicsPipelineLibraryParams;
 
     explicit GraphicsPipeline(
         Scheduler& scheduler, BufferCache& buffer_cache, TextureCache& texture_cache,
