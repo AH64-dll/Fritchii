@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <chrono>
 #include <cstddef>
 #include <limits>
 #include <map>
@@ -219,7 +220,23 @@ public:
         // submission and render pass, and the query keeps every bank it touches alive. Ocarina of
         // Time's title screen and file select reached 16,384 slots over 64 banks (its gameplay
         // windows span at most 36 slots). Past a bank, drop the count as a reset would.
-        if (current_query && current_query->size_slots > SamplesQueryBank::BANK_SIZE) {
+        // EDEN_NX2_EXP16=<slots> raises the limit (zortos293/Lichii#558/#570 for Ocarina's
+        // flickering water and windows; 16,384 hung AMD with the split GPU thread). Resets are
+        // logged every 5 s while they happen.
+        const int limit_setting = VideoCore::Nx2Debug::Experiment(16);
+        const size_t limit =
+            limit_setting > 0 ? static_cast<size_t>(limit_setting) : SamplesQueryBank::BANK_SIZE;
+        if (current_query && current_query->size_slots > limit) {
+            static u64 resets{};
+            static auto since = std::chrono::steady_clock::now();
+            ++resets;
+            if (const auto now = std::chrono::steady_clock::now();
+                now - since >= std::chrono::seconds{5}) {
+                LOG_INFO(Render_Vulkan, "Occlusion counter resets past {} slots: {} in {:.1f} s", limit,
+                         resets, std::chrono::duration<double>(now - since).count());
+                resets = 0;
+                since = now;
+            }
             ResetCounter();
         }
     }
