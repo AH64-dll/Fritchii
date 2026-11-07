@@ -11,6 +11,18 @@
 
 namespace VideoCommon {
 
+/// How many graphics pipelines to evict, least recently used first.
+/// @param cached Graphics pipelines in the cache.
+/// @param stale  Pipelines among them unused for long enough to be evicted.
+/// @param limit  Pipelines kept before any is evicted.
+/// @return Zero within the limit, else the excess, at most `stale`.
+constexpr size_t GraphicsPipelinesToEvict(size_t cached, size_t stale, size_t limit) {
+    if (cached <= limit) {
+        return 0;
+    }
+    return (std::min)(stale, cached - limit);
+}
+
 /// Attribute mask of a native vertex program, two bits per attribute as in
 /// FixedPipelineState::attribute_types.
 /// @param input_generic Components of each generic attribute in the program header's input map.

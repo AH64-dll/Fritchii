@@ -8,6 +8,25 @@
 
 using namespace VideoCommon;
 
+TEST_CASE("Graphics pipelines are evicted only past the limit", "[video_core][pipeline_cache]") {
+    SECTION("within the limit nothing is evicted, however stale") {
+        CHECK(GraphicsPipelinesToEvict(0, 0, 100) == 0);
+        CHECK(GraphicsPipelinesToEvict(100, 100, 100) == 0);
+        CHECK(GraphicsPipelinesToEvict(50, 50, 100) == 0);
+    }
+    SECTION("past the limit only the excess is evicted") {
+        CHECK(GraphicsPipelinesToEvict(101, 101, 100) == 1);
+        CHECK(GraphicsPipelinesToEvict(150, 80, 100) == 50);
+    }
+    SECTION("pipelines used recently are kept even past the limit") {
+        CHECK(GraphicsPipelinesToEvict(150, 20, 100) == 20);
+        CHECK(GraphicsPipelinesToEvict(150, 0, 100) == 0);
+    }
+    SECTION("a zero limit evicts every stale pipeline") {
+        CHECK(GraphicsPipelinesToEvict(10, 7, 0) == 7);
+    }
+}
+
 TEST_CASE("Vertex attribute mask follows the header's input map", "[video_core][pipeline_cache]") {
     std::array<std::array<bool, 4>, 32> inputs{};
     CHECK(VertexAttributeMask(inputs) == 0);
