@@ -3411,6 +3411,9 @@ public:
 private:
     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
+    void FrontTrackIndexDraws(FrontState& state, u32 method);
+    bool FrontSkipsIndexFirst(FrontState& state, u32 method, u32 value, bool shadow_kept);
+    void FrontReportSameWrites(FrontState& state);
     void FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
                               const u32* words, u32 count);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,

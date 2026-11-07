@@ -1076,6 +1076,18 @@ struct Maxwell3D::FrontState {
     bool upload_known{};
     /// The back's draw manager is in an instance loop (DrawMode::Instance): draw.end does nothing.
     bool instance_loop{};
+    /// EDEN_NX2_EXP2, read in Front(): same-value index_buffer.first writes are not sent.
+    int same_experiment{};
+    /// An inline or small index draw (which binds an index buffer not taken from the registers)
+    /// was sent since the last index_buffer.count write. Starts set: nothing is known.
+    bool other_index_draw{true};
+    /// EDEN_NX2_EXP2 counters, logged every ~5 s: writes the experiment dropped, writes the
+    /// existing same-value filters dropped, and writes sent.
+    u64 exp_skipped{};
+    u64 exp_same{};
+    u64 exp_sent{};
+    u64 exp_ticks{};
+    std::chrono::steady_clock::time_point exp_report{};
     u64 upload_device{};
     u32 upload_size{};
     u32 upload_offset{};
@@ -1206,7 +1218,76 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         executing_macro = 0;
         front_macros = true;
     }
+    front->same_experiment = VideoCore::Nx2Debug::Experiment(2);
     return *front;
+}
+
+namespace {
+
+// Indexed draws that bind an index buffer other than the registers' (inline indices, small index
+// draws): the back sets and consumes Dirty::IndexBuffer for them itself.
+bool IsOtherIndexDraw(u32 method) {
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(index_buffer32_first):
+    case MAXWELL3D_REG_INDEX(index_buffer16_first):
+    case MAXWELL3D_REG_INDEX(index_buffer8_first):
+    case MAXWELL3D_REG_INDEX(index_buffer32_subsequent):
+    case MAXWELL3D_REG_INDEX(index_buffer16_subsequent):
+    case MAXWELL3D_REG_INDEX(index_buffer8_subsequent):
+    case MAXWELL3D_REG_INDEX(draw_inline_index):
+    case MAXWELL3D_REG_INDEX(inline_index_2x16.even):
+    case MAXWELL3D_REG_INDEX(inline_index_4x8.index0):
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // Anonymous namespace
+
+void Maxwell3D::FrontTrackIndexDraws(FrontState& fs, u32 method) {
+    if (method == MAXWELL3D_REG_INDEX(index_buffer.count)) {
+        fs.other_index_draw = false;
+    } else if (IsOtherIndexDraw(method)) {
+        fs.other_index_draw = true;
+    }
+}
+
+bool Maxwell3D::FrontSkipsIndexFirst(FrontState& fs, u32 method, u32 value, bool shadow_kept) {
+    // EDEN_NX2_EXP2: index_buffer.first written with its value. On the back it only stores the
+    // register and sets Dirty::IndexBuffer (an instance loop method: no deferred draw flush, and
+    // the draw manager reads the register when it draws). The flag matters only when the index
+    // buffer binding is stale for the next register-indexed draw; that draw needs an
+    // index_buffer.count write (draw_indexed), which always sets the flag, unless the count was
+    // written before an inline or small index draw that rebound and consumed the flag (then the
+    // write is sent).
+    if (method != MAXWELL3D_REG_INDEX(index_buffer.first) || !fs.skip_same || !shadow_kept ||
+        fs.regs[method] != value || fs.other_index_draw) {
+        return false;
+    }
+    ++fs.exp_skipped;
+    return true;
+}
+
+void Maxwell3D::FrontReportSameWrites(FrontState& fs) {
+    if ((++fs.exp_ticks & 0xffff) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (fs.exp_report == std::chrono::steady_clock::time_point{}) {
+        fs.exp_report = now;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - fs.exp_report).count();
+    if (seconds < 5.0) {
+        return;
+    }
+    LOG_INFO(HW_GPU,
+             "EDEN_NX2_EXP2: 3D writes per second: {:.0f} sent, {:.0f} same-value index_buffer.first "
+             "not sent, {:.0f} other same-value writes not sent",
+             fs.exp_sent / seconds, fs.exp_skipped / seconds, fs.exp_same / seconds);
+    fs.exp_skipped = fs.exp_same = fs.exp_sent = 0;
+    fs.exp_report = now;
 }
 
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
@@ -1234,7 +1315,20 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         if (Profile::Enabled()) [[unlikely]] {
             Profile::Add(Profile::Counter::SameValueWrites, 1);
         }
+        if (fs.same_experiment != 0) [[unlikely]] {
+            ++fs.exp_same;
+            FrontReportSameWrites(fs);
+        }
         return;
+    }
+    if (fs.same_experiment != 0) [[unlikely]] {
+        if (execution_mask[method] && FrontSkipsIndexFirst(fs, method, value, shadow_kept)) {
+            if (Profile::Enabled()) [[unlikely]] {
+                Profile::Add(Profile::Counter::SameValueWrites, 1);
+            }
+            FrontReportSameWrites(fs);
+            return;
+        }
     }
     // What a constant buffer upload word or a report writes, for the front's macro memory reads.
     const auto [write_begin, write_end] = FrontWriteRange(fs, method, 1);
@@ -1250,11 +1344,16 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             if (Profile::Enabled()) [[unlikely]] {
                 Profile::Add(Profile::Counter::SameValueWrites, 1);
             }
+            if (fs.same_experiment != 0) [[unlikely]] {
+                ++fs.exp_same;
+                FrontReportSameWrites(fs);
+            }
             return;
         }
         fs.regs[method] = value;
     } else {
         fs.regs[method] = value;
+        FrontTrackIndexDraws(fs, method);
         effect = VideoCommon::SplitWriteTracker::Combine(effect, FrontMethodEffect(method));
         constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
         switch (method) {
@@ -1291,6 +1390,10 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             }
             break;
         }
+    }
+    if (fs.same_experiment != 0) [[unlikely]] {
+        ++fs.exp_sent;
+        FrontReportSameWrites(fs);
     }
     if (from_macro && (execution_mask[method] || !VideoCommon::GpuSplit::MacroSink())) {
         split.MacroWrite(this, method, argument, effect);
@@ -1409,6 +1512,13 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
     } else if (amount != 0) {
         FrontTrackInstanceLoop(fs, method, replay ? fs.shadow[method] : base_start[amount - 1]);
+    }
+    if (amount != 0) {
+        FrontTrackIndexDraws(fs, method);
+    }
+    if (fs.same_experiment != 0) [[unlikely]] {
+        fs.exp_sent += amount;
+        FrontReportSameWrites(fs);
     }
     // What CallMultiMethod does to the registers on the back, then one entry for all the words.
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
