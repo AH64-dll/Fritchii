@@ -2014,7 +2014,12 @@ private:
             VideoCommon::Nx2Perf::g_host_phase_ns.load(std::memory_order_relaxed);
         const long long refresh =
             VideoCommon::Nx2Perf::g_host_refresh_ns.load(std::memory_order_relaxed);
-        if (interval < 25ms || ahead < 0 || refresh <= 0) {
+        // Only on displays whose refresh divides the frame period (60/120/240 Hz for 30 FPS):
+        // on 75/144/165 Hz the frames land on a different phase each time and there is no
+        // single phase to aim for.
+        const long long refreshes = refresh > 0 ? (interval.count() + refresh / 2) / refresh : 0;
+        if (interval < 25ms || ahead < 0 || refresh <= 0 ||
+            std::abs(refreshes * refresh - interval.count()) * 100 > interval.count()) {
             m_phase = {};
             return;
         }
