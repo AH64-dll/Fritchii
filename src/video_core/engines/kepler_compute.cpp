@@ -34,6 +34,7 @@
 #include "video_core/game_dlss_status.h"
 #include "video_core/memory_manager.h"
 #include "video_core/native_query_trace.h"
+#include "video_core/oot_network.h"
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
 #endif
@@ -966,6 +967,97 @@ void KeplerCompute::DescribeNativeResources(const NativeQmdScheduler::Descriptor
                  static_cast<u32>(tic.g_type.Value()), static_cast<u32>(tic.b_type.Value()),
                  static_cast<u32>(tic.a_type.Value()));
     }
+}
+
+std::optional<Texture::TICEntry> KeplerCompute::ConstBuffer0Image(u32 offset) const {
+    const auto& cbuf = launch_description.const_buffer_config[0];
+    const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+    if (!(launch_description.const_buffer_enable_mask & 1) || cbuf.size.Value() < offset + 4 ||
+        !memory_manager.IsFullyMappedRange(cbuf_address + offset, 4)) {
+        return std::nullopt;
+    }
+    const u32 tic_index = memory_manager.Read<u32>(cbuf_address + offset) & 0xfffff;
+    if (tic_index > regs.tic.limit ||
+        !memory_manager.IsFullyMappedRange(regs.tic.Address() +
+                                               u64{tic_index} * sizeof(Texture::TICEntry),
+                                           sizeof(Texture::TICEntry))) {
+        return std::nullopt;
+    }
+    return GetTICEntry(tic_index);
+}
+
+bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
+    using namespace VideoCommon::OotNetwork;
+    if (!BypassEnabled(program_id)) {
+        return false;
+    }
+    auto* const state = rasterizer->OotNetworkBypass();
+    if (!state) {
+        return false;
+    }
+    // The tonemap pass draws before the network every frame; until it has been seen (menus, the
+    // first frame) the network runs as usual. Its first passes are skipped only while the output
+    // pass is being replaced, so a failed replacement brings the whole network back next frame.
+    const GPUVAddr tonemapped = state->tonemapped_image.load(std::memory_order_relaxed);
+    if (tonemapped == 0) {
+        return false;
+    }
+    if (native_key == PrepassProgramKey || native_key == NetworkProgramKey) {
+        return state->output_replaced.load(std::memory_order_relaxed);
+    }
+    if (native_key != OutputProgramKey) {
+        return false;
+    }
+    const auto output = ConstBuffer0Image(OutputImageHandleOffset);
+    if (!output || output->format != Texture::TextureFormat::B10G11R11 || output->Address() == 0 ||
+        output->Address() == tonemapped || !output->IsBlockLinear()) {
+        state->output_replaced.store(false, std::memory_order_relaxed);
+        static bool warned = false;
+        if (!std::exchange(warned, true)) {
+            LOG_WARNING(HW_GPU, "Ocarina of Time: unexpected network output image; not replaced");
+        }
+        return false;
+    }
+    // The tonemapped image is a render target of the output's size, format and layout.
+    Fermi2D::Surface destination{};
+    destination.format = Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+    destination.linear = Fermi2D::MemoryLayout::BlockLinear;
+    destination.block_width.Assign(output->block_width);
+    destination.block_height.Assign(output->block_height);
+    destination.block_depth.Assign(output->block_depth);
+    destination.depth = 1;
+    destination.width = output->Width();
+    destination.height = output->Height();
+    destination.addr_upper = static_cast<u32>(output->Address() >> 32);
+    destination.addr_lower = static_cast<u32>(output->Address());
+    Fermi2D::Surface source = destination;
+    source.addr_upper = static_cast<u32>(tonemapped >> 32);
+    source.addr_lower = static_cast<u32>(tonemapped);
+    const s32 width = static_cast<s32>(output->Width());
+    const s32 height = static_cast<s32>(output->Height());
+    const Fermi2D::Config config{
+        .operation = Fermi2D::Operation::SrcCopy,
+        .filter = Fermi2D::Filter::Point,
+        .must_accelerate = true,
+        .dst_x0 = 0,
+        .dst_y0 = 0,
+        .dst_x1 = width,
+        .dst_y1 = height,
+        .src_x0 = 0,
+        .src_y0 = 0,
+        .src_x1 = width,
+        .src_y1 = height,
+    };
+    const bool copied = rasterizer->AccelerateSurfaceCopy(source, destination, config);
+    state->output_replaced.store(copied, std::memory_order_relaxed);
+    static bool logged = false;
+    if (!std::exchange(logged, true)) {
+        LOG_INFO(HW_GPU,
+                 "Ocarina of Time: anti-aliasing network bypassed ({}): {:#x} -> {:#x} {}x{}",
+                 copied ? "copy of the tonemapped image" : "copy failed", tonemapped,
+                 output->Address(), width, height);
+    }
+    return copied;
 }
 
 std::atomic<u32> g_nx2_trace_draws_after_upscale{};
