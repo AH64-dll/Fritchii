@@ -284,62 +284,9 @@ public:
     /// Waits until the back executed everything sent so far.
     void Drain(DrainSite site = DrainSite::Other);
 
-    /// What sent compute or copy work that may write any memory (EXP10's log line).
-    enum class WriterKind : u32 {
-        Dispatch, ///< QMD launches and inline QMDs
-        Compute,  ///< Other compute methods (uploads, unknown methods)
-        Copy,     ///< Copies the front could not bound
-        Other,    ///< Writers no engine front classified
-        Count,
-    };
     /// Compute or copy work was just sent: what can write GPU-written command lists.
-    /// `classified`: the engine's front noted what that work writes (NoteWriterRange and
-    /// NoteUnboundedWriter); otherwise it may write anything.
-    void NoteWriter(bool classified = false) {
+    void NoteWriter() {
         last_writer_position = write_position;
-        if (!classified) {
-            NoteUnboundedWriter(WriterKind::Other);
-        }
-    }
-    /// Compute or copy work just sent may write any memory.
-    void NoteUnboundedWriter(WriterKind kind) {
-        last_unbounded_writer_position = write_position;
-        ++unbounded_writers[static_cast<size_t>(kind)];
-    }
-    /// Compute or copy work just sent writes only [address, address + size) of `memory` (a copy's
-    /// destination, a release); counts as unbounded when the front can't translate it as the
-    /// back will.
-    void NoteWriterRange(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
-                         WriterKind kind);
-    /// Whether compute or copy work sent after position `since` may write device bytes
-    /// [begin, begin + size): an unbounded writer, or a noted range that overlaps them.
-    [[nodiscard]] bool WritersMayWriteSince(u64 since, u64 begin, u64 size) const {
-        if (last_unbounded_writer_position > since) {
-            return true;
-        }
-        // At most MaxWriterScan ranges are compared (a drained read takes a new snapshot), and
-        // more than are remembered count as overlapping.
-        const u64 end = begin + size;
-        const u64 remembered = (std::min<u64>)(writer_range_count, writer_ranges.size());
-        const u64 limit = (std::min<u64>)(remembered, MaxWriterScan);
-        for (u64 scanned = 0; scanned < limit; ++scanned) {
-            const WriterRange& range =
-                writer_ranges[(writer_range_count - 1 - scanned) % writer_ranges.size()];
-            if (range.position <= since) {
-                return false;
-            }
-            if (range.begin < end && begin < range.end) {
-                return true;
-            }
-        }
-        return limit == MaxWriterScan || remembered == writer_ranges.size();
-    }
-    [[nodiscard]] u64 LastUnboundedWriterPosition() const {
-        return last_unbounded_writer_position;
-    }
-    [[nodiscard]] const std::array<u64, static_cast<size_t>(WriterKind::Count)>&
-    UnboundedWriters() const {
-        return unbounded_writers;
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
@@ -375,11 +322,6 @@ public:
         if (last_writer_position > since || last_unranged_position > since) {
             return true;
         }
-        return NotedWriteSince(since, begin, size);
-    }
-    /// The noted-write part of MayBeWrittenSince: a NoteMemoryWrite sent after `since` overlaps
-    /// [begin, begin + size), or more were noted since than are remembered.
-    [[nodiscard]] bool NotedWriteSince(u64 since, u64 begin, u64 size) const {
         if (last_memory_writer_position <= since) {
             return false;
         }
@@ -632,17 +574,6 @@ private:
     };
     std::array<PendingWrite, 8192> pending_writes{};
     u64 pending_write_count{};
-    /// Compute and copy writes with a known device range (NoteWriterRange), newest last.
-    struct WriterRange {
-        u64 position;
-        u64 begin;
-        u64 end;
-    };
-    std::array<WriterRange, 256> writer_ranges{};
-    static constexpr u64 MaxWriterScan = 128;
-    u64 writer_range_count{};
-    u64 last_unbounded_writer_position{};
-    std::array<u64, static_cast<size_t>(WriterKind::Count)> unbounded_writers{};
     u64 last_sync_position{};
     u64 last_memory_write_position{};
     static constexpr u32 DeferredWrite = ~0U;

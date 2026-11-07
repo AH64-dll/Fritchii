@@ -1964,52 +1964,21 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             static u64 differences{};
             static u64 report_reads{};
             static std::array<u64, 4> miss_reasons{};
-            // EXP10: compute and copies sent since count only where their writes may reach the
-            // bytes read (GpuSplit::WritersMayWriteSince); those dispatches and copies whose
-            // ranges the front can't tell still count for every read.
-            const bool ranged_writers = VideoCore::Nx2Debug::Experiment(10) != 0;
-            static u64 writer_unbounded{};
-            static u64 writer_overlaps{};
-            static u64 range_skips{};
-            static u64 range_differences{};
-            bool range_skip = false;
             const u64 first_page = *device >> 12;
             const u64 last_page = (*device + read_bytes - 1) >> 12;
             bool hit = true;
             for (u64 page = first_page; page <= last_page && hit; ++page) {
                 const auto it = fs.dma_snapshots.find(page);
-                if (it == fs.dma_snapshots.end()) {
-                    hit = false;
-                    ++miss_reasons[0];
-                    break;
-                }
-                // Compute/copy sent since, unranged writer sent since, noted write.
-                const u64 since = it->second;
-                const bool writer_since = split.LastWriterPosition() > since;
-                u32 reason = 4;
-                if (!ranged_writers) {
-                    reason = writer_since                             ? 1
-                             : split.LastUnrangedPosition() > since ? 2
-                             : split.NotedWriteSince(since, *device, read_bytes) ? 3
-                                                                                 : 4;
-                } else if (split.WritersMayWriteSince(since, *device, read_bytes)) {
-                    reason = 1;
-                    ++(split.LastUnboundedWriterPosition() > since ? writer_unbounded
-                                                                   : writer_overlaps);
-                } else if (split.LastUnrangedPosition() > since) {
-                    reason = 2;
-                } else if (split.NotedWriteSince(since, *device, read_bytes)) {
-                    reason = 3;
-                } else {
-                    range_skip |= writer_since;
-                }
-                if (reason != 4) {
-                    hit = false;
+                hit = it != fs.dma_snapshots.end() &&
+                      !split.MayBeWrittenSince(it->second, *device, read_bytes);
+                if (!hit) {
+                    // No snapshot, compute/copy sent since, unranged writer sent since, noted write.
+                    const u32 reason = it == fs.dma_snapshots.end()                   ? 0
+                                       : split.LastWriterPosition() > it->second   ? 1
+                                       : split.LastUnrangedPosition() > it->second ? 2
+                                                                                   : 3;
                     ++miss_reasons[reason];
                 }
-            }
-            if (hit && range_skip) {
-                ++range_skips;
             }
             // A report's value is up to 8 bytes, listed by its first 4: look 12 bytes back. A
             // listed report may not be in guest memory yet: take the drained path.
@@ -2026,13 +1995,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                         std::vector<u32> exact(words);
                         memory_manager.ReadBlockUnsafe(source, exact.data(), read_bytes);
                         if (exact != snap_words) {
-                            range_differences += range_skip ? 1 : 0;
                             if (differences++ < 32) {
                                 LOG_WARNING(HW_GPU,
                                             "DMA snapshot check: macro {:#x} read of {} words at "
-                                            "{:#x} differs from the drained read ({:#x} vs {:#x}){}",
-                                            macro, words, source, snap_words[0], exact[0],
-                                            range_skip ? " (skipped by EXP10 ranges)" : "");
+                                            "{:#x} differs from the drained read ({:#x} vs {:#x})",
+                                            macro, words, source, snap_words[0], exact[0]);
                             }
                             snap_words = std::move(exact);
                         }
@@ -2073,17 +2040,6 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                              "compute/copy, {} unranged, {} noted write",
                              hits, misses, differences, report_reads, miss_reasons[0],
                              miss_reasons[1], miss_reasons[2], miss_reasons[3]);
-                    if (ranged_writers) {
-                        const auto& sent = split.UnboundedWriters();
-                        LOG_INFO(HW_GPU,
-                                 "DMA snapshot EXP10: compute/copy: {} drained ({} unbounded, {} "
-                                 "overlapping ranges), {} skipped by ranges ({} differed); "
-                                 "unbounded writers sent: {} dispatch, {} compute, {} copy, {} "
-                                 "other",
-                                 writer_unbounded + writer_overlaps, writer_unbounded,
-                                 writer_overlaps, range_skips, range_differences, sent[0],
-                                 sent[1], sent[2], sent[3]);
-                    }
                 }
                 for (u32 i = 0; i < words; ++i) {
                     fs.parameters.push_back(snap_words[i]);

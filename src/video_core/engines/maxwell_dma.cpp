@@ -6,7 +6,6 @@
 
 #include <cstdlib>
 #include "common/algorithm.h"
-#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging.h"
 #include <ranges>
@@ -14,7 +13,6 @@
 #include "core/core.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
-#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_base.h"
@@ -62,91 +60,6 @@ void MaxwellDMA::CallMultiMethod(Core::System& system, u32 method, const u32* ba
     for (u32 i = 0; i < amount; ++i) {
         CallMethod(system, method, base_start[i], methods_pending - i <= 1);
     }
-}
-
-void MaxwellDMA::FrontMethod(VideoCommon::GpuSplit& split, u32 method, const u32* arguments,
-                             u32 amount) {
-    if (!front_regs) [[unlikely]] {
-        // Copy the back's registers while it is idle, with the writes its method sink holds.
-        split.Drain(VideoCommon::DrainSite::FrontStart);
-        front_regs = std::make_unique<std::array<u32, 0x200>>();
-        std::copy_n(regs.reg_array.begin(), front_regs->size(), front_regs->begin());
-        for (const auto& [sink_method, value] : method_sink) {
-            if (sink_method < front_regs->size()) {
-                (*front_regs)[sink_method] = value;
-            }
-        }
-    }
-    for (u32 i = 0; i < amount; ++i) {
-        if (method < front_regs->size()) {
-            (*front_regs)[method] = arguments[i];
-        }
-        if (method == offsetof(Regs, launch_dma) / sizeof(u32)) {
-            FrontNoteLaunch(split, arguments[i]);
-        }
-    }
-}
-
-void MaxwellDMA::FrontNoteLaunch(VideoCommon::GpuSplit& split, u32 launch) {
-    // What Launch and ReleaseSemaphore write, from the same registers, never less.
-    using Kind = VideoCommon::GpuSplit::WriterKind;
-    const auto& r = *front_regs;
-    const auto reg = [&r](size_t offset) { return r[offset / sizeof(u32)]; };
-    const auto address = [&reg](size_t offset) {
-        return (GPUVAddr{reg(offset) & 0xff} << 32) | reg(offset + sizeof(u32));
-    };
-    // LaunchDMA: semaphore_type, dst_memory_layout, multi_line_enable, remap_enable, src/dst_type.
-    const u32 semaphore_type = (launch >> 3) & 3;
-    const bool dst_pitch = ((launch >> 8) & 1) != 0;
-    const bool multi_line = ((launch >> 9) & 1) != 0;
-    const bool remap = ((launch >> 10) & 1) != 0;
-    const bool physical = ((launch >> 12) & 3) != 0;
-    if (semaphore_type != 0) {
-        split.NoteWriterRange(memory_manager, address(offsetof(Regs, semaphore)), 16, Kind::Copy);
-    }
-    if (physical) {
-        split.NoteUnboundedWriter(Kind::Copy);
-        return;
-    }
-    // RemapConst word 2: dst_x bits 0-2, component size bits 16-17, dst components bits 24-25.
-    const u32 components = reg(offsetof(Regs, remap_const) + 2 * sizeof(u32));
-    const u64 remap_bytes =
-        remap ? u64{((components >> 16) & 3) + 1} * (((components >> 24) & 3) + 1) : 1;
-    const GPUVAddr destination = address(offsetof(Regs, offset_out));
-    const u64 length = reg(offsetof(Regs, line_length_in));
-    const u64 lines = (std::max)(reg(offsetof(Regs, line_count)), 1U);
-    GPUVAddr begin = destination;
-    u64 size = 0;
-    if (!multi_line) {
-        // A constant fill writes up to 4 bytes an element (BufferClear); a copy to a block linear
-        // page moves 16-byte pieces within their 512-byte GOB.
-        const bool fill = remap && (components & 7) == 4;
-        begin = destination & ~GPUVAddr{0x1ff};
-        size = Common::AlignUp(destination + length * (fill ? 4 : remap_bytes), 0x200) - begin;
-    } else if (dst_pitch) {
-        const s32 pitch = static_cast<s32>(reg(offsetof(Regs, pitch_out)));
-        if (pitch < 0) {
-            split.NoteUnboundedWriter(Kind::Copy);
-            return;
-        }
-        const u64 pitch_bytes = static_cast<u64>(pitch);
-        size = (std::max)(pitch_bytes * lines, pitch_bytes * (lines - 1) + length * remap_bytes);
-    } else {
-        constexpr size_t params = offsetof(Regs, dst_params);
-        const u32 block = reg(params);
-        const u64 row_bytes = u64{reg(params + 4)} * remap_bytes;
-        const u32 height = reg(params + 8);
-        const u32 depth = (std::max)(reg(params + 12), 1U);
-        const u32 layer = reg(params + 16);
-        if ((block & 0xf) != 0 || layer != 0 || row_bytes >= (u64{1} << 20) ||
-            height >= (1U << 16) || depth >= (1U << 12)) {
-            split.NoteUnboundedWriter(Kind::Copy);
-            return;
-        }
-        size = CalculateSize(true, 1, static_cast<u32>(row_bytes), height, depth,
-                             (block >> 4) & 0xf, (block >> 8) & 0xf);
-    }
-    split.NoteWriterRange(memory_manager, begin, size, Kind::Copy);
 }
 
 void MaxwellDMA::Launch() {

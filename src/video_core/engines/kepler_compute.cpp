@@ -1408,7 +1408,6 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     FollowNote("", method, argument);
     if (method >= fs.registers.size()) {
         split.Method(this, method, argument, is_last_call, segment);
-        split.NoteUnboundedWriter(VideoCommon::GpuSplit::WriterKind::Compute);
         return;
     }
     if (method >= 0xe00) {
@@ -1431,7 +1430,6 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     FrontApply(fs, method, argument);
     split.Method(this, method, argument, is_last_call, segment, FrontEffect(method));
     FrontNoteWrites(split, fs, method);
-    FrontNoteWriter(split, fs, method, argument);
     if (method == 0x6c3) {
         FrontNoteRelease(split, fs, argument);
     }
@@ -1470,40 +1468,6 @@ VideoCommon::SplitWriteTracker::Effect KeplerCompute::FrontEffect(u32 method) co
     default:
         return Effect::Unknown; // Inline uploads among them
     }
-}
-
-void KeplerCompute::FrontNoteWriter(VideoCommon::GpuSplit& split, const FrontState& fs,
-                                    u32 method, u32 argument) {
-    // What ProcessNativeMethod writes memory for: plain registers, the macro code and bindings
-    // and the QMD actions it ignores write nothing, a report semaphore its 16 bytes.
-    using Kind = VideoCommon::GpuSplit::WriterKind;
-    if (FrontEffect(method) == VideoCommon::SplitWriteTracker::Effect::None) {
-        return;
-    }
-    switch (method) {
-    case 0xae:
-        return;
-    case 0xaf:
-        if ((argument & 2) == 0) {
-            return;
-        }
-        break;
-    case 0xb0:
-        if ((argument & 15) <= 1) {
-            return;
-        }
-        break;
-    case 0x6c3:
-        split.NoteWriterRange(memory_manager,
-                              (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) |
-                                  fs.registers[0x6c1],
-                              16, Kind::Compute);
-        return;
-    default:
-        break;
-    }
-    const bool dispatch = method == 0xaf || method == 0xb0 || method == 0x107;
-    split.NoteUnboundedWriter(dispatch ? Kind::Dispatch : Kind::Compute);
 }
 
 void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u32 method) {
@@ -1555,9 +1519,6 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
     }
     if (method >= fs.registers.size() || amount == 0) {
         split.MultiMethod(this, method, base_start, amount, methods_pending, segment);
-        if (amount != 0) {
-            split.NoteUnboundedWriter(VideoCommon::GpuSplit::WriterKind::Compute);
-        }
         return;
     }
     for (u32 i = 0; i < amount; ++i) {
@@ -1567,9 +1528,6 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment,
                       FrontEffect(method));
     FrontNoteWrites(split, fs, method);
-    for (u32 i = 0; i < amount; ++i) {
-        FrontNoteWriter(split, fs, method, base_start[i]);
-    }
 }
 
 void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1614,7 +1572,6 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         FrontApply(fs, address, value);
         split.MacroWrite(this, address, value, FrontEffect(address));
         FrontNoteWrites(split, fs, address);
-        FrontNoteWriter(split, fs, address, value);
         if (address == 0x6c3) {
             FrontNoteRelease(split, fs, value);
         }

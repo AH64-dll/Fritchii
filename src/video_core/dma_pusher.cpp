@@ -31,7 +31,6 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
-#include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
@@ -674,11 +673,9 @@ void DmaPusher::CallMethod(u32 argument) {
         const bool memory_writer = split.Active() &&
                                    (engine_type == Engines::EngineTypes::KeplerMemory ||
                                     engine_type == Engines::EngineTypes::Fermi2D);
-        // Whether the engine's front noted what the work sent writes (GpuSplit::NoteWriter).
-        bool classified = false;
         SCOPE_EXIT {
             if (writer) {
-                split.NoteWriter(classified);
+                split.NoteWriter();
             } else if (memory_writer) {
                 split.NoteUnrangedWriter();
             }
@@ -699,18 +696,12 @@ void DmaPusher::CallMethod(u32 argument) {
                     if (compute->FrontRunsMacros()) {
                         compute->FrontCallMethod(system, split, dma_state.method, argument,
                                                  dma_state.is_last_call, &segment);
-                        classified = true;
                         return;
                     }
                 }
             }
             split.Method(subchannel, dma_state.method, argument, dma_state.is_last_call,
                          WantsSegment() ? &segment : nullptr, effect);
-            if (engine_type == Engines::EngineTypes::MaxwellDMA) {
-                static_cast<Engines::MaxwellDMA*>(subchannel)->FrontMethod(
-                    split, dma_state.method, &argument, 1);
-                classified = true;
-            }
             return;
         }
         if (!subchannel->execution_mask[dma_state.method]) {
@@ -751,11 +742,9 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         const bool memory_writer = split.Active() &&
                                    (engine_type == Engines::EngineTypes::KeplerMemory ||
                                     engine_type == Engines::EngineTypes::Fermi2D);
-        // Whether the engine's front noted what the work sent writes (GpuSplit::NoteWriter).
-        bool classified = false;
         SCOPE_EXIT {
             if (writer) {
-                split.NoteWriter(classified);
+                split.NoteWriter();
             } else if (memory_writer) {
                 split.NoteUnrangedWriter();
             }
@@ -776,18 +765,12 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                     if (compute->FrontRunsMacros()) {
                         compute->FrontCallMultiMethod(system, split, dma_state.method, base_start,
                                                       num_methods, dma_state.method_count, &segment);
-                        classified = true;
                         return;
                     }
                 }
             }
             split.MultiMethod(subchannel, dma_state.method, base_start, num_methods,
                               dma_state.method_count, WantsSegment() ? &segment : nullptr, effect);
-            if (engine_type == Engines::EngineTypes::MaxwellDMA) {
-                static_cast<Engines::MaxwellDMA*>(subchannel)->FrontMethod(
-                    split, dma_state.method, base_start, num_methods);
-                classified = true;
-            }
             return;
         }
         VideoCommon::Nx2Profile::Scope method_scope{VideoCommon::Nx2Profile::Zone::Method};
