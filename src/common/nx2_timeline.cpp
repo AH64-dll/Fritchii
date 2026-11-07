@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -29,16 +30,36 @@ struct Event {
     const char* name;
 };
 
-struct ThreadBuffer {
-    std::mutex mutex;
-    std::vector<Event> events;
-    u64 thread_id{};
-    std::string name;
-};
-
 // At most this many spans per thread and recording (the GPU threads make ~200,000 a second,
 // the front's macros over a million: consecutive spans of one name merge, see Record).
 constexpr size_t MaxEvents = size_t{1} << 22;
+// Spans are kept in chunks of this many: one vector grown to millions of spans was copied whole
+// at each growth, under the recording thread's span (GPUBack stalled 2.5 to 15.7 ms each time,
+// which showed as the longest fence-release drains in Ocarina of Time traces).
+constexpr size_t ChunkEvents = size_t{1} << 16;
+
+struct ThreadBuffer {
+    std::mutex mutex;
+    std::vector<std::vector<Event>> chunks;
+    size_t count{};
+    u64 thread_id{};
+    std::string name;
+
+    [[nodiscard]] Event* Last() {
+        return count == 0 ? nullptr : &chunks.back().back();
+    }
+    void Push(const Event& event) {
+        if (chunks.empty() || chunks.back().size() == ChunkEvents) {
+            chunks.emplace_back().reserve(ChunkEvents);
+        }
+        chunks.back().push_back(event);
+        ++count;
+    }
+    void Clear() {
+        chunks.clear();
+        count = 0;
+    }
+};
 // Spans of the same name closer than this merge into one.
 constexpr u64 MergeGapNs = 2000;
 
@@ -118,12 +139,14 @@ void Write(const std::filesystem::path& path, double seconds) {
         first = false;
     };
     for (const auto& buffer : buffers) {
-        std::vector<Event> events;
+        std::vector<std::vector<Event>> chunks;
+        size_t count{};
         {
             std::scoped_lock lock{buffer->mutex};
-            events.swap(buffer->events);
+            chunks.swap(buffer->chunks);
+            count = std::exchange(buffer->count, 0);
         }
-        if (events.empty()) {
+        if (count == 0) {
             continue;
         }
         comma();
@@ -131,6 +154,12 @@ void Write(const std::filesystem::path& path, double seconds) {
                             buffer->thread_id);
         AppendEscaped(json, buffer->name);
         json += "\"}}";
+        std::vector<Event> events;
+        events.reserve(count);
+        for (const auto& chunk : chunks) {
+            events.insert(events.end(), chunk.begin(), chunk.end());
+        }
+        chunks.clear();
         for (const Event& event : events) {
             comma();
             json += R"({"name":")";
@@ -145,7 +174,7 @@ void Write(const std::filesystem::path& path, double seconds) {
             }
             json += '}';
         }
-        total += events.size();
+        total += count;
     }
     json += "\n]}\n";
     std::error_code error;
@@ -173,17 +202,16 @@ void Record(const char* name, u64 begin_ns, u64 end_ns) {
     if (!Active()) {
         return;
     }
-    if (!buffer.events.empty()) {
-        Event& last = buffer.events.back();
-        const u64 last_end = last.begin + last.duration;
-        if (last.name == name && last.duration != 0 && begin_ns >= last_end &&
+    if (Event* const last = buffer.Last()) {
+        const u64 last_end = last->begin + last->duration;
+        if (last->name == name && last->duration != 0 && begin_ns >= last_end &&
             begin_ns - last_end < MergeGapNs) {
-            last.duration = end_ns - last.begin;
+            last->duration = end_ns - last->begin;
             return;
         }
     }
-    if (buffer.events.size() < MaxEvents) {
-        buffer.events.push_back({begin_ns, (std::max)(end_ns - begin_ns, u64{1}), name});
+    if (buffer.count < MaxEvents) {
+        buffer.Push({begin_ns, (std::max)(end_ns - begin_ns, u64{1}), name});
     }
 }
 
@@ -193,8 +221,8 @@ void Instant(const char* name) {
     }
     ThreadBuffer& buffer = Buffer();
     std::scoped_lock lock{buffer.mutex};
-    if (buffer.events.size() < MaxEvents && Active()) {
-        buffer.events.push_back({Now(), 0, name});
+    if (buffer.count < MaxEvents && Active()) {
+        buffer.Push({Now(), 0, name});
     }
 }
 
@@ -207,7 +235,7 @@ bool Start(const std::filesystem::path& path, double seconds, bool detail) {
         std::scoped_lock lock{g_registry_mutex};
         for (const auto& buffer : g_buffers) {
             std::scoped_lock buffer_lock{buffer->mutex};
-            buffer->events.clear();
+            buffer->Clear();
         }
     }
     g_start_ns = Now();
