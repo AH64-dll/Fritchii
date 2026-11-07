@@ -1655,9 +1655,11 @@ bool InPart(GplPart part, size_t stage) {
                                              : !IsPreRasterizationStage(stage);
 }
 
-VkPipelineCreateFlags LibraryFlags() {
+/// Create flags of a shader library, keeping link time optimization info when optimized links are
+/// on or fast links are not usable on `device`.
+VkPipelineCreateFlags LibraryFlags(const Device& device) {
     VkPipelineCreateFlags flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
-    if (GplOptimizeEnabled()) {
+    if (GplOptimizeEnabled() || !device.CanFastLinkGraphicsLibraries()) {
         flags |= VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
     }
     return flags;
@@ -1670,7 +1672,7 @@ std::string GraphicsPipeline::ShaderLibraryKey(GplPart part, const PipelineState
     key_writer.Add(static_cast<u32>(part));
     // Same render pass handle = same formats and samples (the render pass cache keeps them).
     key_writer.Add(render_pass);
-    key_writer.Add(static_cast<u32>(LibraryFlags()));
+    key_writer.Add(static_cast<u32>(LibraryFlags(device)));
     const VkPushConstantRange push_range{DescriptorLayoutBuilder{device}.PushConstantRange()};
     key_writer.Add(push_range.stageFlags);
     key_writer.Add(push_range.offset);
@@ -1810,7 +1812,7 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
     library.pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = &library_ci,
-        .flags = LibraryFlags(),
+        .flags = LibraryFlags(device),
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.empty() ? nullptr : shader_stages.data(),
         .pVertexInputState = nullptr,
@@ -1917,7 +1919,7 @@ bool GraphicsPipeline::MakeLibraryPipeline(VkRenderPass render_pass) {
     vertex_input_library = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = &vertex_input_ci,
-        .flags = LibraryFlags(),
+        .flags = LibraryFlags(device),
         .stageCount = 0,
         .pStages = nullptr,
         .pVertexInputState = &states.vertex_input_ci,
@@ -1943,7 +1945,7 @@ bool GraphicsPipeline::MakeLibraryPipeline(VkRenderPass render_pass) {
     fragment_output_library = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = &fragment_output_ci,
-        .flags = LibraryFlags(),
+        .flags = LibraryFlags(device),
         .stageCount = 0,
         .pStages = nullptr,
         .pVertexInputState = nullptr,
@@ -1961,7 +1963,7 @@ bool GraphicsPipeline::MakeLibraryPipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
-    pipeline = LinkLibraries(render_pass, false);
+    pipeline = LinkLibraries(render_pass, !device.CanFastLinkGraphicsLibraries());
     linked = true;
     return true;
 }
