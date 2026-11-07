@@ -78,10 +78,16 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // The CPU usually releases the semaphore soon after: poll for half a
                     // millisecond before sleeping, or every wait also waits out a host sleep
                     // (title 1 waits ~25 times a second).
+                    // EDEN_NX2_EXP6 (zortos293/Lichii#446): 1 = 50 us sleeps (Ocarina waits here
+                    // ~330 times a second and its present waits for the work behind them; on
+                    // Windows a sleep still lasts one timer tick, ~0.5 ms), 2 = always yield.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
-                    if (std::chrono::steady_clock::now() - last_progress <
-                        std::chrono::microseconds{500}) {
+                    const int poll = VideoCore::Nx2Debug::Experiment(6);
+                    if (poll == 2 || std::chrono::steady_clock::now() - last_progress <
+                                         std::chrono::microseconds{500}) {
                         std::this_thread::yield();
+                    } else if (poll == 1) {
+                        std::this_thread::sleep_for(std::chrono::microseconds{50});
                     } else {
                         std::this_thread::sleep_for(std::chrono::milliseconds{1});
                     }
