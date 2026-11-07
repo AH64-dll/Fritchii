@@ -1200,7 +1200,8 @@ std::vector<u64> FileEnvironment::MappedStoragePointerKeys() const {
 bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
     const auto it = storage_pointer_types.find(MakeCbufKey(index, offset));
     if (it == storage_pointer_types.end()) {
-        throw Shader::LogicError("Uncached storage pointer classification");
+        throw Shader::LogicError("Uncached storage pointer classification c{}[{:#x}]", index,
+                                 offset);
     }
     return it->second != 0;
 }
@@ -1208,7 +1209,8 @@ bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
 bool FileEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
     const auto it = storage_pointer_types.find(MakeIndirectCbufKey(index, offset, indirect));
     if (it == storage_pointer_types.end()) {
-        throw Shader::LogicError("Uncached storage pointer table classification");
+        throw Shader::LogicError("Uncached storage pointer table classification c{}[{:#x}]+{:#x}",
+                                 index, offset, indirect);
     }
     return it->second != 0;
 }
