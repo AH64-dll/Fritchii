@@ -4444,8 +4444,10 @@ void MainWindow::OnGameListPrepareShaderWarm(u64 program_id, const std::string& 
 }
 
 void MainWindow::OnGameListDeleteShaderWarm(u64 program_id) {
-    if (shader_warm_dialog && shader_warm_dialog->IsRunning()) {
-        // The builder writes these files: deleting them under it would lose the result or fail it.
+    if (shader_warm_dialog && shader_warm_dialog->IsRunning() &&
+        shader_warm_dialog->TitleId() == program_id) {
+        // The builder writes this title's files: deleting them under it would lose the result or
+        // fail it. Other titles' files are in their own folders.
         QMessageBox::information(this, tr("Delete Shader Warm-up"),
                                  tr("Shaders are being prepared. Try again when it is done."));
         shader_warm_dialog->raise();

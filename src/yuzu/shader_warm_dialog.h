@@ -45,6 +45,10 @@ public:
     bool IsRunning() const {
         return running;
     }
+    /// The title whose warm-up files this dialog prepares.
+    u64 TitleId() const {
+        return title_id;
+    }
 
 signals:
     void BuildFinished(bool ok);
