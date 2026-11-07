@@ -296,6 +296,10 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "cause shorter stutters.\nUsed on NVIDIA and AMD GPUs. The graphics half of the "
               "shader warm-up (Prepare shaders in the game list) needs it.\nTakes effect after "
               "restarting the game."));
+    INSERT(Settings, shader_warm_threads, tr("Shader warm-up threads:"),
+           tr("CPU threads the shader warm-up uses (low priority). More threads finish the "
+              "warm-up sooner but leave less CPU to the game while it runs.\nTakes "
+              "effect at the next game start."));
     INSERT(Settings, enable_compute_pipelines, tr("Enable Compute Pipelines (Intel Vulkan Only)"),
            tr("Required by some games.\nThis setting only exists for Intel "
               "proprietary drivers and may crash if enabled.\nCompute pipelines are always enabled "

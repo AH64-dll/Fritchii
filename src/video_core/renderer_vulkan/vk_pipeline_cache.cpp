@@ -1716,11 +1716,13 @@ std::filesystem::path WarmFile(const char* variable, const std::filesystem::path
     return {};
 }
 
-/// Threads for each warm-up (compute and graphics): EDEN_NX2_WARM_THREADS=N, 1 to 32, else 4.
-/// They always run at low priority.
+/// Threads for each warm-up (compute and graphics): EDEN_NX2_WARM_THREADS=N (1 to 32), else the
+/// shader_warm_threads setting. They always run at low priority.
 size_t WarmThreads() {
-    static const size_t count = [] {
-        constexpr size_t Default = 4;
+    const size_t setting =
+        std::clamp<size_t>(Settings::values.shader_warm_threads.GetValue(), 1, 32);
+    static const size_t forced = [] {
+        constexpr size_t Default = 0;
         const char* const value = std::getenv("EDEN_NX2_WARM_THREADS");
         if (value == nullptr || *value == '\0') {
             return Default;
@@ -1729,13 +1731,14 @@ size_t WarmThreads() {
         const long parsed = std::strtol(value, &end, 10);
         if (end == value || *end != '\0' || parsed < 1 || parsed > 32) {
             LOG_WARNING(Render_Vulkan,
-                        "Nx2Perf: EDEN_NX2_WARM_THREADS={} is not a number from 1 to 32, using {}",
-                        value, Default);
+                        "Nx2Perf: EDEN_NX2_WARM_THREADS={} is not a number from 1 to 32, using "
+                        "the setting",
+                        value);
             return Default;
         }
         return static_cast<size_t>(parsed);
     }();
-    return count;
+    return forced != 0 ? forced : setting;
 }
 
 /// The "already warmed" marker: warm file size and last-write time, entry count, GPU driver
