@@ -96,6 +96,9 @@ inline void LoadExperiments() {
         // walking through Hyrule Field, fresh launches: 1% low 30.3 -> 35.1 fps, frames over
         // 25 ms 68 -> 38 of ~1650.
         g_experiments[8].store(15, std::memory_order_relaxed);
+        // EXP9 = 1: native uniform bank pages compared only when they may have changed (verified
+        // with EXP9=2: 0 missed in 120 s walking). Idle 54.5 -> 57.7 fps, walking 56.6 -> 58.9.
+        g_experiments[9].store(1, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {
