@@ -1319,9 +1319,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
     // zortos293/Lichii builds from #194 on (cache version 53) write the same records as this
     // build under another version number: with no cache of this version, copy theirs and
-    // relabel the copy. Their files stay as they are.
-    if (std::error_code error; !std::filesystem::exists(pipeline_cache_filename, error)) {
-        constexpr u32 ZortosCacheVersion = 53;
+    // relabel the copy. Their files stay as they are. Version 54 (#408) only masks the vertex
+    // attribute types in its keys, as loading does here; the newest found is copied.
+    for (const u32 ZortosCacheVersion : {54U, 53U}) {
+        std::error_code error;
+        if (std::filesystem::exists(pipeline_cache_filename, error)) {
+            break;
+        }
         constexpr std::array<char, 8> PipelineCacheMagic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
         const auto zortos = VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan",
                                                                     ZortosCacheVersion);
