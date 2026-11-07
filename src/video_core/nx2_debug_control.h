@@ -105,6 +105,10 @@ inline void LoadExperiments() {
         // EXP9 = 1: native uniform bank pages compared only when they may have changed (verified
         // with EXP9=2: 0 missed in 120 s walking). Idle 54.5 -> 57.7 fps, walking 56.6 -> 58.9.
         g_experiments[9].store(1, std::memory_order_relaxed);
+        // EXP10 = 1: macro DMA reads wait only for the dispatches, uploads, copies and releases
+        // that may have written them (EDEN_NX2_DMA_SNAPSHOT=10 verify: 0 differed in 2 x 90 s
+        // walking). GPU front idle 81 -> 105 ms/s, waits for the back 368 -> 338 ms/s.
+        g_experiments[10].store(1, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {
