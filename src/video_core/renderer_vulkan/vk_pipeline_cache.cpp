@@ -1716,6 +1716,28 @@ std::filesystem::path WarmFile(const char* variable, const std::filesystem::path
     return {};
 }
 
+/// Threads for each warm-up (compute and graphics): EDEN_NX2_WARM_THREADS=N, 1 to 32, else 4.
+/// They always run at low priority.
+size_t WarmThreads() {
+    static const size_t count = [] {
+        constexpr size_t Default = 4;
+        const char* const value = std::getenv("EDEN_NX2_WARM_THREADS");
+        if (value == nullptr || *value == '\0') {
+            return Default;
+        }
+        char* end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end == value || *end != '\0' || parsed < 1 || parsed > 32) {
+            LOG_WARNING(Render_Vulkan,
+                        "Nx2Perf: EDEN_NX2_WARM_THREADS={} is not a number from 1 to 32, using {}",
+                        value, Default);
+            return Default;
+        }
+        return static_cast<size_t>(parsed);
+    }();
+    return count;
+}
+
 /// The "already warmed" marker: warm file size and last-write time, entry count, GPU driver
 /// version and device ID, pipeline cache version. Next to the warm file, or in the title's
 /// shader folder when that folder is not writable.
@@ -1888,7 +1910,7 @@ void PipelineCache::StartComputeWarm(u64 title_id) {
     };
     auto progress = std::make_shared<Progress>();
     static const GuessMissing guess{};
-    constexpr size_t NumThreads = 4;
+    const size_t NumThreads = WarmThreads();
     progress->running = NumThreads;
     compute_warm_done = false;
     shader_notify.SetWarmProgress(1, 0, entries->size());
@@ -2006,7 +2028,7 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
                     e.what());
         return;
     }
-    constexpr size_t NumThreads = 4;
+    const size_t NumThreads = WarmThreads();
     reader->running = NumThreads;
     LOG_INFO(Render_Vulkan,
              "Nx2Perf graphics_warm: {} ({} MB) queued on {} low priority threads, starts after "

@@ -36,3 +36,5 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_SPLIT_SKIP=1
 #EDEN_NX2_AUTO_STUB=1
 #EDEN_NX2_KEEP_ASTC=1
+# Threads for each shader warm-up (compute, then graphics), 1 to 32. They run at low priority.
+#EDEN_NX2_WARM_THREADS=4
