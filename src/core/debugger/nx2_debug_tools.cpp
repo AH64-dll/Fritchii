@@ -599,6 +599,10 @@ struct InputRun {
     std::string_view controller;
     /// The present count the first step starts at; the next present when unset.
     std::optional<u64> at_present;
+    /// Above 0: steps advance with elapsed time at this many frames a second instead of with
+    /// presents. Games that move by elapsed time (Ocarina of Time) then follow the recorded path
+    /// whatever frame rate the replay runs at.
+    double frame_rate = 0.0;
 };
 
 /// Holds the steps on the run's controller from the next present (or at_present) on, and returns
@@ -630,8 +634,19 @@ json RunInput(ToolState& state, const std::vector<InputStep>& steps, const json&
         run.max_timeout_s);
     const auto script = std::make_shared<const std::vector<InputStep>>(steps);
     const auto ends = std::make_shared<const std::vector<u64>>(InputStepEnds(steps, start));
-    controller->SetInputInjector([script, ends] {
-        return InputAt(*script, *ends, g_nx2_present_count.load(std::memory_order_relaxed));
+    const double frame_rate = run.frame_rate;
+    const auto timed_from = std::chrono::steady_clock::now();
+    // The frame the replay is at: the present count, or with frame_rate the elapsed time.
+    const auto frame_now = [frame_rate, timed_from, start] {
+        if (frame_rate > 0.0) {
+            const double seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - timed_from).count();
+            return start + static_cast<u64>(seconds * frame_rate);
+        }
+        return g_nx2_present_count.load(std::memory_order_relaxed);
+    };
+    controller->SetInputInjector([script, ends, frame_now] {
+        return InputAt(*script, *ends, frame_now());
     });
     SCOPE_EXIT {
         controller->SetInputInjector({});
@@ -639,7 +654,7 @@ json RunInput(ToolState& state, const std::vector<InputStep>& steps, const json&
     const auto begin = std::chrono::steady_clock::now();
     const auto deadline = begin + std::chrono::seconds{timeout};
     for (;;) {
-        const u64 now = g_nx2_present_count.load(std::memory_order_relaxed);
+        const u64 now = frame_now();
         if (now >= start + total) {
             break;
         }
@@ -662,6 +677,7 @@ json RunInput(ToolState& state, const std::vector<InputStep>& steps, const json&
         {"steps", steps.size()},
         {"frames", total},
         {"first_present", start},
+        {"frame_rate", frame_rate},
         {"elapsed_s",
          std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count()},
     };
@@ -853,11 +869,24 @@ json InputReplay(ToolState& state, const json& params, const ClientGone& client_
     if (params.contains("at_present")) {
         at_present = params.at("at_present").get<u64>();
     }
+    // Timing: "time" (default when the recording has its rate) replays by elapsed time at the
+    // recorded frame rate; "frames" replays one step frame per present.
+    double frame_rate = 0.0;
+    if (params.value("timing", std::string{"time"}) == "time") {
+        if (params.contains("frame_rate")) {
+            frame_rate = params.at("frame_rate").get<double>();
+        } else if (recording.contains("frame_rate")) {
+            frame_rate = recording.at("frame_rate").get<double>();
+        } else if (recording.contains("seconds") && recording.value("seconds", 0.0) > 0.0) {
+            frame_rate = recording.value("frames", 0.0) / recording.at("seconds").get<double>();
+        }
+    }
     json result = RunInput(state, steps, params, client_gone,
                            {.max_frames = MAX_RECORD_FRAMES,
                             .max_timeout_s = 86400,
                             .controller = controller,
-                            .at_present = at_present});
+                            .at_present = at_present,
+                            .frame_rate = frame_rate});
     result["path"] = Common::FS::PathToUTF8String(path);
     return result;
 }
