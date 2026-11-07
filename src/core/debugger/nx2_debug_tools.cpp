@@ -31,6 +31,7 @@
 #include "hid_core/hid_core.h"
 #include "video_core/gpu.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/renderer_base.h"
 
 namespace Core::Nx2Debug {
@@ -188,7 +189,13 @@ json Status(ToolState& state, const json& params) {
     const u64 after = g_nx2_present_count.load(std::memory_order_relaxed);
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+    json frame_times = json::array();
+    for (const auto& count : VideoCommon::Nx2Perf::g_frame_times) {
+        frame_times.push_back(count.load(std::memory_order_relaxed));
+    }
     return {
+        {"frame_time_bucket_us", VideoCommon::Nx2Perf::FrameTimeBucketNs / 1000},
+        {"frame_times", std::move(frame_times)},
         {"title", state.title},
         {"program_id", fmt::format("{:016X}", state.program_id)},
         {"build", std::string{Common::g_build_fullname}},

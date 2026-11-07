@@ -380,6 +380,15 @@ void PresentManager::PresentThread(std::stop_token token) {
             void(std::exchange(lock, std::unique_lock{swapchain_mutex}));
             last_present_id = 0;
             CopyToSwapchain(frame);
+            {
+                static std::chrono::steady_clock::time_point previous{};
+                const auto now = std::chrono::steady_clock::now();
+                if (previous != std::chrono::steady_clock::time_point{}) {
+                    VideoCommon::Nx2Perf::NoteFrameTime(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(now - previous).count());
+                }
+                previous = now;
+            }
             if (present_wait_enabled) {
                 const auto submitted = std::chrono::steady_clock::now();
                 pacer.NoteSubmitted(last_present_id, submitted, held);
