@@ -494,12 +494,22 @@ GraphicsPipeline::GraphicsPipeline(
             const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
             Validate();
             if (library_cache) {
+                const bool has_module = std::ranges::any_of(
+                    spv_modules, [](const vk::ShaderModule& module) { return bool(module); });
                 bool made{};
                 try {
                     made = MakeLibraryPipeline(render_pass);
                 } catch (const vk::Exception& exception) {
                     LOG_ERROR(Render_Vulkan, "Nx2Perf gpl: pipeline {:016x} linking failed: {}",
                               key.Hash(), exception.what());
+                    if (libraries_only) {
+                        throw;
+                    }
+                }
+                if (!made && libraries_only && has_module) {
+                    // A warm-up build whose library the driver did not make: reported as a
+                    // failed build (Failed()), not counted as built.
+                    throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
                 }
                 if (!made && !libraries_only) {
                     library_cache->RecordFallback();

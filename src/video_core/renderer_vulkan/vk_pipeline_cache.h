@@ -141,17 +141,22 @@ public:
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 
+    /// What a graphics warm-up entry came to: built, not buildable (a guess the translation
+    /// rejects, which another warm-up would reject too), or refused by the driver.
+    enum class WarmResult { Built, Unbuildable, DriverFailed };
+
     /// Graphics pipeline libraries (EDEN_NX2_GPL): builds the pre-rasterization and fragment
     /// shader libraries of the pipeline `key` would make, on the calling thread, with no draw and
-    /// no pipeline kept (for a warm-up). `pools` must be the calling thread's own. False when the
-    /// device has no libraries, the pipeline takes the monolithic route, or a build failed.
+    /// no pipeline kept (for a warm-up). `pools` must be the calling thread's own. Unbuildable
+    /// when the device has no libraries or the pipeline takes the monolithic route, DriverFailed
+    /// when a library build failed.
     /// The key may hold a single stage (no partner): a vertex-only key builds just that vertex
     /// program's pre-rasterization library (vertex SPIR-V does not depend on the fragment
     /// stage); a fragment-only key builds just the fragment library, emitted as if the partner
     /// writes every varying (the common variant). The key's state (attribute types, render
     /// target formats, depth and raster state) is what the libraries are keyed and built with.
-    bool WarmGraphicsLibraries(ShaderPools& pools, const GraphicsPipelineCacheKey& key,
-                               std::span<Shader::Environment* const> envs);
+    WarmResult WarmGraphicsLibraries(ShaderPools& pools, const GraphicsPipelineCacheKey& key,
+                                     std::span<Shader::Environment* const> envs);
 
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();

@@ -1997,6 +1997,8 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
         bool failed{};
         std::atomic<size_t> built{};
         std::atomic<size_t> failed_builds{};
+        /// Builds the driver refused: worth another warm-up, unlike entries that cannot be built.
+        std::atomic<size_t> driver_failures{};
         std::atomic<size_t> running{};
         size_t read{}; ///< Entries taken from the file (under the mutex)
         size_t known_total{}; ///< Entry count recorded by the builder, 0 when unknown
@@ -2083,14 +2085,21 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
                     }
                 }
                 env.SetGuessMissing(&guess);
-                bool ok = false;
+                WarmResult result = WarmResult::Unbuildable;
                 try {
                     Shader::Environment* const env_ptr = &env;
-                    ok = WarmGraphicsLibraries(pools, key, std::span{&env_ptr, 1});
+                    result = WarmGraphicsLibraries(pools, key, std::span{&env_ptr, 1});
+                } catch (const vk::Exception& e) {
+                    LOG_DEBUG(Render_Vulkan, "graphics_warm: {}", e.what());
+                    result = WarmResult::DriverFailed;
                 } catch (const std::exception& e) {
                     LOG_DEBUG(Render_Vulkan, "graphics_warm: {}", e.what());
                 }
+                const bool ok = result == WarmResult::Built;
                 (ok ? reader->built : reader->failed_builds).fetch_add(1);
+                if (result == WarmResult::DriverFailed) {
+                    reader->driver_failures.fetch_add(1);
+                }
                 const size_t done = reader->built + reader->failed_builds;
                 if (reader->throttle.Due()) {
                     // The builder's recorded count, or else an estimate from the bytes read.
@@ -2117,7 +2126,8 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
                 bool complete = false;
                 {
                     std::scoped_lock lock{reader->mutex};
-                    complete = !reader->failed && reader->end == reader->position;
+                    complete = !reader->failed && reader->end == reader->position &&
+                               reader->driver_failures == 0;
                 }
                 if (complete && !stop.stop_requested() && !warm_cancel) {
                     WriteWarmMarker(warm_file, title_file, device, reader->read);
@@ -2245,15 +2255,19 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     return BuiltPipeline(current_pipeline);
 }
 
-bool PipelineCache::WarmGraphicsLibraries(ShaderPools& pools, const GraphicsPipelineCacheKey& key,
-                                          std::span<Shader::Environment* const> envs) {
+PipelineCache::WarmResult PipelineCache::WarmGraphicsLibraries(
+    ShaderPools& pools, const GraphicsPipelineCacheKey& key,
+    std::span<Shader::Environment* const> envs) {
     if (!device.IsExtGraphicsPipelineLibrarySupported()) {
-        return false;
+        return WarmResult::Unbuildable;
     }
     pools.ReleaseContents();
     const auto pipeline{
         CreateGraphicsPipeline(pools, key, envs, nullptr, false, nullptr, nullptr, true)};
-    return pipeline && !pipeline->Failed();
+    if (!pipeline) {
+        return WarmResult::Unbuildable;
+    }
+    return pipeline->Failed() ? WarmResult::DriverFailed : WarmResult::Built;
 }
 
 void PipelineCache::TickFrame() {
