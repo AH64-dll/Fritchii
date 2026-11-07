@@ -31,6 +31,15 @@ std::filesystem::path GraphicsWarmPath(u64 title_id);
 /// cache version; a matching marker skips that warm-up at boot.
 std::filesystem::path WarmMarkerPath(const std::filesystem::path& warm_file);
 
+/// Entry count of a warm file, written by the builder next to it (extension .count): the entry
+/// count and the warm file's size. The file format has no count, so the warm-up shows exact
+/// progress only with this; files from the offline tools have none.
+std::filesystem::path WarmCountPath(const std::filesystem::path& warm_file);
+
+/// The entry count recorded for `warm_file`, or 0 when there is none or it was written for a
+/// file of another size.
+u64 ReadWarmCount(const std::filesystem::path& warm_file);
+
 /// Removes the title's warm files, their markers and leftover temporary files (rebuild or delete
 /// from the UI). Returns false when a file exists but cannot be removed, with the reason in
 /// `error` when given.

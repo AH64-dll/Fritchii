@@ -1963,6 +1963,7 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
         std::atomic<size_t> failed_builds{};
         std::atomic<size_t> running{};
         size_t read{}; ///< Entries taken from the file (under the mutex)
+        size_t known_total{}; ///< Entry count recorded by the builder, 0 when unknown
         std::streamoff position{};
         WarmProgressThrottle throttle;
         std::chrono::steady_clock::time_point begin{};
@@ -1976,6 +1977,8 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
         }
         reader->file.exceptions(std::ifstream::failbit);
         reader->end = reader->file.tellg();
+        reader->known_total =
+            static_cast<size_t>(VideoCommon::ShaderWarm::ReadWarmCount(warm_file));
         reader->file.seekg(0, std::ios::beg);
         std::array<char, 8> magic{};
         u32 version{};
@@ -2054,9 +2057,9 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
                 (ok ? reader->built : reader->failed_builds).fetch_add(1);
                 const size_t done = reader->built + reader->failed_builds;
                 if (reader->throttle.Due()) {
-                    // The file has no entry count: estimate it from the bytes read so far.
-                    size_t total{};
-                    {
+                    // The builder's recorded count, or else an estimate from the bytes read.
+                    size_t total{reader->known_total};
+                    if (total == 0) {
                         std::scoped_lock lock{reader->mutex};
                         const std::streamoff header = 12;
                         const std::streamoff end = reader->end;

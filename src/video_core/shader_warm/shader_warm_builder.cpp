@@ -311,12 +311,43 @@ fs::path WarmMarkerPath(const fs::path& warm_file) {
     return marker;
 }
 
+fs::path WarmCountPath(const fs::path& warm_file) {
+    fs::path count = warm_file;
+    count.replace_extension(".count");
+    return count;
+}
+
+u64 ReadWarmCount(const fs::path& warm_file) {
+    std::ifstream in(WarmCountPath(warm_file));
+    u64 entries{};
+    u64 size{};
+    if (!(in >> entries >> size)) {
+        return 0;
+    }
+    std::error_code ec;
+    const auto actual = fs::file_size(warm_file, ec);
+    return !ec && actual == size ? entries : 0;
+}
+
+namespace {
+/// Records `entries` for the finished warm file at `warm_file` (see WarmCountPath).
+void WriteWarmCount(const fs::path& warm_file, u64 entries) {
+    std::error_code ec;
+    const auto size = fs::file_size(warm_file, ec);
+    if (ec) {
+        return;
+    }
+    std::ofstream out(WarmCountPath(warm_file), std::ios::trunc);
+    out << entries << ' ' << size << '\n';
+}
+} // Anonymous namespace
+
 bool DeleteWarmFiles(u64 title_id, std::string* error) {
     bool ok = true;
     for (const auto& warm : {ComputeWarmPath(title_id), GraphicsWarmPath(title_id)}) {
         fs::path tmp = warm;
         tmp += ".tmp";
-        for (const auto& path : {warm, WarmMarkerPath(warm), tmp}) {
+        for (const auto& path : {warm, WarmMarkerPath(warm), WarmCountPath(warm), tmp}) {
             std::error_code ec;
             fs::remove(path, ec);
             if (ec) {
@@ -751,6 +782,8 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     if (ec) {
         return fail("Cannot replace " + Common::FS::PathToUTF8String(graphics_path));
     }
+    WriteWarmCount(compute_path, result.compute_programs);
+    WriteWarmCount(graphics_path, result.vertex_programs + result.fragment_programs);
     report(StageWriting, patches.size(), patches.size());
     result.ok = true;
     LOG_INFO(Render_Vulkan,
