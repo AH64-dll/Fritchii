@@ -800,6 +800,18 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
+    if (size != 0) {
+        // Before the traps: a read that sees the new read area generation also sees these bits.
+        const u64 first = addr >> page_bits;
+        const u64 last = (std::min)((addr + size - 1) >> page_bits, armed_page_count - 1);
+        for (u64 page = first; page <= last; ++page) {
+            auto& word = armed_pages[page / 64];
+            const u64 bit = u64{1} << (page % 64);
+            if ((word.load(std::memory_order_relaxed) & bit) == 0) {
+                word.fetch_or(bit, std::memory_order_release);
+            }
+        }
+    }
     const auto MarkRegionReadTrap = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionReadTrap;
     Memory::Memory* run_inter = nullptr;
     u64 run_begin = 0;

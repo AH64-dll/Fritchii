@@ -128,6 +128,34 @@ KProcess& GetCurrentProcess(KernelCore& kernel);
 s32 GetCurrentCoreId(KernelCore& kernel);
 Core::Memory::Memory& GetCurrentMemory(KernelCore& kernel);
 
+/// KThread::m_context_guard. The scheduler only try_locks and unlocks it, often in a loop while
+/// another core still unloads the thread; each try on the winpthreads mutex was costly.
+/// EDEN_NX2_CONTEXT_GUARD=0 restores the std::mutex.
+class KThreadContextGuard {
+public:
+    bool try_lock() {
+        if (FlagMode()) {
+            return !m_flag.load(std::memory_order_relaxed) &&
+                   !m_flag.exchange(true, std::memory_order_acquire);
+        }
+        return m_mutex.try_lock();
+    }
+
+    void unlock() {
+        if (FlagMode()) {
+            m_flag.store(false, std::memory_order_release);
+            return;
+        }
+        m_mutex.unlock();
+    }
+
+private:
+    static bool FlagMode();
+
+    std::atomic<bool> m_flag{false};
+    std::mutex m_mutex;
+};
+
 class KThread final : public KAutoObjectWithSlabHeapAndContainer<KThread, KWorkerTask>,
                       public Common::IntrusiveListBaseNode<KThread>,
                       public KTimerTask {
@@ -933,7 +961,7 @@ private:
     bool m_resource_limit_release_hint{};
     bool m_is_kernel_address_key{};
     StackParameters m_stack_parameters{};
-    std::mutex m_context_guard{};
+    KThreadContextGuard m_context_guard{};
 
     // For emulation
     std::shared_ptr<Common::Fiber> m_host_context{};
@@ -989,6 +1017,12 @@ public:
     ConditionVariableThreadTree* GetConditionVariableTree() const {
         return m_condvar_tree;
     }
+
+    /// EDEN_NX2_ARB_SPIN (KAddressArbiter): how well this thread's pre-wait spins paid off
+    /// lately (0-16), and a counter that probes again now and then while it is 0. Touched only
+    /// by the thread itself.
+    u8 m_nx2_arb_spin_credit{8};
+    u8 m_nx2_arb_spin_probe{};
 };
 
 class KScopedDisableDispatch {

@@ -185,8 +185,8 @@ bool Argument::IsInMemory(RegAlloc& reg_alloc) const noexcept {
     return HostLocIsSpill(*reg_alloc.ValueLocation(value.GetInst()));
 }
 
-RegAlloc::RegAlloc(std::bitset<32> gpr_order, std::bitset<32> xmm_order) noexcept
-    : gpr_order(gpr_order), xmm_order(xmm_order)
+RegAlloc::RegAlloc(std::bitset<32> gpr_order, std::bitset<32> xmm_order, bool spill_to_gpr, bool scratch_copy) noexcept
+    : gpr_order(gpr_order), xmm_order(xmm_order), spill_to_gpr(spill_to_gpr), scratch_copy(scratch_copy)
 {}
 
 RegAlloc::ArgumentInfo RegAlloc::GetArgumentInfo(const IR::Inst* inst) noexcept {
@@ -300,6 +300,16 @@ HostLoc RegAlloc::UseScratchImpl(BlockOfCode& code, IR::Value use_value, std::bi
         if (LocInfo(current_location).IsLastUse()) {
             LocInfo(current_location).is_set_last_use = true;
         } else {
+            if (scratch_copy) {
+                // The value is still needed: write into a copy in a free register and leave the
+                // original where it is, instead of evicting the original (often to the stack).
+                const HostLoc copy_location = SelectARegister(desired_locations);
+                if (LocInfo(copy_location).IsEmpty()) {
+                    CopyToScratch(code, bit_width, copy_location, current_location);
+                    LocInfo(copy_location).WriteLock();
+                    return copy_location;
+                }
+            }
             MoveOutOfTheWay(code, current_location);
         }
         LocInfo(current_location).WriteLock();
@@ -526,6 +536,19 @@ void RegAlloc::SpillRegister(BlockOfCode& code, HostLoc loc) noexcept {
     ASSERT(HostLocIsRegister(loc) && "Only registers can be spilled");
     ASSERT(!LocInfo(loc).IsEmpty() && "There is no need to spill unoccupied registers");
     ASSERT(!LocInfo(loc).IsLocked() && "Registers that have been allocated must not be spilt");
+    if (spill_to_gpr && HostLocIsGPR(loc)) {
+        // Park the value in a free callee-saved GPR (survives host calls) instead of the stack.
+        for (size_t i = 0; i < 16; ++i) {
+            const auto candidate = HostLoc(i);
+            if (candidate == loc || candidate == HostLoc::RSP || candidate == HostLoc::RBP ||
+                (candidate >= HostLoc::R13 && candidate <= HostLoc::R15) || !gpr_order.test(i) ||
+                !ABI_ALL_CALLEE_SAVE.test(i) || !LocInfo(candidate).IsEmpty()) {
+                continue;
+            }
+            Move(code, candidate, loc);
+            return;
+        }
+    }
     auto const new_loc = FindFreeSpill(HostLocIsXMM(loc));
     Move(code, new_loc, loc);
 }

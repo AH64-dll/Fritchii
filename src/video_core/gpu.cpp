@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <list>
 #include <memory>
 #include <utility>
@@ -39,10 +40,27 @@
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_profile.h"
+#include "video_core/nx2_reactive.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 
 namespace Tegra {
+
+namespace {
+
+// EDEN_NX2_OPT_TICKWORK=0: TickWork locks the sync request mutex on every call (each draw, clear
+// and dispatch), as before, instead of first checking without the lock whether a request is
+// queued at all.
+bool TickWorkFastEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_OPT_TICKWORK");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+} // Anonymous namespace
 
 struct GPU::Impl {
     explicit Impl(Core::System& system_, bool is_async_, bool use_nvdec_)
@@ -109,12 +127,46 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
+        // Called at every fence (~11,000 a second in Ocarina), mostly with nothing collected:
+        // skip the six cores' locks then (EDEN_NX2_DIRTY_FASTPATH=0 always gathers).
+        static const bool fast_path = [] {
+            const char* value = std::getenv("EDEN_NX2_DIRTY_FASTPATH");
+            return value == nullptr || value[0] != '0';
+        }();
+        // EDEN_NX2_DIRTY_ANY: one shared flag instead of three atomics per core's manager, on
+        // lines the cores write (18 loads per fence, ~18,000 fences a second).
+        static const bool any_flag = [] {
+            const char* value = std::getenv("EDEN_NX2_DIRTY_ANY");
+            return value == nullptr || value[0] != '0';
+        }();
+        const bool use_any_flag = fast_path && any_flag;
+        if (use_any_flag) {
+            if (!Core::GPUDirtyMemoryManager::AnyWrites()) {
+                return;
+            }
+        } else if (fast_path) {
+            bool may_have_writes = false;
+            for (auto& manager : system.GetGPUDirtyMemoryManager()) {
+                may_have_writes |= manager.MayHaveWrites();
+            }
+            if (!may_have_writes) {
+                return;
+            }
+        }
         std::vector<std::pair<DAddr, u64>> writes;
         std::function<void(PAddr, size_t)> callback_writes(
             [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
+        if (use_any_flag) {
+            // Until EndGather, a concurrent caller finding the flag clear gathers too, so it
+            // never returns before the writes collected before it are applied.
+            Core::GPUDirtyMemoryManager::BeginGather();
+        }
         system.GatherGPUDirtyMemory(callback_writes);
         if (!writes.empty()) {
             renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+        }
+        if (use_any_flag) {
+            Core::GPUDirtyMemoryManager::EndGather();
         }
     }
 
@@ -136,6 +188,7 @@ struct GPU::Impl {
         std::unique_lock lck{sync_request_mutex};
         const u64 fence = ++last_sync_fence;
         sync_requests.emplace_back(std::forward<Func>(action));
+        has_sync_requests.store(true, std::memory_order_release);
         return fence;
     }
 
@@ -157,6 +210,13 @@ struct GPU::Impl {
 
     /// Tick pending requests within the GPU.
     void TickWork() {
+        // A request queued after this check is run by the next TickWork, as one queued just
+        // after the loop below empties the queue is. Whoever made it and then had this thread
+        // tick (WaitForIdle's TickGPU) is ordered after its store, so that tick sees it.
+        if (TickWorkFastEnabled() && !has_sync_requests.load(std::memory_order_acquire)) {
+            return;
+        }
+        VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TickWork};
         std::unique_lock lck{sync_request_mutex};
         while (!sync_requests.empty()) {
             auto request = std::move(sync_requests.front());
@@ -167,6 +227,8 @@ struct GPU::Impl {
             sync_request_mutex.lock();
             sync_request_cv.notify_all();
         }
+        // Under the lock with the queue empty: no request can be queued in between.
+        has_sync_requests.store(false, std::memory_order_relaxed);
     }
 
     [[nodiscard]] u64 GetTicks() const {
@@ -234,10 +296,48 @@ struct GPU::Impl {
         gpu_thread.FlushRegion(addr, size, is_async);
     }
 
+    /// A read of GPU-written memory whose downloads are on their way (Nx2Reactive::WaitLanding):
+    /// waits for them to land, without the GPU thread. Returns the area once they have, or the
+    /// last answer (not preemtive) when no download covers it anymore or after 16 ms (a flush
+    /// would wait for the same host GPU work); the read then flushes.
+    VideoCore::RasterizerDownloadArea WaitForLanding(DAddr addr, u64 size,
+                                                     VideoCore::RasterizerDownloadArea area) {
+        auto& landing = VideoCommon::Nx2Reactive::GetLanding();
+        VideoCore::RasterizerInterface* const rasterizer = renderer->ReadRasterizer();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{16};
+        landing.waiters.fetch_add(1, std::memory_order_acq_rel);
+        while (true) {
+            const u64 generation = landing.generation.load(std::memory_order_acquire);
+            area = rasterizer->GetFlushArea(addr, size);
+            if (area.preemtive || !area.wait_landing) {
+                break;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                break;
+            }
+            std::unique_lock lock{landing.mutex};
+            landing.cv.wait_until(lock, (std::min)(deadline, now + std::chrono::milliseconds{1}),
+                                  [&] {
+                                      return landing.generation.load(std::memory_order_acquire) !=
+                                             generation;
+                                  });
+        }
+        landing.waiters.fetch_sub(1, std::memory_order_acq_rel);
+        area.wait_landing = false;
+        return area;
+    }
+
     VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size) {
         auto raster_area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
         if (raster_area.preemtive) {
             return raster_area;
+        }
+        if (raster_area.wait_landing) {
+            raster_area = WaitForLanding(addr, size, raster_area);
+            if (raster_area.preemtive) {
+                return raster_area;
+            }
         }
         raster_area.preemtive = true;
         // A guest CPU read of GPU-written memory (reactive flushing): count them, they decide
@@ -246,6 +346,35 @@ struct GPU::Impl {
             LOG_INFO(HW_GPU, "CPU read of GPU-written memory [{:#x}, {:#x}) ({} so far)",
                      raster_area.start_address, raster_area.end_address,
                      reads.load(std::memory_order_relaxed));
+        }
+        if (VideoCommon::Nx2Reactive::AsyncFlush()) {
+            // The GPU thread queues the data for a download it submits at once and goes on;
+            // this thread waits for the copy to land (EDEN_NX2_REACTIVE_ASYNC_FLUSH). Without a
+            // download queued it flushes right there, as below.
+            bool queued = false;
+            const u64 async_fence = RequestSyncOperation([this, raster_area, &queued]() {
+                InvalidateGPUCache();
+                VideoCore::RasterizerInterface* const rasterizer = renderer->ReadRasterizer();
+                const u64 area_size = raster_area.end_address - raster_area.start_address;
+                queued = rasterizer->QueueFlushRegion(raster_area.start_address, area_size);
+                if (!queued) {
+                    rasterizer->FlushRegion(raster_area.start_address, area_size);
+                }
+            });
+            gpu_thread.TickGPU(is_async);
+            WaitForSyncOperation(async_fence);
+            bool landed = !queued;
+            if (queued) {
+                VideoCore::RasterizerDownloadArea pending = raster_area;
+                pending.preemtive = false;
+                pending.wait_landing = true;
+                landed = WaitForLanding(addr, size, pending).preemtive;
+            }
+            if (landed) {
+                return raster_area;
+            }
+            // Not landed (a newer write or a pending CPU write kept the page GPU-written, or no
+            // copy covered it): flush as before.
         }
         const u64 fence = RequestSyncOperation([this, raster_area]() {
             // Apply collected guest writes before downloading GPU data over guest memory.
@@ -371,6 +500,9 @@ struct GPU::Impl {
     std::condition_variable sync_cv;
 
     std::list<std::function<void()>> sync_requests;
+    /// sync_requests is not empty (set and cleared under sync_request_mutex; TickWork reads it
+    /// without the lock to skip the lock when nothing is queued).
+    std::atomic<bool> has_sync_requests{};
     std::atomic<u64> current_sync_fence{};
     u64 last_sync_fence{};
 
@@ -442,6 +574,12 @@ bool GPU::HasPendingCPUWrites(DAddr addr, u64 size) {
 
 void GPU::ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
     impl->ForEachPendingCpuWrite(callback);
+}
+
+void GPU::CollectHandoffWrite(DAddr addr, u64 size) {
+    // The last manager is kept for the handoff (core.cpp). Its writers all hold the buffer cache's
+    // lock, so it has one producer at a time, like a core's.
+    impl->system.GetGPUDirtyMemoryManager().back().Collect(addr, size);
 }
 
 void GPU::OnCommandListEnd() {

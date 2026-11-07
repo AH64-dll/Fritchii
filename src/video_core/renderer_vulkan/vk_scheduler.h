@@ -64,8 +64,13 @@ public:
     /// once); otherwise it goes with the next one. The back submits deferred work before it
     /// sleeps and when another thread asks (WaitSubmitted). True when the flush was deferred.
     bool DeferFlush();
-    /// Submits deferred work (the split's back, from its idle hook).
-    void FlushDeferred();
+    /// Submits deferred work (the split's back, from its idle hook). `location` is counted as
+    /// the submission's site by EDEN_NX2_GPU_PROFILE.
+    void FlushDeferred(std::source_location location = std::source_location::current());
+    /// The split's back: the work so far is submitted with the next submission, when the back
+    /// goes idle or when another thread waits for it (WaitSubmitted), with no time window. False
+    /// on other threads (the caller submits).
+    bool DeferFlushUntilWanted();
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
     /// submit deferred work (logged every 2 s while it waits). False only when the back thread
     /// is not running, so nothing will submit it: the caller then submits it itself.
@@ -98,8 +103,9 @@ public:
         cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool, query + 1);
     }
 
-    /// Sends currently recorded work to the worker thread.
-    void DispatchWork();
+    /// Sends currently recorded work to the worker thread. `lazy` (EDEN_NX2_LAZY_WAKE): a sleeping
+    /// worker is woken only once two chunks wait; submissions and WaitWorker always wake it.
+    void DispatchWork(bool lazy = false);
 
     /// Requests to begin a renderpass.
     void RequestRenderpass(const Framebuffer* framebuffer,
@@ -145,6 +151,9 @@ public:
         return state.renderpass != VK_NULL_HANDLE;
     }
 
+    /// Whether the active render pass is the one RequestRenderpass(framebuffer) would keep.
+    bool RenderPassMatches(const Framebuffer* framebuffer) const;
+
     /// Update the pipeline to the current execution context.
     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
 
@@ -186,7 +195,7 @@ public:
         if (chunk->Record(command)) {
             return;
         }
-        DispatchWork();
+        DispatchWork(true);
         (void)chunk->Record(command);
     }
 
@@ -515,6 +524,7 @@ private:
     std::mutex queue_mutex;
     std::condition_variable_any event_cv;
     bool worker_waiting{}; ///< The worker is waiting for work (guarded by queue_mutex)
+    bool lazy_queued{};    ///< A lazily queued chunk may wait for a sleeping worker (recording thread)
     std::jthread worker_thread;
 
     std::chrono::steady_clock::duration frame_interval{};

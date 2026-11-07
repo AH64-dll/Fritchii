@@ -63,6 +63,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         Common::SetCurrentThreadToPerformanceCores();
         if (Settings::values.pin_gpu_threads.GetValue()) {
             Common::PinCurrentThread(Common::PinnedRole::GpuFront);
+        } else {
+            Common::PinHostThread(Common::HostThreadRole::GpuFront);
         }
         system.RegisterHostThread();
 
@@ -82,6 +84,11 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     scheduler.ResumePending(system.GPU());
                 }
                 if (!state.queue.TryPop(next)) {
+                    // EDEN_NX2_PUBLISH_WAITS: what the resumed channels sent goes to the back
+                    // before this thread yields or sleeps (Commit publishes every 256 words).
+                    if (split.Active()) {
+                        split.PublishBeforeWait();
+                    }
                     // The CPU usually releases the semaphore soon after: poll for half a
                     // millisecond, then in short sleeps. Ocarina of Time waits here ~330 times a
                     // second and its present waits for the work behind them: with 1 ms sleeps the
@@ -133,6 +140,11 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     });
                 } else {
                     ASSERT(false);
+                }
+                if (!std::holds_alternative<SubmitListCommand>(next.data)) {
+                    // Syncs, maps, flushes and composites write guest memory anywhere.
+                    split.NoteUnboundedWrite(false,
+                                             VideoCommon::UnboundedCause::GpuThreadCommand);
                 }
                 split.Defer([state_ptr = &state, fence = next.fence, block = next.block] {
                     SignalCommand(*state_ptr, fence, block);

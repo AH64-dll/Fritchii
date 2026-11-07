@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <functional>
 #include <optional>
 #include <span>
@@ -19,6 +20,7 @@
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_bindcache.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -220,6 +222,30 @@ public:
 
     void AddTransition(GraphicsPipeline* transition);
 
+    /// A cheap digest of a key: keys with different tags differ.
+    [[nodiscard]] static u64 TransitionTag(const GraphicsPipelineCacheKey& k) noexcept {
+        u64 tag = 0;
+        for (const u64 hash : k.unique_hashes) {
+            tag = (tag ^ hash) * 0x9E3779B97F4A7C15ULL;
+        }
+        u64 formats{};
+        std::memcpy(&formats, k.state.color_formats.data(),
+                    (std::min)(sizeof(formats), sizeof(k.state.color_formats)));
+        tag ^= (u64{k.state.raw1} << 32 | k.state.raw2) ^ (formats * 0xC2B2AE3D27D4EB4FULL);
+        if (VideoCommon::Nx2BindMemo::PipeNextPointersEnabled()) {
+            // Only bytes operator== compares: equal keys must tag alike.
+            u64 more = k.state.attribute_types;
+            if (offsetof(FixedPipelineState, attachments) + sizeof(k.state.attachments) <=
+                k.state.Size()) {
+                for (const auto& attachment : k.state.attachments) {
+                    more = (more ^ attachment.raw) * 0x9E3779B97F4A7C15ULL;
+                }
+            }
+            tag ^= more * 0xD6E8FEB86659FD93ULL;
+        }
+        return tag;
+    }
+
     bool Configure(bool is_indexed) {
         return configure_func(this, is_indexed);
     }
@@ -228,9 +254,43 @@ public:
         if (key == current_key) {
             return this;
         }
-        const auto it{std::find(transition_keys.begin(), transition_keys.end(), current_key)};
-        return it != transition_keys.end() ? transitions[std::distance(transition_keys.begin(), it)]
-                                           : nullptr;
+        if (!VideoCommon::PipelineTransitionTagsEnabled()) {
+            const auto it{std::find(transition_keys.begin(), transition_keys.end(), current_key)};
+            return it != transition_keys.end()
+                       ? transitions[std::distance(transition_keys.begin(), it)]
+                       : nullptr;
+        }
+        // EDEN_NX2_PIPE_TRANSITIONS: full keys are compared only where the tag matches, and a
+        // transition taken moves one place toward the front.
+        const u64 tag = TransitionTag(current_key);
+        if (VideoCommon::Nx2BindMemo::PipeNextPointersEnabled()) {
+            // A transition's key is its pipeline's own (AddTransition).
+            for (size_t index = 0; index < transition_tags.size(); ++index) {
+                GraphicsPipeline* const next = transitions[index];
+                if (transition_tags[index] != tag || next->key != current_key) {
+                    continue;
+                }
+                if (index != 0) {
+                    std::swap(transition_tags[index], transition_tags[index - 1]);
+                    std::swap(transitions[index], transitions[index - 1]);
+                }
+                return next;
+            }
+            return nullptr;
+        }
+        for (size_t index = 0; index < transition_tags.size(); ++index) {
+            if (transition_tags[index] != tag || transition_keys[index] != current_key) {
+                continue;
+            }
+            GraphicsPipeline* const next = transitions[index];
+            if (index != 0) {
+                std::swap(transition_tags[index], transition_tags[index - 1]);
+                std::swap(transition_keys[index], transition_keys[index - 1]);
+                std::swap(transitions[index], transitions[index - 1]);
+            }
+            return next;
+        }
+        return nullptr;
     }
 
     /// The frame the pipeline cache last handed this pipeline out (evicts long unused ones).
@@ -253,6 +313,7 @@ public:
     void ClearTransitions() noexcept {
         transition_keys.clear();
         transitions.clear();
+        transition_tags.clear();
     }
 
     [[nodiscard]] bool IsBuilt() const noexcept {
@@ -304,6 +365,7 @@ private:
 
     std::vector<GraphicsPipelineCacheKey> transition_keys;
     std::vector<GraphicsPipeline*> transitions;
+    std::vector<u64> transition_tags; ///< TransitionTag of each of transition_keys
     u64 last_use_frame{};
     bool used{};
 
@@ -331,6 +393,7 @@ private:
     VkDeviceSize last_descriptor_buffer_offset{};
     u32 last_descriptor_buffer_chunk{};
     u64 last_descriptor_buffer_generation{};
+    std::vector<u32> binding_kinds; ///< EDEN_NX2_BINDMEMO: per texture/image view, in read order
 
     const bool worker_only_build;
     bool uses_push_descriptor{false};

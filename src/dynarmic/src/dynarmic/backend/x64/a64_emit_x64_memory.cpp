@@ -9,6 +9,7 @@
 #include <array>
 #include <initializer_list>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 
 #include <fmt/format.h>
@@ -407,6 +408,374 @@ void A64EmitX64::EmitA64ExclusiveWriteMemory128(A64EmitContext& ctx, IR::Inst* i
     } else {
         EmitExclusiveWriteMemory<128, &A64::UserCallbacks::MemoryWriteExclusive128>(ctx, inst);
     }
+}
+
+namespace {
+
+template<std::size_t bitsize>
+using AtomicT = mcl::unsigned_integer_of_size<bitsize>;
+
+template<std::size_t bitsize>
+bool AtomicWriteExclusive(A64::UserCallbacks* cb, u64 vaddr, AtomicT<bitsize> value, AtomicT<bitsize> expected) {
+    if constexpr (bitsize == 8) {
+        return cb->MemoryWriteExclusive8(vaddr, value, expected);
+    } else if constexpr (bitsize == 16) {
+        return cb->MemoryWriteExclusive16(vaddr, value, expected);
+    } else if constexpr (bitsize == 32) {
+        return cb->MemoryWriteExclusive32(vaddr, value, expected);
+    } else {
+        return cb->MemoryWriteExclusive64(vaddr, value, expected);
+    }
+}
+
+// op is the LSE opc field: 0 ADD, 1 CLR, 2 EOR, 3 SET, 4 SMAX, 5 SMIN, 6 UMAX, 7 UMIN, 8 SWP.
+template<std::size_t bitsize>
+AtomicT<bitsize> AtomicRmwResult(AtomicT<bitsize> a, AtomicT<bitsize> b, u64 op) {
+    using T = AtomicT<bitsize>;
+    using S = std::make_signed_t<T>;
+    switch (op) {
+    case 0:
+        return T(a + b);
+    case 1:
+        return T(a & ~b);
+    case 2:
+        return T(a ^ b);
+    case 3:
+        return T(a | b);
+    case 4:
+        return S(a) > S(b) ? a : b;
+    case 5:
+        return S(a) < S(b) ? a : b;
+    case 6:
+        return a > b ? a : b;
+    case 7:
+        return a < b ? a : b;
+    default:
+        return b;
+    }
+}
+
+// Slow paths through the memory callbacks (no fastmem, or a fastmem fault): a CAS loop. A failed
+// write that leaves memory unchanged is not a race (unmapped or aborted access): stop there.
+template<std::size_t bitsize>
+u64 AtomicRmwFallback(const A64::UserConfig& conf, u64 vaddr, u64 operand, u64 op) {
+    using T = AtomicT<bitsize>;
+    for (;;) {
+        const T old = T(conf.callbacks->MemoryRead(vaddr, bitsize / 8));
+        if (AtomicWriteExclusive<bitsize>(conf.callbacks, vaddr, AtomicRmwResult<bitsize>(old, T(operand), op), old) ||
+            T(conf.callbacks->MemoryRead(vaddr, bitsize / 8)) == old) {
+            return old;
+        }
+    }
+}
+
+template<std::size_t bitsize>
+u64 AtomicCasFallback(const A64::UserConfig& conf, u64 vaddr, u64 expected, u64 desired) {
+    using T = AtomicT<bitsize>;
+    for (;;) {
+        const T old = T(conf.callbacks->MemoryRead(vaddr, bitsize / 8));
+        if (old != T(expected)) {
+            return old;
+        }
+        if (AtomicWriteExclusive<bitsize>(conf.callbacks, vaddr, T(desired), old) ||
+            T(conf.callbacks->MemoryRead(vaddr, bitsize / 8)) == old) {
+            return old;
+        }
+    }
+}
+
+Xbyak::Reg SizedReg(Xbyak::Reg64 reg, std::size_t bitsize) {
+    switch (bitsize) {
+    case 8:
+        return reg.cvt8();
+    case 16:
+        return reg.cvt16();
+    case 32:
+        return reg.cvt32();
+    default:
+        return reg;
+    }
+}
+
+Xbyak::Address SizedPtr(const Xbyak::RegExp& addr, std::size_t bitsize) {
+    switch (bitsize) {
+    case 8:
+        return Xbyak::util::byte[addr];
+    case 16:
+        return word[addr];
+    case 32:
+        return dword[addr];
+    default:
+        return qword[addr];
+    }
+}
+
+}  // anonymous namespace
+
+// Reached as a call from a fastmem fault (or the address-range abort): does the whole operation
+// through the callbacks and returns the old value in `result`, all other registers preserved.
+void A64EmitX64::EmitAtomicFallbackStub(Xbyak::Reg64 result, std::initializer_list<Xbyak::Reg64> sources, std::optional<u32> param4, AtomicFallbackFn fallback) {
+    ABI_PushCallerSaveRegistersAndAdjustStackExcept(code, HostLocRegIdx(result.getIdx()));
+    // push/pop is a parallel move: every source is read before any parameter is written.
+    for (const auto& source : sources) {
+        code.push(source);
+    }
+    const std::array<Xbyak::Reg64, 3> params{code.ABI_PARAM2, code.ABI_PARAM3, code.ABI_PARAM4};
+    for (size_t i = sources.size(); i > 0; --i) {
+        code.pop(params[i - 1]);
+    }
+    code.mov(code.ABI_PARAM1, std::bit_cast<u64>(&conf));
+    if (param4) {
+        code.mov(code.ABI_PARAM4.cvt32(), *param4);
+    }
+    code.CallFunction(fallback);
+    if (result.getIdx() != code.ABI_RETURN.getIdx()) {
+        code.mov(result, code.ABI_RETURN);
+    }
+    ABI_PopCallerSaveRegistersAndAdjustStackExcept(code, HostLocRegIdx(result.getIdx()));
+    code.ret();
+}
+
+template<std::size_t bitsize>
+void A64EmitX64::EmitAtomicRmwMemory(A64EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const u8 op = args[3].GetImmediateU8();
+    const AtomicFallbackFn fallback = &AtomicRmwFallback<bitsize>;
+    const auto fastmem_marker = ShouldFastmem(ctx, inst);
+
+    if (!fastmem_marker) {
+        ctx.reg_alloc.HostCall(code, inst, {}, args[1], args[2]);
+        code.mov(code.ABI_PARAM1, std::bit_cast<u64>(&conf));
+        code.mov(code.ABI_PARAM4.cvt32(), u32(op));
+        code.CallFunction(fallback);
+        code.ZeroExtendFrom(bitsize, code.ABI_RETURN);
+        EmitCheckMemoryAbort(ctx, inst);
+        return;
+    }
+
+    SharedLabel abort = ctx.GenSharedLabel(), end = ctx.GenSharedLabel();
+    bool require_abort_handling = false;
+
+    if (op == 0b0000 || op == 0b1000) {
+        // LDADD: LOCK XADD. SWP: XCHG (always locked). Both leave the old value in `value`.
+        const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(code, args[1]);
+        const Xbyak::Reg64 value = ctx.reg_alloc.UseScratchGpr(code, args[2]);
+        const auto addr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
+        const auto location = code.getCurr();
+        if (op == 0b0000) {
+            code.lock();
+            code.xadd(SizedPtr(addr, bitsize), SizedReg(value, bitsize));
+        } else {
+            code.xchg(SizedPtr(addr, bitsize), SizedReg(value, bitsize));
+        }
+        const auto resume = code.getCurr();
+        if constexpr (bitsize < 32) {
+            code.ZeroExtendFrom(bitsize, value);
+        }
+        code.L(*end);
+        ColdEmits(code, ctx).emplace_back([=, this] {
+            const auto stub = code.getCurr<void (*)()>();
+            EmitAtomicFallbackStub(value, {vaddr, value}, u32(op), fallback);
+            AddFastmemPatch(location, resume, stub, *fastmem_marker, conf.recompile_on_exclusive_fastmem_failure);
+            if (require_abort_handling) {
+                code.L(*abort);
+                code.call(stub);
+                code.jmp(*end, code.T_NEAR);
+            }
+        });
+        ctx.reg_alloc.DefineValue(code, inst, value);
+        EmitCheckMemoryAbort(ctx, inst);
+        return;
+    }
+
+    // The others: load, compute, LOCK CMPXCHG, retry on a race. The old value ends up in rax.
+    const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code, HostLoc::RAX);
+    const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(code, args[1]);
+    const Xbyak::Reg64 operand = ctx.reg_alloc.UseGpr(code, args[2]);
+    const Xbyak::Reg64 desired = ctx.reg_alloc.ScratchGpr(code);
+    const bool is_minmax = op >= 0b0100 && op <= 0b0111;
+    const bool is_signed = op == 0b0100 || op == 0b0101;
+    const Xbyak::Reg64 operand_ext = is_minmax && bitsize < 32 ? ctx.reg_alloc.ScratchGpr(code) : operand;
+    const auto addr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
+
+    if (is_minmax && bitsize < 32) {
+        if (is_signed) {
+            code.movsx(operand_ext.cvt32(), SizedReg(operand, bitsize));
+        } else {
+            code.movzx(operand_ext.cvt32(), SizedReg(operand, bitsize));
+        }
+    }
+    const Xbyak::Reg cmp_desired = bitsize == 64 ? Xbyak::Reg(desired) : Xbyak::Reg(desired.cvt32());
+    const Xbyak::Reg cmp_operand = bitsize == 64 ? Xbyak::Reg(operand_ext) : Xbyak::Reg(operand_ext.cvt32());
+
+    const auto load_location = code.getCurr();
+    switch (bitsize) {
+    case 8:
+        code.movzx(eax, Xbyak::util::byte[addr]);
+        break;
+    case 16:
+        code.movzx(eax, word[addr]);
+        break;
+    case 32:
+        code.mov(eax, dword[addr]);
+        break;
+    default:
+        code.mov(rax, qword[addr]);
+        break;
+    }
+    Xbyak::Label loop;
+    code.L(loop);
+    switch (op) {
+    case 0b0001:
+        code.mov(desired, operand);
+        code.not_(desired);
+        code.and_(desired, rax);
+        break;
+    case 0b0010:
+        code.mov(desired, rax);
+        code.xor_(desired, operand);
+        break;
+    case 0b0011:
+        code.mov(desired, rax);
+        code.or_(desired, operand);
+        break;
+    default:
+        if (bitsize == 8) {
+            if (is_signed) {
+                code.movsx(desired.cvt32(), al);
+            } else {
+                code.movzx(desired.cvt32(), al);
+            }
+        } else if (bitsize == 16) {
+            if (is_signed) {
+                code.movsx(desired.cvt32(), ax);
+            } else {
+                code.movzx(desired.cvt32(), ax);
+            }
+        } else if (bitsize == 32) {
+            code.mov(desired.cvt32(), eax);
+        } else {
+            code.mov(desired, rax);
+        }
+        code.cmp(cmp_desired, cmp_operand);
+        switch (op) {
+        case 0b0100:
+            code.cmovl(cmp_desired, cmp_operand);
+            break;
+        case 0b0101:
+            code.cmovg(cmp_desired, cmp_operand);
+            break;
+        case 0b0110:
+            code.cmovb(cmp_desired, cmp_operand);
+            break;
+        default:
+            code.cmova(cmp_desired, cmp_operand);
+            break;
+        }
+        break;
+    }
+    const auto cas_location = code.getCurr();
+    code.lock();
+    code.cmpxchg(SizedPtr(addr, bitsize), SizedReg(desired, bitsize));
+    code.jnz(loop);
+    code.L(*end);
+    const auto resume = code.getCurr();
+    ColdEmits(code, ctx).emplace_back([=, this] {
+        const auto stub = code.getCurr<void (*)()>();
+        EmitAtomicFallbackStub(result, {vaddr, operand}, u32(op), fallback);
+        AddFastmemPatch(load_location, resume, stub, *fastmem_marker, conf.recompile_on_exclusive_fastmem_failure);
+        AddFastmemPatch(cas_location, resume, stub, *fastmem_marker, conf.recompile_on_exclusive_fastmem_failure);
+        if (require_abort_handling) {
+            code.L(*abort);
+            code.call(stub);
+            code.jmp(*end, code.T_NEAR);
+        }
+    });
+    ctx.reg_alloc.DefineValue(code, inst, result);
+    EmitCheckMemoryAbort(ctx, inst);
+}
+
+template<std::size_t bitsize>
+void A64EmitX64::EmitAtomicCasMemory(A64EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const AtomicFallbackFn fallback = &AtomicCasFallback<bitsize>;
+    const auto fastmem_marker = ShouldFastmem(ctx, inst);
+
+    if (!fastmem_marker) {
+        ctx.reg_alloc.HostCall(code, inst, {}, args[1], args[2], args[3]);
+        code.mov(code.ABI_PARAM1, std::bit_cast<u64>(&conf));
+        code.CallFunction(fallback);
+        code.ZeroExtendFrom(bitsize, code.ABI_RETURN);
+        EmitCheckMemoryAbort(ctx, inst);
+        return;
+    }
+
+    const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code, HostLoc::RAX);
+    const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(code, args[1]);
+    const Xbyak::Reg64 expected = ctx.reg_alloc.UseGpr(code, args[2]);
+    const Xbyak::Reg64 desired = ctx.reg_alloc.UseGpr(code, args[3]);
+
+    SharedLabel abort = ctx.GenSharedLabel(), end = ctx.GenSharedLabel();
+    bool require_abort_handling = false;
+    const auto addr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
+
+    if constexpr (bitsize == 64) {
+        code.mov(rax, expected);
+    } else {
+        code.mov(eax, expected.cvt32());
+    }
+    const auto location = code.getCurr();
+    code.lock();
+    code.cmpxchg(SizedPtr(addr, bitsize), SizedReg(desired, bitsize));
+    const auto resume = code.getCurr();
+    if constexpr (bitsize < 32) {
+        code.ZeroExtendFrom(bitsize, rax);
+    }
+    code.L(*end);
+    ColdEmits(code, ctx).emplace_back([=, this] {
+        const auto stub = code.getCurr<void (*)()>();
+        EmitAtomicFallbackStub(result, {vaddr, expected, desired}, std::nullopt, fallback);
+        AddFastmemPatch(location, resume, stub, *fastmem_marker, conf.recompile_on_exclusive_fastmem_failure);
+        if (require_abort_handling) {
+            code.L(*abort);
+            code.call(stub);
+            code.jmp(*end, code.T_NEAR);
+        }
+    });
+    ctx.reg_alloc.DefineValue(code, inst, result);
+    EmitCheckMemoryAbort(ctx, inst);
+}
+
+void A64EmitX64::EmitA64AtomicRmwMemory8(A64EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicRmwMemory<8>(ctx, inst);
+}
+
+void A64EmitX64::EmitA64AtomicRmwMemory16(A64EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicRmwMemory<16>(ctx, inst);
+}
+
+void A64EmitX64::EmitA64AtomicRmwMemory32(A64EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicRmwMemory<32>(ctx, inst);
+}
+
+void A64EmitX64::EmitA64AtomicRmwMemory64(A64EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicRmwMemory<64>(ctx, inst);
+}
+
+void A64EmitX64::EmitA64AtomicCasMemory8(A64EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicCasMemory<8>(ctx, inst);
+}
+
+void A64EmitX64::EmitA64AtomicCasMemory16(A64EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicCasMemory<16>(ctx, inst);
+}
+
+void A64EmitX64::EmitA64AtomicCasMemory32(A64EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicCasMemory<32>(ctx, inst);
+}
+
+void A64EmitX64::EmitA64AtomicCasMemory64(A64EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicCasMemory<64>(ctx, inst);
 }
 
 void A64EmitX64::EmitCheckMemoryAbort(A64EmitContext&, IR::Inst* inst, Xbyak::Label* end) {

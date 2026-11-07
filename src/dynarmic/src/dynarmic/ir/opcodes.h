@@ -159,6 +159,16 @@ constexpr bool IsExclusiveMemoryWrite(const Opcode op) noexcept {
     case Opcode::A64ExclusiveWriteMemory32:
     case Opcode::A64ExclusiveWriteMemory64:
     case Opcode::A64ExclusiveWriteMemory128:
+#if defined(ARCHITECTURE_x86_64)
+    case Opcode::A64AtomicRmwMemory8:
+    case Opcode::A64AtomicRmwMemory16:
+    case Opcode::A64AtomicRmwMemory32:
+    case Opcode::A64AtomicRmwMemory64:
+    case Opcode::A64AtomicCasMemory8:
+    case Opcode::A64AtomicCasMemory16:
+    case Opcode::A64AtomicCasMemory32:
+    case Opcode::A64AtomicCasMemory64:
+#endif
         return true;
 
     default:

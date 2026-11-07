@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <initializer_list>
 #include <map>
 #include <optional>
 #include <tuple>
@@ -60,8 +61,9 @@ public:
         const void* code_ptr = nullptr;
     };
     static_assert(sizeof(FastDispatchEntry) == 0x10);
-    static constexpr u64 fast_dispatch_table_mask = 0xFFFFF0;
-    static constexpr size_t fast_dispatch_table_size = 0x100000;
+    static constexpr size_t default_fast_dispatch_table_bits = 20;
+    /// Entries per set when conf.fast_dispatch_set_associative (one 64-byte cache line).
+    static constexpr size_t fast_dispatch_ways = 4;
 
     void ClearFastDispatchTable();
     void GenMemory128Accessors();
@@ -110,6 +112,12 @@ public:
     void EmitExclusiveReadMemoryInline(A64EmitContext& ctx, IR::Inst* inst);
     template<std::size_t bitsize, auto callback>
     void EmitExclusiveWriteMemoryInline(A64EmitContext& ctx, IR::Inst* inst);
+    template<std::size_t bitsize>
+    void EmitAtomicRmwMemory(A64EmitContext& ctx, IR::Inst* inst);
+    template<std::size_t bitsize>
+    void EmitAtomicCasMemory(A64EmitContext& ctx, IR::Inst* inst);
+    using AtomicFallbackFn = u64 (*)(const A64::UserConfig& conf, u64 vaddr, u64 a, u64 b);
+    void EmitAtomicFallbackStub(Xbyak::Reg64 result, std::initializer_list<Xbyak::Reg64> sources, std::optional<u32> param4, AtomicFallbackFn fallback);
 
     // Terminal instruction emitters
     bool EmitLeafTerminal(IR::Term::LeafTerminal const& terminal, IR::LocationDescriptor initial_location, bool is_single_step) noexcept override;
@@ -126,7 +134,23 @@ public:
     const A64::UserConfig conf;
     RegAlloc reg_alloc; //reusable reg alloc
     BlockRangeInformation<u64> block_ranges;
-    std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;
+    std::vector<FastDispatchEntry> fast_dispatch_table;
+    /// Byte offset mask of a set (or entry) in fast_dispatch_table.
+    u32 fast_dispatch_table_mask = 0;
+    size_t fast_dispatch_set_size = 1;
+    /// EmitA64SetCheckBit left the check bit in ZF for the CheckBit terminal.
+    bool check_bit_in_zf = false;
+
+    // Compact block exits (conf.compact_block_exits): one shared unlinked-exit stub per target
+    // descriptor, created while a block that links to it is emitted, and kept until ClearCache.
+    ::Common::unordered_map<u64, CodePtr> exit_stubs;
+    std::vector<std::pair<u64, Xbyak::Label*>> pending_exit_stubs;
+    bool emitting_block = false;
+    Xbyak::Label* PendingExitStub(const IR::LocationDescriptor& target);
+    void EnsureExitStub(const IR::LocationDescriptor& target);
+    void FlushPendingExitStubs();
+    /// Leaves the block for `target` without linking: stores the PC and returns to the dispatcher.
+    void EmitUnlinkedExit(const IR::LocationDescriptor& target);
     std::vector<FastmemPatchInfo> fastmem_patch_info;  // sorted by rip
     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> read_fallbacks;
     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> write_fallbacks;

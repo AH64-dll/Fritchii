@@ -86,7 +86,12 @@ bool TranslatorVisitor::DSB(Imm<4> /*CRm*/) {
     return true;
 }
 
-bool TranslatorVisitor::DMB(Imm<4> /*CRm*/) {
+bool TranslatorVisitor::DMB(Imm<4> CRm) {
+    // CRm<1:0>: 01 orders loads only, 10 stores only; both already hold on a TSO host.
+    const u32 types = CRm.ZeroExtend() & 0b11;
+    if (options.elide_ld_st_barriers && (types == 0b01 || types == 0b10)) {
+        return true;
+    }
     ir.DataMemoryBarrier();
     return true;
 }

@@ -142,6 +142,31 @@ public:
     /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
     void ArmReadTraps(DAddr addr, size_t size);
 
+    /// False only when ArmReadTraps never covered a page of [addr, addr + size). The bits are
+    /// set before the traps (and the read area generation) change, and never cleared, so a
+    /// guest read that finds them clear needs no flush (EDEN_NX2_READ_FASTPATH).
+    [[nodiscard]] bool MayHaveArmedReadTraps(DAddr addr, size_t size) const {
+        if (size == 0) {
+            return false;
+        }
+        const u64 first = addr >> page_bits;
+        const u64 last = (addr + size - 1) >> page_bits;
+        if (last < first || last >= armed_page_count) {
+            return true;
+        }
+        for (u64 page = first; page <= last; ++page) {
+            if ((armed_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Changes whenever Map or Unmap changed a translation.
+    [[nodiscard]] u64 MappingGeneration() const {
+        return translation_generation.load(std::memory_order_acquire);
+    }
+
 private:
     struct TranslationEntry {
         DAddr guest_page{};
@@ -246,6 +271,10 @@ private:
     }
 
     std::atomic<u64> translation_generation{1}; ///< Bumped by Map and Unmap
+    static constexpr u64 armed_page_count = device_as_size >> page_bits;
+    /// Pages ArmReadTraps ever covered, one bit each (MayHaveArmedReadTraps).
+    std::unique_ptr<std::atomic<u64>[]> armed_pages{
+        std::make_unique<std::atomic<u64>[]>(armed_page_count / 64)};
     using CounterType = u8;
     using CounterAtomicType = std::atomic_uint8_t;
     static constexpr size_t subentries = 8 / sizeof(CounterType);

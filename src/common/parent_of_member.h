@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdlib>
 #include <type_traits>
 
 #include "common/assert.h"
@@ -141,18 +143,40 @@ constexpr std::ptrdiff_t OffsetOf() {
     return OffsetOfCalculator<RealParentType, MemberType>::OffsetOf(MemberPtr);
 };
 
+// EDEN_NX2_OFFSETOF_CACHE: the offset is computed once per member instead of on every call (the
+// kernel's intrusive trees call this for each node they visit, under the scheduler lock). Read
+// before its dynamic initialization, the switch is false and the old path runs.
+inline const bool g_nx2_offset_of_cache = [] {
+    const char* value = std::getenv("EDEN_NX2_OFFSETOF_CACHE");
+    return value == nullptr || value[0] != '0';
+}();
+
+template <auto MemberPtr, typename RealParentType>
+std::ptrdiff_t CachedOffsetOf() {
+    static const std::ptrdiff_t offset = OffsetOf<MemberPtr, RealParentType>();
+    return offset;
+}
+
+template <auto MemberPtr, typename RealParentType>
+constexpr std::ptrdiff_t ParentOffset() {
+    if (!std::is_constant_evaluated() && g_nx2_offset_of_cache) {
+        return CachedOffsetOf<MemberPtr, RealParentType>();
+    }
+    return OffsetOf<MemberPtr, RealParentType>();
+}
+
 } // namespace impl
 
 template <auto MemberPtr, typename RealParentType = impl::GetParentType<MemberPtr>>
 constexpr RealParentType& GetParentReference(impl::GetMemberType<MemberPtr>* member) {
-    std::ptrdiff_t Offset = impl::OffsetOf<MemberPtr, RealParentType>();
+    std::ptrdiff_t Offset = impl::ParentOffset<MemberPtr, RealParentType>();
     return *static_cast<RealParentType*>(
         static_cast<void*>(static_cast<uint8_t*>(static_cast<void*>(member)) - Offset));
 }
 
 template <auto MemberPtr, typename RealParentType = impl::GetParentType<MemberPtr>>
 constexpr RealParentType const& GetParentReference(impl::GetMemberType<MemberPtr> const* member) {
-    std::ptrdiff_t Offset = impl::OffsetOf<MemberPtr, RealParentType>();
+    std::ptrdiff_t Offset = impl::ParentOffset<MemberPtr, RealParentType>();
     return *static_cast<const RealParentType*>(static_cast<const void*>(
         static_cast<const uint8_t*>(static_cast<const void*>(member)) - Offset));
 }

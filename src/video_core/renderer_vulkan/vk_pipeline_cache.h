@@ -140,6 +140,12 @@ public:
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 
+    /// A channel's dirty tables were (re)built: the state watch must patch them again.
+    void ResetStateWatch() noexcept {
+        state_watch.Reset();
+        key_pipeline = nullptr;
+    }
+
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
@@ -193,6 +199,10 @@ private:
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
+    /// EDEN_NX2_PIPE_SKIP: the pipeline graphics_key was last resolved to, and what its state
+    /// was refreshed from. While both stand, a draw reuses it without a refresh or lookup.
+    GraphicsPipeline* key_pipeline{};
+    PipelineStateWatch state_watch;
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();

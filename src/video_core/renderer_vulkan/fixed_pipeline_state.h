@@ -8,6 +8,7 @@
 
 #include <array>
 #include <type_traits>
+#include <vector>
 
 #include "common/bit_field.h"
 #include "common/common_types.h"
@@ -263,6 +264,10 @@ struct FixedPipelineState {
 
     void Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features);
 
+    /// The part of Refresh a raised Dirty::Blending redoes without dynamic blend state: the
+    /// attachments, from the blend and color mask registers. Clears the flag.
+    void RefreshBlending(Tegra::Engines::Maxwell3D& maxwell3d);
+
     size_t Hash() const noexcept;
 
     bool operator==(const FixedPipelineState& rhs) const noexcept;
@@ -291,6 +296,9 @@ struct FixedPipelineState {
         return offsetof(FixedPipelineState, xfb_state);
     }
 
+    /// attribute_types as Refresh computes it with dynamic vertex input.
+    [[nodiscard]] static u64 DynamicAttributeTypes(const Maxwell& regs) noexcept;
+
     u32 DynamicAttributeType(size_t index) const noexcept {
         return (attribute_types >> (index * 2)) & 0b11;
     }
@@ -298,6 +306,70 @@ struct FixedPipelineState {
 static_assert(std::has_unique_object_representations_v<FixedPipelineState>);
 static_assert(std::is_trivially_copyable_v<FixedPipelineState>);
 static_assert(std::is_trivially_constructible_v<FixedPipelineState>);
+
+/// EDEN_NX2_PIPE_SKIP: tells when FixedPipelineState::Refresh would give the state it gave last
+/// time. Registers Refresh reads that have a free dirty table slot raise Dirty::PipelineState;
+/// those whose two slots are taken are compared by value.
+class PipelineStateWatch {
+public:
+    /// The parts of the key a Refresh would change that StateUnchanged left to ApplyPatch
+    /// (EDEN_NX2_PIPE_PATCH).
+    struct Patch {
+        bool blending{};          ///< Dirty::Blending raised (no dynamic blend state)
+        bool vertex_input{};      ///< dynamic vertex input: the attribute types differ
+        u64 attribute_types{};    ///< what Refresh would compute for them
+
+        [[nodiscard]] bool Any() const noexcept {
+            return blending || vertex_input;
+        }
+    };
+
+    /// Whether Refresh would leave `state` as it is: no flag raised, the same draw topology,
+    /// engine hint and dual-source blending, the value-compared registers unchanged, and the
+    /// parts Refresh redoes under a raised VertexInput (dynamic) or ViewportSwizzles flag equal
+    /// to what it would compute. Clears ViewportSwizzles then, as Refresh would. A raised flag
+    /// passes when every watched register holds its value at the last Store again
+    /// (EDEN_NX2_PIPE_SKIP_VALUES); the flag is cleared then.
+    /// With `patch`: a raised Blending flag and changed dynamic attribute types don't fail it but
+    /// are noted there, for ApplyPatch to redo alone; everything else is checked as without.
+    [[nodiscard]] bool StateUnchanged(Tegra::Engines::Maxwell3D& maxwell3d,
+                                      const FixedPipelineState& state,
+                                      Patch* patch = nullptr) noexcept;
+
+    /// After StateUnchanged passed with `patch`: redoes the noted parts of `state` as Refresh
+    /// would. The other Refresh inputs are unchanged, so the rest of the key and the last
+    /// Store's snapshot both stand.
+    static void ApplyPatch(Tegra::Engines::Maxwell3D& maxwell3d, FixedPipelineState& state,
+                           const Patch& patch);
+
+    /// Called right after Refresh: remembers its inputs and clears Dirty::PipelineState.
+    void Store(Tegra::Engines::Maxwell3D& maxwell3d, const DynamicFeatures& features);
+
+    /// Forgets the watched engine, so the next Store patches its (possibly new) dirty tables.
+    void Reset() noexcept {
+        engine = nullptr;
+        valid = false;
+    }
+
+private:
+    void Setup(Tegra::Engines::Maxwell3D& maxwell3d, const DynamicFeatures& features);
+
+    const Tegra::Engines::Maxwell3D* engine{};
+    std::vector<u32> value_registers;
+    std::vector<u32> values;
+    /// Every register of RefreshRegisterRuns and its value at the last Store, compared when
+    /// Dirty::PipelineState was raised (EDEN_NX2_PIPE_SKIP_VALUES).
+    std::vector<u32> watched_registers;
+    std::vector<u32> watched_values;
+    Maxwell::PrimitiveTopology topology{};
+    Tegra::Engines::Maxwell3D::EngineHint engine_state{};
+    bool dual_source_blend{};
+    bool blending_gated{};
+    bool dynamic_vertex_input{};
+    bool valid{};
+};
+
+[[nodiscard]] bool PipelineSkipEnabled() noexcept;
 
 } // namespace Vulkan
 

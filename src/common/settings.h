@@ -568,6 +568,21 @@ struct Values {
                                                                  true,
                                                                  true};
 
+    // How much of a native (Switch 2) compute program's storage binding a dispatch marks
+    // GPU-written. Its pointer carries no size, so the binding is up to 8 MiB; marking all of it
+    // defers the CPU's later writes to those pages (Ocarina of Time's white leaves) and has fences
+    // copy them back. Auto: the extent the shader's stores provably reach (the whole binding when
+    // unknown). Full: the whole binding (the behaviour before the store extent). Cap64K: at most
+    // 64 KiB.
+    SwitchableSetting<NativeComputeWriteMark, true> native_compute_write_mark{
+        linkage,
+        NativeComputeWriteMark::Auto,
+        "native_compute_write_mark",
+        Category::RendererAdvanced,
+        Specialization::Default,
+        true,
+        true};
+
     SwitchableSetting<VramUsageMode, true> vram_usage_mode{linkage,
                                                            VramUsageMode::Conservative,
                                                            "vram_usage_mode",

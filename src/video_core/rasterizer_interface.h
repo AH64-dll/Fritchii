@@ -137,6 +137,14 @@ public:
 
     virtual RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) = 0;
 
+    /// EDEN_NX2_REACTIVE_ASYNC_FLUSH, on the GPU thread for a guest read: queues the GPU-written
+    /// buffer data in the range for download at a fence submitted now, without waiting for the
+    /// host GPU; the reader waits for it to land (Nx2Reactive::WaitLanding). False when it can't
+    /// (image data, nothing queued): the caller flushes.
+    virtual bool QueueFlushRegion([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size) {
+        return false;
+    }
+
     /// Whether reports in the range wait for host query results not yet in guest memory.
     [[nodiscard]] virtual bool HasPendingQueries([[maybe_unused]] DAddr addr,
                                                  [[maybe_unused]] u64 size) {

@@ -646,6 +646,25 @@ bool MemoryManager::IsMemoryDirty(GPUVAddr gpu_addr, size_t size,
     return result;
 }
 
+bool MemoryManager::Nx2ReadNeedsDrain(GPUVAddr gpu_addr, std::size_t size) const {
+    if (size == 0) {
+        return false;
+    }
+    const GPUVAddr end = gpu_addr + size;
+    const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
+    if (shim && gpu_addr < shim + NumShimSyncpoints * sizeof(u32) && end > shim) {
+        return true;
+    }
+    constexpr GPUVAddr written_page = GPUVAddr{1} << Tegra::Nx2WrittenPageBits;
+    for (GPUVAddr page = gpu_addr & ~(written_page - 1); page < end; page += written_page) {
+        const auto device = GpuToCpuAddress(page);
+        if (!device || Tegra::Nx2IsGpuWritten(*device)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
     // Native storage buffers ask this for up to 8 MiB on each bind, ~90,000 times a second in
     // Ocarina's Kokiri village: answer from the runs kept at map time instead of walking pages.

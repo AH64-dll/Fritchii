@@ -7,14 +7,17 @@
 #pragma once
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 
 #include <boost/container/static_vector.hpp>
 
 #include "common/common_types.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/dkb_frame_trace.h"
+#include "video_core/buffer_cache/nx2_write_handoff.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -112,6 +115,7 @@ public:
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
+    bool QueueFlushRegion(DAddr addr, u64 size) override;
     bool HasPendingQueries(DAddr addr, u64 size) override;
     void InvalidateRegion(DAddr addr, u64 size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
@@ -241,6 +245,53 @@ private:
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
+    /// EDEN_NX2_DYNSTATE_CACHE: one slot per dynamic state whose last recorded value is cached.
+    enum class DynSlot : u32 {
+        Viewports,
+        Scissors,
+        DepthBias,
+        BlendConstants,
+        DepthBounds,
+        LineWidth,
+        CullMode,
+        DepthBoundsTestEnable,
+        DepthTestEnable,
+        DepthWriteEnable,
+        StencilTestEnable,
+        DepthCompareOp,
+        FrontFace,
+        StencilOp,
+        PrimitiveRestartEnable,
+        RasterizerDiscardEnable,
+        DepthBiasEnable,
+        LogicOp,
+        ColorWriteEnable,
+        VertexInput,
+    };
+
+    /// False when `value` is what slot last recorded into the current command buffer (the
+    /// record can be skipped); otherwise caches it and returns true.
+    template <typename T>
+    bool DynamicStateChanged(DynSlot slot, T& cached, const T& value);
+    void ForgetDynamicState(DynSlot slot) noexcept {
+        dyn_cache.valid &= ~(u64{1} << static_cast<u32>(slot));
+    }
+    void BuildDynamicStateMask();
+
+    struct VertexInputLayout {
+        boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> bindings;
+        boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> attributes;
+    };
+    /// Attribute formats, per binding stride, instancing and divisor, and the repacked bindings.
+    using VertexInputKey = std::array<u32, 32 + 32 * 3 + 1>;
+    struct VertexInputKeyHash {
+        size_t operator()(const VertexInputKey& key) const noexcept;
+    };
+    void BuildVertexInputLayout(const Tegra::Engines::Maxwell3D::Regs& regs, u32 max_attributes,
+                                u32 max_bindings, VertexInputLayout& layout) const;
+    /// BufferCacheRuntime::SetVertexRepackLayout, skipped while its inputs are unchanged.
+    u32 UpdateVertexRepackLayout(bool dynamic_input);
+
     void FrameDumpPass(const Framebuffer* framebuffer);
     /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
     void TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes);
@@ -274,6 +325,7 @@ private:
     TextureCache texture_cache;
     BufferCacheRuntime buffer_cache_runtime;
     BufferCache buffer_cache;
+    VideoCommon::Nx2WriteHandoff write_handoff;
     QueryCacheRuntime query_cache_runtime;
     QueryCache query_cache;
     PipelineCache pipeline_cache;
@@ -315,6 +367,8 @@ private:
         std::array<f32, 280 * 12> bones{};
     } oot_actor, oot_previous_actor;
 #endif
+    u64 nx2_dispatch_serial = 0;     ///< Compute dispatches recorded (EDEN_NX2_WFI_DEFER)
+    u64 nx2_wfi_dispatch_serial = 0; ///< nx2_dispatch_serial at the last real wait for idle
     u64 render_trace_frame = 0;
     u32 render_trace_draws = 0;
     u32 render_trace_clears = 0;
@@ -366,6 +420,49 @@ private:
     u64 mesh_arena_size{64ULL << 20};
     /// The current submission's arena, after its counter is reset.
     const MeshArena& AcquireMeshArena();
+
+    /// Dynamic state last recorded into the command buffer of `epoch` (bit per DynSlot in
+    /// `valid`). Viewports and scissors are keyed on the registers they are computed from.
+    struct DynamicStateCache {
+        u64 epoch{};
+        u64 valid{};
+        std::array<u32, 6 + 16 * 7> viewports{};
+        std::array<u32, 6 + 16 * 3> scissors{};
+        std::array<f32, 3> depth_bias{};
+        std::array<f32, 4> blend_constants{};
+        std::array<f32, 2> depth_bounds{};
+        f32 line_width{};
+        u32 cull_mode{};
+        u32 depth_bounds_test{};
+        u32 depth_test{};
+        u32 depth_write{};
+        u32 stencil_test{};
+        u32 depth_compare{};
+        u32 front_face{};
+        std::array<u32, 9> stencil_op{};
+        u32 primitive_restart{};
+        u32 rasterizer_discard{};
+        u32 depth_bias_enable{};
+        u32 logic_op{};
+        std::array<VkBool32, 8> color_write_enable{};
+        const void* vertex_input{};
+    };
+    DynamicStateCache dyn_cache;
+    /// The dirty flags UpdateDynamicStates consumes on this device: none set, nothing to record.
+    Tegra::Engines::Maxwell3D::DirtyState::Flags dyn_state_mask{};
+    bool dyn_state_mask_built{};
+    bool dyn_state_never_skip{};
+
+    /// EDEN_NX2_VERTEX_INPUT_CACHE: vertex input layouts, built once and recorded by pointer
+    /// (immutable while the rasterizer lives).
+    std::unordered_map<VertexInputKey, std::unique_ptr<VertexInputLayout>, VertexInputKeyHash>
+        vertex_input_layouts;
+    VertexInputKey last_vertex_input_key{};
+    const VertexInputLayout* last_vertex_input_layout{};
+    /// Attribute formats and strides SetVertexRepackLayout last chose its repack mask from.
+    std::array<u32, 64> repack_key{};
+    bool repack_key_valid{};
+    bool repack_key_dynamic{};
 
     struct IndirectTrace {
         vk::Buffer readback;

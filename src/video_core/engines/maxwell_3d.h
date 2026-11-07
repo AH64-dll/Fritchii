@@ -37,6 +37,10 @@ namespace Tegra {
 class MemoryManager;
 }
 
+namespace Tegra::OotMacros {
+enum class Id : u8;
+}
+
 namespace VideoCommon {
 class GpuSplit;
 }
@@ -3102,8 +3106,19 @@ public:
         void DrawDeferred(Maxwell3D& maxwell3d, bool loop_continues = false);
         /// Instances after the first wait to be drawn together (DrawDeferred).
         [[nodiscard]] bool HasDeferredDraw() const noexcept {
-            return draw_state.draw_mode == DrawMode::Instance && draw_state.instance_count != 0;
+            return (draw_state.draw_mode == DrawMode::Instance && draw_state.instance_count != 0) ||
+                   first_folded;
         }
+        /// EDEN_NX2_FOLD_INSTANCE (split front, OoT draw macros): the next draw.end ends the first
+        /// instance of an instance loop. The loop's deferred draw covers that instance too
+        /// (DrawDeferred draws instance_count + 1), so it isn't drawn on its own (it was drawn
+        /// twice).
+        void FoldFirstInstance() noexcept {
+            fold_first_instance = true;
+        }
+        bool fold_first_instance{};
+        /// A folded first instance whose loop's deferred draw hasn't come yet.
+        bool first_folded{};
         /// Methods an instance loop writes between its draws; any other write ends the loop.
         [[nodiscard]] static bool IsInstanceLoopMethod(u32 method) noexcept;
         void DrawArray(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, u32 base_instance, u32 num_instances);
@@ -3214,6 +3229,20 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
+    /// GpuSplit's back (Kind::StateDelta, EDEN_NX2_FRONT_STATE): state register writes the
+    /// front coalesced, `count` words of method | value << 32 (shadow RAM already applied).
+    void ApplyFrontDelta(Core::System& system, const u64* entries, u32 count);
+    /// GpuSplit's back (Kind::DrawBatch): an instance loop's begin..end writes, then
+    /// `repeats - 1` more identical instances.
+    void RunDrawBatch(Core::System& system, const u64* methods, u32 count, u32 repeats);
+    /// GpuSplit's back (Kind::CbWrite, EDEN_NX2_FRONT_CB_ENCODE): `count` (1-4) constant buffer
+    /// data words (`first`, then the others two per u64 of `rest`, low half first), to
+    /// const_buffer.buffer + nibble i of `nibbles`, as the single writes would.
+    void BackCbWrite(Core::System& system, u32 nibbles, u32 first, const u64* rest, u32 count);
+    /// Whether `engine` is a Maxwell3D (GpuSplit's back profile zones; any thread).
+    [[nodiscard]] static bool IsMaxwell3D(const EngineInterface* engine);
+    /// GpuSplit's back (Kind::CbBind): a write of bind group `stage`'s raw_config.
+    void BackCbBind(Core::System& system, u32 stage, u32 argument);
 
     bool ShouldExecute() const {
         return execute_on;
@@ -3311,12 +3340,13 @@ private:
 
     /// Whether state register writes that keep the register's value are dropped (CallMethod).
     static bool SkipSameValueWrites() {
-        static const bool skip = [] {
-            const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
-            return value == nullptr || value[0] != '0';
-        }();
-        return skip;
+        return skip_same_value_writes;
     }
+    // Read once at startup (no guard to check on every method).
+    static inline const bool skip_same_value_writes = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
+        return value == nullptr || value[0] != '0';
+    }();
 
     /// Handles writes to the macro uploading register.
     void ProcessMacroUpload(u32 data);
@@ -3400,13 +3430,44 @@ private:
     void ReleaseFront();
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
+    /// FrontWrite for the methods that aren't plain state registers (FrontState::plain).
+    void FrontWriteFull(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                        u32 argument, bool is_last_call, bool from_macro);
+    /// FrontWrite for a plain state register: into the registers and the delta.
+    void FrontStateWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                         u32 argument);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                       u32 count);
+    /// Narrow drains (GpuSplit::NarrowDrains): notes the guest memory an executable method just
+    /// sent (`words` data words of it) writes on the back.
+    void FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 words);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
+    // EDEN_NX2_FRONT_STATE: state writes held back as a delta, instance loops as a draw batch.
+    void FrontMarkDelta(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 value);
+    /// Sends an executable write, or holds it back in a draw batch.
+    void FrontSend(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                   u32 value, bool is_last_call, bool from_macro);
+    void FrontEmitBatch(VideoCommon::GpuSplit& split, FrontState& state);
+    void FrontEmitCapture(VideoCommon::GpuSplit& split, FrontState& state);
+    /// EDEN_NX2_FRONT_CB_ENCODE: holds a constant buffer data write in the current run.
+    void FrontCbWord(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument);
+    /// Sends the held constant buffer run (Kind::CbWrite) and notes its writes.
+    void FrontEmitCb(VideoCommon::GpuSplit& split, FrontState& state);
+    /// GpuSplit::PendingFlush: sends the batch, the partial capture and the delta.
+    static void FrontFlushPending(void* maxwell3d);
+    /// Runs OoT macro replacement `id` for the call; false: the JIT runs it (nothing was done).
+    bool FrontRunOotMacro(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                          OotMacros::Id id);
+    /// What a replacement runs against (macro_hle_oot.h).
+    struct OotContext;
+    /// The held-back draw batch is `count` writes equal to `writes`: `more` further repeats of
+    /// them are counted as FrontSend would count each. False: send them one by one.
+    bool FrontBatchRepeats(VideoCommon::GpuSplit& split, FrontState& state,
+                           const std::array<u32, 2>* writes, u32 count, u32 more);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,

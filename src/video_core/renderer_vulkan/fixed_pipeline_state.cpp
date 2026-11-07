@@ -6,7 +6,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <utility>
+#include <vector>
 #include <bit>
 #include <numeric>
 #include <ranges>
@@ -15,6 +19,7 @@
 #include "common/settings.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/nx2_bindmemo_stats.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 
@@ -103,6 +108,7 @@ void RefreshXfbState(VideoCommon::TransformFeedbackState& state, const Maxwell& 
 }
 } // Anonymous namespace
 
+// A register read here must also be in RefreshRegisterRuns (EDEN_NX2_PIPE_SKIP).
 void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features) {
     const Maxwell& regs = maxwell3d.regs;
     const auto topology_ = maxwell3d.draw_manager.draw_state.topology;
@@ -198,23 +204,7 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
     if (maxwell3d.dirty.flags[Dirty::VertexInput]) {
         if (features.has_dynamic_vertex_input) {
             // Dirty flag will be reset by the command buffer update
-            static constexpr std::array LUT{
-                0u, // Invalid
-                1u, // SignedNorm
-                1u, // UnsignedNorm
-                2u, // SignedInt
-                3u, // UnsignedInt
-                1u, // UnsignedScaled
-                1u, // SignedScaled
-                1u, // Float
-            };
-            const auto& attrs = regs.vertex_attrib_format;
-            attribute_types = 0;
-            for (size_t i = 0; i < Maxwell::NumVertexAttributes; ++i) {
-                const u32 mask = attrs[i].constant != 0 ? 0 : 3;
-                const u32 type = LUT[static_cast<size_t>(attrs[i].type.Value())];
-                attribute_types |= static_cast<u64>(type & mask) << (i * 2);
-            }
+            attribute_types = DynamicAttributeTypes(regs);
         } else {
             maxwell3d.dirty.flags[Dirty::VertexInput] = false;
             enabled_divisors = 0;
@@ -255,19 +245,7 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
     }
     if (!extended_dynamic_state_3_blend) {
         if (maxwell3d.dirty.flags[Dirty::Blending]) {
-            maxwell3d.dirty.flags[Dirty::Blending] = false;
-            for (size_t index = 0; index < attachments.size(); ++index) {
-                attachments[index].Refresh(regs, index);
-                auto& attachment = attachments[index];
-                if (color_write_enable_dynamic && attachment.mask_r == 0 &&
-                    attachment.mask_g == 0 && attachment.mask_b == 0 &&
-                    attachment.mask_a == 0) {
-                    attachment.mask_r.Assign(1);
-                    attachment.mask_g.Assign(1);
-                    attachment.mask_b.Assign(1);
-                    attachment.mask_a.Assign(1);
-                }
-            }
+            RefreshBlending(maxwell3d);
         }
     }
     dynamic_state.Refresh3(regs, features);
@@ -286,6 +264,43 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
                 repack_mask, binding, regs.vertex_streams[binding].stride));
         }
     }
+}
+
+void FixedPipelineState::RefreshBlending(Tegra::Engines::Maxwell3D& maxwell3d) {
+    const Maxwell& regs = maxwell3d.regs;
+    maxwell3d.dirty.flags[Dirty::Blending] = false;
+    for (size_t index = 0; index < attachments.size(); ++index) {
+        attachments[index].Refresh(regs, index);
+        auto& attachment = attachments[index];
+        if (color_write_enable_dynamic && attachment.mask_r == 0 && attachment.mask_g == 0 &&
+            attachment.mask_b == 0 && attachment.mask_a == 0) {
+            attachment.mask_r.Assign(1);
+            attachment.mask_g.Assign(1);
+            attachment.mask_b.Assign(1);
+            attachment.mask_a.Assign(1);
+        }
+    }
+}
+
+u64 FixedPipelineState::DynamicAttributeTypes(const Maxwell& regs) noexcept {
+    static constexpr std::array LUT{
+        0u, // Invalid
+        1u, // SignedNorm
+        1u, // UnsignedNorm
+        2u, // SignedInt
+        3u, // UnsignedInt
+        1u, // UnsignedScaled
+        1u, // SignedScaled
+        1u, // Float
+    };
+    const auto& attrs = regs.vertex_attrib_format;
+    u64 types = 0;
+    for (size_t i = 0; i < Maxwell::NumVertexAttributes; ++i) {
+        const u32 mask = attrs[i].constant != 0 ? 0 : 3;
+        const u32 type = LUT[static_cast<size_t>(attrs[i].type.Value())];
+        types |= static_cast<u64>(type & mask) << (i * 2);
+    }
+    return types;
 }
 
 void FixedPipelineState::BlendingAttachment::Refresh(const Maxwell& regs, size_t index) {
@@ -618,6 +633,254 @@ Maxwell::Blend::Factor FixedPipelineState::UnpackBlendFactor(u32 packed) noexcep
     };
     ASSERT(packed < LUT.size());
     return LUT[packed];
+}
+
+} // namespace Vulkan
+
+namespace Vulkan {
+namespace {
+using Tegra::Engines::Maxwell3D;
+
+#define PSW_OFF(field_name) static_cast<u32>(MAXWELL3D_REG_INDEX(field_name))
+#define PSW_NUM(field_name) static_cast<u32>(sizeof(Maxwell3D::Regs::field_name) / sizeof(u32))
+
+/// The 3D registers FixedPipelineState::Refresh reads with these features outside the parts it
+/// recomputes only under a dirty flag (VertexInput, ViewportSwizzles, Blending), as word runs.
+/// The blend registers, which only decide attachment0_dual_source_blend, are left out: that bit
+/// is compared instead, as blending changes between draws with dynamic blend state.
+std::vector<std::pair<u32, u32>> RefreshRegisterRuns(const DynamicFeatures& features) {
+    std::vector<std::pair<u32, u32>> runs;
+    const auto add = [&](u32 first, u32 count) { runs.emplace_back(first, count); };
+    add(PSW_OFF(transform_feedback_enabled), 1);
+    add(PSW_OFF(depth_mode), 1);
+    add(PSW_OFF(polygon_mode_front), 1);
+    add(PSW_OFF(tessellation), PSW_NUM(tessellation));
+    add(PSW_OFF(patch_vertices), 1);
+    add(PSW_OFF(anti_alias_samples_mode), 1);
+    add(PSW_OFF(alpha_test_enabled), 1);
+    add(PSW_OFF(alpha_test_func), 1);
+    add(PSW_OFF(mandated_early_z), 1);
+    add(PSW_OFF(zeta_enable), 1);
+    add(PSW_OFF(zeta) +
+            static_cast<u32>(offsetof(Maxwell::Zeta, format) / sizeof(u32)),
+        1);
+    add(PSW_OFF(window_origin), PSW_NUM(window_origin));
+    add(PSW_OFF(provoking_vertex), 1);
+    add(PSW_OFF(conservative_raster_enable), 1);
+    add(PSW_OFF(line_anti_alias_enable), 1);
+    add(PSW_OFF(anti_alias_alpha_control), PSW_NUM(anti_alias_alpha_control));
+    add(PSW_OFF(depth_bounds), PSW_NUM(depth_bounds));
+    add(PSW_OFF(line_stipple_params), PSW_NUM(line_stipple_params));
+    for (u32 index = 0; index < Maxwell::NumRenderTargets; ++index) {
+        add(PSW_OFF(rt) + index * PSW_NUM(rt[0]) +
+                static_cast<u32>(offsetof(Maxwell::RenderTargetConfig, format) / sizeof(u32)),
+            1);
+    }
+    add(PSW_OFF(alpha_test_ref), 1);
+    add(PSW_OFF(point_size), 1);
+    if (!features.has_extended_dynamic_state) {
+        add(PSW_OFF(gl_front_face), 1);
+        add(PSW_OFF(stencil_front_op), PSW_NUM(stencil_front_op));
+        add(PSW_OFF(stencil_two_side_enable), 1);
+        add(PSW_OFF(stencil_back_op), PSW_NUM(stencil_back_op));
+        add(PSW_OFF(stencil_enable), 1);
+        add(PSW_OFF(depth_write_enabled), 1);
+        add(PSW_OFF(depth_bounds_enable), 1);
+        add(PSW_OFF(depth_test_enable), 1);
+        add(PSW_OFF(depth_test_func), 1);
+        add(PSW_OFF(gl_cull_face), 1);
+        add(PSW_OFF(gl_cull_test_enabled), 1);
+        add(PSW_OFF(vertex_streams), PSW_NUM(vertex_streams));
+    }
+    if (!features.has_extended_dynamic_state_2_logic_op) {
+        add(PSW_OFF(logic_op), PSW_NUM(logic_op));
+        if (!features.has_extended_dynamic_state_2) {
+            add(PSW_OFF(polygon_offset_point_enable), 1);
+            add(PSW_OFF(polygon_offset_line_enable), 1);
+            add(PSW_OFF(polygon_offset_fill_enable), 1);
+            add(PSW_OFF(rasterize_enable), 1);
+            add(PSW_OFF(primitive_restart), PSW_NUM(primitive_restart));
+        }
+    }
+    if (!features.has_dynamic_state3_logic_op_enable) {
+        add(PSW_OFF(logic_op), PSW_NUM(logic_op));
+    }
+    if (!features.has_dynamic_state3_depth_clamp_enable) {
+        add(PSW_OFF(viewport_clip_control), PSW_NUM(viewport_clip_control));
+    }
+    if (!features.has_dynamic_state3_line_stipple_enable) {
+        add(PSW_OFF(line_stipple_enable), 1);
+    }
+    if (!features.has_dynamic_vertex_input && features.has_static_vertex_repack) {
+        add(PSW_OFF(vertex_attrib_format), PSW_NUM(vertex_attrib_format));
+        add(PSW_OFF(vertex_streams), PSW_NUM(vertex_streams));
+    }
+    return runs;
+}
+
+#undef PSW_NUM
+#undef PSW_OFF
+} // Anonymous namespace
+
+bool PipelineSkipEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_PIPE_SKIP");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+void PipelineStateWatch::Setup(Maxwell3D& maxwell3d, const DynamicFeatures& features) {
+    // Every channel's tables are set up alike: patching is idempotent, and the registers left to
+    // compare by value come out the same for each.
+    auto& tables = maxwell3d.dirty.tables;
+    constexpr u8 flag = Dirty::PipelineState;
+    value_registers.clear();
+    watched_registers.clear();
+    for (const auto& [first, count] : RefreshRegisterRuns(features)) {
+        for (u32 reg = first; reg < first + count; ++reg) {
+            watched_registers.push_back(reg);
+            if (tables[0][reg] == flag || tables[1][reg] == flag) {
+                continue;
+            }
+            if (tables[1][reg] == VideoCommon::Dirty::NullEntry) {
+                tables[1][reg] = flag;
+            } else if (tables[0][reg] == VideoCommon::Dirty::NullEntry) {
+                tables[0][reg] = flag;
+            } else {
+                value_registers.push_back(reg);
+            }
+        }
+    }
+    // HLE macros (macro.cpp) set this one without dirty flags.
+    value_registers.push_back(static_cast<u32>(MAXWELL3D_REG_INDEX(transform_feedback_enabled)));
+    std::ranges::sort(value_registers);
+    value_registers.erase(std::unique(value_registers.begin(), value_registers.end()),
+                          value_registers.end());
+    values.resize(value_registers.size());
+    watched_registers.push_back(static_cast<u32>(MAXWELL3D_REG_INDEX(transform_feedback_enabled)));
+    std::ranges::sort(watched_registers);
+    watched_registers.erase(std::unique(watched_registers.begin(), watched_registers.end()),
+                            watched_registers.end());
+    watched_values.clear();
+    blending_gated = !features.has_extended_dynamic_state_3_blend;
+    dynamic_vertex_input = features.has_dynamic_vertex_input;
+    engine = &maxwell3d;
+}
+
+void PipelineStateWatch::Store(Maxwell3D& maxwell3d, const DynamicFeatures& features) {
+    if (engine != &maxwell3d) {
+        Setup(maxwell3d, features);
+    }
+    const u32* const regs = maxwell3d.regs.reg_array.data();
+    for (size_t index = 0; index < value_registers.size(); ++index) {
+        values[index] = regs[value_registers[index]];
+    }
+    if (VideoCommon::Nx2BindMemo::PipeSkipValuesEnabled()) {
+        watched_values.resize(watched_registers.size());
+        for (size_t index = 0; index < watched_registers.size(); ++index) {
+            watched_values[index] = regs[watched_registers[index]];
+        }
+    }
+    topology = maxwell3d.draw_manager.draw_state.topology;
+    engine_state = maxwell3d.engine_state;
+    dual_source_blend = ComputeAttachment0DualSourceBlend(maxwell3d.regs);
+    maxwell3d.dirty.flags[Dirty::PipelineState] = false;
+    valid = true;
+}
+
+bool PipelineStateWatch::StateUnchanged(Maxwell3D& maxwell3d, const FixedPipelineState& state,
+                                        Patch* patch) noexcept {
+    using VideoCommon::Nx2BindMemo::Note;
+    using Stat = VideoCommon::Nx2BindMemo::Stat;
+    if (!valid || engine != &maxwell3d) {
+        Note(Stat::PipeMissNotSetUp);
+        return false;
+    }
+    auto& flags = maxwell3d.dirty.flags;
+    const u32* const regs = maxwell3d.regs.reg_array.data();
+    bool flag_values_same = false;
+    if (flags[Dirty::PipelineState]) {
+        // Written since the last Refresh: unchanged if each holds the value it had then again.
+        if (!VideoCommon::Nx2BindMemo::PipeSkipValuesEnabled() ||
+            watched_values.size() != watched_registers.size()) {
+            Note(Stat::PipeMissFlag);
+            return false;
+        }
+        for (size_t index = 0; index < watched_registers.size(); ++index) {
+            if (regs[watched_registers[index]] != watched_values[index]) {
+                Note(Stat::PipeMissFlag);
+                return false;
+            }
+        }
+        flag_values_same = true;
+    }
+    if (blending_gated && flags[Dirty::Blending]) {
+        if (patch == nullptr) {
+            Note(Stat::PipeMissBlending);
+            return false;
+        }
+        patch->blending = true;
+    }
+    if (flags[Dirty::VertexInput]) {
+        if (!dynamic_vertex_input) {
+            Note(Stat::PipeMissVertexInput);
+            return false;
+        }
+        const u64 types = FixedPipelineState::DynamicAttributeTypes(maxwell3d.regs);
+        if (types != state.attribute_types) {
+            if (patch == nullptr) {
+                Note(Stat::PipeMissVertexInput);
+                return false;
+            }
+            patch->vertex_input = true;
+            patch->attribute_types = types;
+        }
+    }
+    if (maxwell3d.draw_manager.draw_state.topology != topology ||
+        maxwell3d.engine_state != engine_state ||
+        ComputeAttachment0DualSourceBlend(maxwell3d.regs) != dual_source_blend) {
+        Note(Stat::PipeMissDrawState);
+        return false;
+    }
+    for (size_t index = 0; index < value_registers.size(); ++index) {
+        if (regs[value_registers[index]] != values[index]) {
+            Note(Stat::PipeMissValues);
+            return false;
+        }
+    }
+    if (flags[Dirty::ViewportSwizzles]) {
+        const auto& transform = maxwell3d.regs.viewport_transform;
+        for (size_t index = 0; index < transform.size(); ++index) {
+            if (static_cast<u16>(transform[index].swizzle.raw) != state.viewport_swizzles[index]) {
+                Note(Stat::PipeMissSwizzles);
+                return false;
+            }
+        }
+        flags[Dirty::ViewportSwizzles] = false;
+    }
+    if (flag_values_same) {
+        // The registers equal the last Store's again: the flag may stand for them as cleared.
+        flags[Dirty::PipelineState] = false;
+        Note(Stat::PipeFlagValuesSame);
+    }
+    return true;
+}
+
+void PipelineStateWatch::ApplyPatch(Maxwell3D& maxwell3d, FixedPipelineState& state,
+                                    const Patch& patch) {
+    using VideoCommon::Nx2BindMemo::Note;
+    using Stat = VideoCommon::Nx2BindMemo::Stat;
+    if (patch.blending) {
+        // As Refresh without dynamic blend state under a raised Blending flag.
+        state.RefreshBlending(maxwell3d);
+        Note(Stat::PipePatchBlend);
+    }
+    if (patch.vertex_input) {
+        // As Refresh with dynamic vertex input; the flag stays for the command buffer update.
+        state.attribute_types = patch.attribute_types;
+        Note(Stat::PipePatchVertexInput);
+    }
 }
 
 } // namespace Vulkan

@@ -283,6 +283,64 @@ struct UserConfig {
     /// callbacks.
     bool recompile_on_exclusive_fastmem_failure = true;
 
+    /// x64 only. The host is TSO, so ordered (acquire) loads are emitted as plain loads instead
+    /// of LOCK XADD. Ordered stores keep XCHG, which keeps STLR followed by LDAR ordered.
+    bool tso_ordered_loads = false;
+
+    /// x64 only. DMB that only orders loads (xxLD) or only stores (xxST) is a no-op on TSO.
+    bool elide_ld_st_barriers = false;
+
+    /// x64 only. The register allocator moves a value it must evict into a free callee-saved
+    /// GPR when there is one, instead of spilling it to the stack.
+    bool spill_to_free_gpr = false;
+
+    /// x64 only. When an instruction overwrites an operand that is still needed later, the
+    /// register allocator writes into a copy in a free register instead of evicting the original.
+    bool scratch_copy_to_free_reg = false;
+
+    /// x64 only, with unchecked 64-bit fastmem. A base + immediate address whose only use is one
+    /// load or store is folded into that access's addressing mode instead of computed with LEA.
+    bool fold_address_offsets = false;
+
+    /// x64 only. A 32-bit value known to be zero-extended in its host register (written by a
+    /// 32-bit instruction) is not zero-extended again by SetW / ZeroExtendWordToLong.
+    bool elide_redundant_zext = false;
+
+    /// x64 only. Unlinked block exits jump to one shared stub per target (PC store + dispatcher
+    /// return) instead of an inline stub, so patch sites are 5/6 bytes instead of 22/23.
+    bool compact_block_exits = false;
+
+    /// x64 only. Cold code (memory-access fault and abort paths, atomic fallbacks, exit stubs) is
+    /// emitted into a separate region at the end of the code cache, away from the hot blocks.
+    bool far_code = false;
+
+    /// x64 only. Blocks do not save and set up %rbp as a frame pointer (nothing in the JIT
+    /// reads it; Windows unwinding does not use it).
+    bool omit_block_frame = false;
+
+    /// x64 only, without cycle counting. Links to a higher guest PC skip the halt check; links
+    /// to the same or a lower PC and indirect branches (RSB/fast dispatch) check it instead, so
+    /// every loop still sees a halt request.
+    bool halt_check_on_back_edges = false;
+
+    /// x64 only. Return stack buffer entries used (power of two, 8 to 32).
+    std::uint32_t rsb_size = 8;
+
+    /// x64 only. log2 of the number of fast dispatch table entries (0 = default 20) and whether
+    /// the table is 4-way set associative (the four ways of a set share one cache line).
+    std::uint32_t fast_dispatch_table_bits = 0;
+    bool fast_dispatch_set_associative = false;
+
+    /// x64 only, without cycle counting. Conditional branches, CSEL and CBZ/TBZ use the host
+    /// flags directly when the flag-setting instruction was emitted right before them, instead
+    /// of reloading NZCV from the guest state (the state is still written).
+    bool reuse_host_flags = false;
+
+    /// x64 only, with fastmem exclusives and Unsafe_IgnoreGlobalMonitor. LSE atomics (LDADD
+    /// and friends, SWP, CAS) become one host atomic instruction (or a host CAS loop) instead
+    /// of an exclusive load/store pair that ends the block.
+    bool native_lse_atomics = false;
+
     /// This option relates to translation. Generally when we run into an unpredictable
     /// instruction the ExceptionRaised callback is called. If this is true, we define
     /// definite behaviour for some unpredictable instructions.

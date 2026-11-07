@@ -52,6 +52,22 @@ public:
         /* Do Nothing */
     }
 
+    // EDEN_NX2_QUERY_LAZY_SYNC (payload releases, GuestStreamer): the newest pending sync's
+    // value reaches guest memory during the report (MarkInFlight .. FinishInFlight); a wait for
+    // idle applies written ones as guest CPU writes (ResolveLazy) and copies only the rest.
+    virtual void MarkInFlight([[maybe_unused]] size_t query_id) {}
+
+    /// Returns true when the sync must be copied at once (a wait for idle left it pending).
+    virtual bool FinishInFlight([[maybe_unused]] size_t query_id, [[maybe_unused]] bool written) {
+        return false;
+    }
+
+    virtual void ResolveLazy() {}
+
+    virtual bool HasCopyPending() const {
+        return HasPendingSync();
+    }
+
     virtual size_t WriteCounter(VAddr address, bool has_timestamp, u32 value,
                                 std::optional<u32> subreport = std::nullopt) = 0;
 

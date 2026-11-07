@@ -58,9 +58,61 @@ public:
 
     /// Returns true if a region has been modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
+        // Within one word of one manager (each streamed uniform buffer, inline writes): the same
+        // answer from one mask test, without the generic page and word iteration.
+        const u64 local = query_cpu_addr & HIGHER_PAGE_MASK;
+        if (query_size != 0 && local + query_size <= HIGHER_PAGE_SIZE &&
+            local / BYTES_PER_WORD == (local + query_size - 1) / BYTES_PER_WORD) {
+            const Manager* const manager = top_tier[query_cpu_addr >> HIGHER_PAGE_BITS];
+            return manager != nullptr &&
+                   manager->IsWordRangeGpuModified(local, local + query_size - 1);
+        }
         return IteratePages<false>(query_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
             return manager->IsRegionModified(Type::GPU, offset, size);
         });
+    }
+
+    /// True when every page of the region is already CPU-dirty, so MarkRegionAsCpuModified would
+    /// change nothing (CPU-dirty pages are unprotected; CachedCpuWrite is unused). False when a
+    /// part has no manager yet. Read only.
+    [[nodiscard]] bool IsRegionFullyCpuModified(VAddr query_cpu_addr, u64 query_size) const noexcept {
+        if (query_size == 0) {
+            return false;
+        }
+        std::size_t page_index{query_cpu_addr >> HIGHER_PAGE_BITS};
+        u64 page_offset{query_cpu_addr & HIGHER_PAGE_MASK};
+        u64 remaining{query_size};
+        while (remaining > 0) {
+            const u64 amount = (std::min<u64>)(HIGHER_PAGE_SIZE - page_offset, remaining);
+            const Manager* const manager = top_tier[page_index];
+            if (manager == nullptr || !manager->IsRangeFullyCpuModified(page_offset, amount)) {
+                return false;
+            }
+            ++page_index;
+            page_offset = 0;
+            remaining -= amount;
+        }
+        return true;
+    }
+
+    /// True when an upload walk over the region (ForEachUploadRange) could find or change
+    /// anything: a page in it is CPU-dirty or unprotected, or part of it has no manager yet (the
+    /// walk would create one with every page dirty). Read only.
+    [[nodiscard]] bool IsRegionUploadDirty(VAddr query_cpu_addr, u64 query_size) const noexcept {
+        std::size_t page_index{query_cpu_addr >> HIGHER_PAGE_BITS};
+        u64 page_offset{query_cpu_addr & HIGHER_PAGE_MASK};
+        u64 remaining{query_size};
+        while (remaining > 0) {
+            const u64 amount = (std::min<u64>)(HIGHER_PAGE_SIZE - page_offset, remaining);
+            const Manager* const manager = top_tier[page_index];
+            if (manager == nullptr || manager->IsRangeUploadDirty(page_offset, amount)) {
+                return true;
+            }
+            ++page_index;
+            page_offset = 0;
+            remaining -= amount;
+        }
+        return false;
     }
 
     /// Returns true if a region has been marked as Preflushable
@@ -184,6 +236,44 @@ public:
                                           static_cast<s64>(end - begin), func);
         });
     }
+    /// ForEachUploadRange / ForEachDirtyUploadRange keeping Hot pages unprotected and dirty:
+    /// they go to `hot_func` instead (WordManager::ForEachCpuUploadRange).
+    template <typename Func, typename HotFunc>
+    void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool skip_clean, Func&& func,
+                            HotFunc&& hot_func) {
+        IteratePages<true>(query_cpu_range, query_size,
+                           [&func, &hot_func, skip_clean](Manager* manager, u64 offset, size_t size) {
+            u64 begin = offset;
+            u64 end = offset + size;
+            if (skip_clean) {
+                const u64 dirty = manager->DirtyWords(offset / BYTES_PER_WORD,
+                                                      (offset + size - 1) / BYTES_PER_WORD);
+                if (dirty == 0) {
+                    return;
+                }
+                begin = (std::max<u64>)(offset, std::countr_zero(dirty) * BYTES_PER_WORD);
+                end = (std::min<u64>)(offset + size, (64 - std::countl_zero(dirty)) * BYTES_PER_WORD);
+            }
+            manager->ForEachCpuUploadRange(manager->cpu_addr + begin, static_cast<s64>(end - begin),
+                                           func, hot_func);
+        });
+    }
+
+    /// Marks or unmarks Hot pages (BufferCache hot pages).
+    void MarkRegionHot(VAddr cpu_address, u64 size, bool hot) {
+        IteratePages<true>(cpu_address, size, [hot](Manager* manager, u64 offset, size_t length) {
+            manager->ChangeRegionState(Type::Hot, hot, manager->cpu_addr + offset, length);
+        });
+    }
+
+    /// Calls `func` for each range of Hot pages in the region.
+    template <typename Func>
+    void ForEachHotRange(VAddr cpu_address, u64 size, Func&& func) {
+        IteratePages<false>(cpu_address, size, [&func](Manager* manager, u64 offset, size_t length) {
+            manager->ForEachModifiedRange(Type::Hot, false, manager->cpu_addr + offset, length, func);
+        });
+    }
+
     /// Verify mode: true when the clean words of the managers over a range match a recount.
     [[nodiscard]] bool CleanWordsHold(VAddr query_cpu_addr, u64 query_size) const noexcept {
         const size_t first = query_cpu_addr >> HIGHER_PAGE_BITS;

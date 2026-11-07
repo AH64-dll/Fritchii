@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 #include <deque>
@@ -21,6 +22,7 @@
 #include "common/scratch_buffer.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/puller.h"
+#include "video_core/gpu_split.h"
 
 namespace Core {
 class System;
@@ -205,6 +207,25 @@ private:
     void CallMethod(u32 argument);
     void CallMultiMethod(const u32* base_start, u32 num_methods);
     [[nodiscard]] bool WantsSegment() const;
+
+    /// Narrow drains (GpuSplit::NarrowDrains): the guest memory a method sent to the split's
+    /// back writes there. Taken before the method is sent, noted once it is (NoteBackWrites).
+    struct BackWrites {
+        std::array<std::pair<GPUVAddr, GPUVAddr>, 4> ranges{};
+        u32 count{};
+        bool unbounded{};
+        bool writer{}; ///< Compute or copy work (GpuSplit::NoteUnboundedWrite)
+        VideoCommon::UnboundedCause cause{}; ///< GpuSplit::NoteUnboundedWrite
+    };
+    BackWrites FrontBackWrites(Engines::EngineInterface& engine, Engines::EngineTypes type,
+                               u32 method, const u32* arguments, u32 count);
+    void NoteBackWrites(const BackWrites& writes);
+    /// GpuSplit::WaitForWriters for a command list's pages (narrowed with the narrow drains).
+    bool WaitForListWriters(GPUVAddr address, size_t size);
+    /// WaitForListWriters for a list on pages the GPU never wrote (EDEN_NX2_LIST_EXACT).
+    bool WaitForListFetch(GPUVAddr address, size_t size);
+    /// Marks the list's pages as read from; whether all of them were before.
+    bool MarkListPagesSeen(GPUVAddr address, size_t size);
     void ReportUnboundSubchannel();
     void WatchArgument(u32 method, u32 argument) const;
 

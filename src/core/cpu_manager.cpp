@@ -182,6 +182,8 @@ void CpuManager::RunThread(std::stop_token token, std::size_t core) {
     Common::SetCurrentThreadToPerformanceCores();
     if (Settings::values.pin_gpu_threads.GetValue()) {
         Common::PinCurrentThread(Common::PinnedRole::GuestCore);
+    } else {
+        Common::PinHostThread(Common::HostThreadRole::GuestCore, core);
     }
     auto& data = core_data[core];
     data.host_context = Common::Fiber::ThreadToFiber();

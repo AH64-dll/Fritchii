@@ -12,6 +12,18 @@
 
 namespace Kernel {
 
+/// Address waits for the kernel's own locks (Common::Nx2AddressWait: WaitOnAddress on Windows).
+/// EDEN_NX2_KSPIN=0 restores std::atomic waits and the short lock spin.
+namespace Nx2Wait {
+bool Enabled();
+/// Microseconds a contended kernel lock spins before sleeping (EDEN_NX2_KSPIN_US, default 20).
+s64 SpinMicroseconds();
+/// Sleeps while word holds expected; may return early.
+void Wait(std::atomic<u32>& word, u32 expected);
+void WakeOne(std::atomic<u32>& word);
+void WakeAll(std::atomic<u32>& word);
+} // namespace Nx2Wait
+
 class KSpinLock {
 public:
     explicit KSpinLock() = default;
@@ -24,6 +36,8 @@ public:
     bool TryLock();
 
 private:
+    void LockContendedNx2();
+
     // 0 free, 1 held, 2 held with (possible) sleepers. The scheduler lock is taken by every
     // core thousands of times a frame and held for microseconds: a contended Lock spins briefly
     // before sleeping, instead of putting the host thread to sleep at once and paying its

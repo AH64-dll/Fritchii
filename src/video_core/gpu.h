@@ -153,6 +153,9 @@ public:
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback);
     /// Returns true when guest CPU writes to the range are collected but not yet applied.
     [[nodiscard]] bool HasPendingCPUWrites(DAddr addr, u64 size);
+    /// Collects a guest CPU write for the next InvalidateGPUCache on behalf of a guest write trap
+    /// (EDEN_NX2_WRITE_HANDOFF). Only the holder of the buffer cache's lock calls it.
+    void CollectHandoffWrite(DAddr addr, u64 size);
     /// Signal the ending of command list.
     void OnCommandListEnd();
 

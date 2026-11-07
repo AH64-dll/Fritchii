@@ -62,6 +62,26 @@ enum class Zone : u32 {
     WriterWait,
     ListSubmitWait,
     ListGpuWait,
+    TickWork,       ///< GPU::TickWork (sync requests: reactive flushes)
+    InlineToMemory, ///< AccelerateInlineToMemory
+    // The split back's own work, inside what was "other" and "method" (count: entries or calls).
+    RingDecode,   ///< BackLoop's batches: entry decode and dispatch, Engine entries, method sinks
+    DeltaApply,   ///< Kind::StateDelta (Maxwell3D::ApplyFrontDelta)
+    CbWrite,      ///< Kind::CbWrite (Maxwell3D::BackCbWrite)
+    CbBind,       ///< Kind::CbBind and bind group methods (Maxwell3D::ProcessCBBind)
+    CbMulti,      ///< Constant buffer data in method runs (Maxwell3D::ProcessCBMultiData)
+    DrawBatch,    ///< Kind::DrawBatch expansion (Maxwell3D::RunDrawBatch)
+    DrawManager,  ///< DrawManager begin/end/deferred, outside the rasterizer's draw
+    Method3D,     ///< Maxwell3D method entries ("method" keeps the other engines and runs)
+    Call,         ///< Kind::Call entries, by thunk in the "calls" report line
+    FinishMacro,  ///< Maxwell3D::FinishFrontMacro (a Call after each front macro that drew)
+    QueryReport,  ///< report_semaphore.query (Maxwell3D::ProcessQueryGet)
+    CounterReset, ///< clear_report_value (Maxwell3D::ProcessCounterReset)
+    RenderEnable, ///< render_enable.mode (Maxwell3D::ProcessQueryCondition)
+    SyncPoint,    ///< sync_info (Maxwell3D::ProcessSyncPoint)
+    WaitForIdle,  ///< wait_for_idle (rasterizer WaitForIdle)
+    CacheBarrier, ///< invalidate_texture_data_cache, fragment and tiled cache barriers
+    IdleHook,     ///< The back's idle hook (Scheduler::FlushDeferred: submits)
     Count,
 };
 
@@ -73,8 +93,13 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
     "fence skipped", "method", "split drain", "split wait",
-    "writer wait", "list submit wait", "list GPU wait",
+    "writer wait", "list submit wait", "list GPU wait", "tick work", "inline to memory",
+    "ring decode", "delta apply", "cb write", "cb bind", "cb multi", "draw batch",
+    "draw manager", "method 3D", "call", "finish macro", "query report", "counter reset",
+    "render enable", "syncpoint", "wait for idle", "cache barrier", "idle hook",
 };
+static_assert(zone_names[static_cast<size_t>(Zone::Count) - 1] != nullptr,
+              "every zone needs a name");
 
 // Read once at startup: Enabled() runs several times per method write (no guard to check).
 inline const bool g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
@@ -100,10 +125,31 @@ inline u64 Ticks() {
 #endif
 }
 
+/// Amounts counted on the GPU thread, logged per second with the zones.
+enum class Counter : u32 {
+    DownloadBytes,  ///< Buffer data copied back from the host GPU at fences
+    DownloadCopies, ///< Buffer ranges copied back
+    DmaReadBytes,   ///< Guest memory the native MME read with DMA
+    DownloadBytesOnDmaPages, ///< Of DownloadBytes: on pages the MME has DMA-read
+    MethodWrites,   ///< 3D register writes (Maxwell3D::CallMethod below the macro range)
+    SameValueWrites, ///< Of MethodWrites: the register already held the value
+    AcquireChecks,  ///< Semaphore acquires evaluated
+    AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
+    DeltaWords,     ///< Split back: StateDelta words applied
+    DeltaSameWords, ///< Of DeltaWords: the register held the value already
+    CbWriteWords,   ///< Split back: words in Kind::CbWrite entries
+    BatchRepeats,   ///< Split back: instances a DrawBatch counted without replaying them
+    RingWords,      ///< Split back: ring words consumed
+    RingEntries,    ///< Split back: ring entries executed
+    FusedWrites,    ///< Split back: compute writes in Kind::Writes entries (EDEN_NX2_COMPUTE_FUSE)
+    MergedUploads,  ///< Split back: inline upload flushes joined to the one before (I2M_MERGE)
+    Count,
+};
+
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 8> counters{}; ///< See Counter
+    std::array<u64, static_cast<size_t>(Counter::Count)> counters{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_count{};
     u64 child_ns{};    ///< Time of the zones nested in the current one
@@ -145,18 +191,6 @@ private:
     bool enabled;
     u64 start{};
     u64 parent_child_ns{};
-};
-
-/// Amounts counted on the GPU thread, logged per second with the zones.
-enum class Counter : u32 {
-    DownloadBytes,  ///< Buffer data copied back from the host GPU at fences
-    DownloadCopies, ///< Buffer ranges copied back
-    DmaReadBytes,   ///< Guest memory the native MME read with DMA
-    DownloadBytesOnDmaPages, ///< Of DownloadBytes: on pages the MME has DMA-read
-    MethodWrites,   ///< 3D register writes (Maxwell3D::CallMethod below the macro range)
-    SameValueWrites, ///< Of MethodWrites: the register already held the value
-    AcquireChecks,  ///< Semaphore acquires evaluated
-    AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
 };
 
 /// Method calls on this thread by method (3D registers on the back, macros on the front), and
@@ -227,10 +261,10 @@ inline void AddDrain(DrainSite site, u64 start) {
 }
 
 /// Called by the GPU thread (and the split's back thread) between commands: logs and resets
-/// the totals every 10 s.
-inline void Report(const char* thread_name = "GPU thread") {
+/// the totals every 10 s. Returns whether it logged (the window just ended).
+inline bool Report(const char* thread_name = "GPU thread") {
     if (!Enabled()) {
-        return;
+        return false;
     }
     auto& data = t_data;
     const u64 now = Now();
@@ -239,11 +273,11 @@ inline void Report(const char* thread_name = "GPU thread") {
         data.window_start_ticks = Ticks();
         data.cpu_start_ns = Common::CurrentThreadCpuTimeNs();
         data.child_ns = 0;
-        return;
+        return false;
     }
     const u64 window = now - data.window_start;
     if (window < 10'000'000'000ULL) {
-        return;
+        return false;
     }
     const auto cpu_now = Common::CurrentThreadCpuTimeNs();
     const u64 now_ticks = Ticks();
@@ -276,6 +310,18 @@ inline void Report(const char* thread_name = "GPU thread") {
     line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
                         static_cast<double>(data.counters[7]) * 1e9 / window);
+    if (data.counters[static_cast<size_t>(Counter::RingEntries)] != 0) {
+        const auto per_second = [&](Counter counter) {
+            return static_cast<double>(data.counters[static_cast<size_t>(counter)]) * 1e9 / window;
+        };
+        line += fmt::format(" | ring {:.0f} entries {:.0f} words | delta words {:.0f} ({:.0f} "
+                            "same on the back) | cb write words {:.0f} | batch repeats {:.0f} | "
+                            "fused compute writes {:.0f} | merged uploads {:.0f}",
+                            per_second(Counter::RingEntries), per_second(Counter::RingWords),
+                            per_second(Counter::DeltaWords), per_second(Counter::DeltaSameWords),
+                            per_second(Counter::CbWriteWords), per_second(Counter::BatchRepeats),
+                            per_second(Counter::FusedWrites), per_second(Counter::MergedUploads));
+    }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {
         if (data.drain_count[i] != 0) {
@@ -310,6 +356,7 @@ inline void Report(const char* thread_name = "GPU thread") {
     data.window_start = now;
     data.window_start_ticks = now_ticks;
     data.cpu_start_ns = cpu_now;
+    return true;
 }
 
 } // namespace VideoCommon::Nx2Profile

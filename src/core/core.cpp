@@ -625,7 +625,9 @@ struct System::Impl {
     std::optional<Tools::RenderdocAPI> renderdoc_api;
     std::optional<Tegra::GPU> gpu_core;
 
-    std::array<Core::GPUDirtyMemoryManager, Core::Hardware::NUM_CPU_CORES> gpu_dirty_memory_managers;
+    // One per guest core, one for the other threads (EDEN_NX2_SYS_SLOT, core/memory.cpp) and the
+    // last for the buffer cache's write handoff (EDEN_NX2_WRITE_HANDOFF, GPU::CollectHandoffWrite).
+    std::array<Core::GPUDirtyMemoryManager, Core::Hardware::NUM_CPU_CORES + 2> gpu_dirty_memory_managers;
     std::vector<std::vector<u8>> user_channel;
     std::vector<std::vector<u8>> general_channel;
 

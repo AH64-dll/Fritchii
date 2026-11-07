@@ -266,6 +266,13 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Controls the DMA read mode.\nUnsafe is faster, while Safe is more stable and can fix issues in some games.\nDefault follows the GPU Accuracy setting."));
     INSERT(Settings, gpu_fence_behavior, tr("GPU Fence Behavior:"),
            tr("Controls the GPU fence synchronization behavior.\nImmediate is the fastest option, but can introduce some issues.\nBalanced offers better compatibility and may fix issues in some games.\nAccurate further improves compatibility at the cost of some performance.\nDefault follows the GPU Mode setting."));
+    INSERT(Settings, native_compute_write_mark, tr("Native compute write mark:"),
+           tr("How much of a Switch 2 compute shader's storage buffer is treated as written by "
+              "the GPU after each dispatch.\nAuto marks what the shader's stores can reach and "
+              "falls back to Full when that cannot be proven.\nFull marks the whole binding (up to "
+              "8 MiB), the original behaviour: it can delay the game's own writes to nearby memory "
+              "(flickering effects) and copy far more data back from the GPU.\n64 KiB cap marks at "
+              "most 64 KiB, which can miss data a large dispatch really wrote."));
     INSERT(Settings, use_asynchronous_shaders, tr("Enable asynchronous shader compilation"),
            tr("May reduce shader stutter."));
     INSERT(Settings, gpu_clock, tr("GPU Clocks"),
@@ -488,6 +495,12 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(DmaAccuracy, Default, tr("Default")),
                               PAIR(DmaAccuracy, Unsafe, tr("Unsafe (fast)")),
                               PAIR(DmaAccuracy, Safe, tr("Safe (stable)")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::NativeComputeWriteMark>::Index(),
+                          {
+                              PAIR(NativeComputeWriteMark, Auto, tr("Auto (shader extent)")),
+                              PAIR(NativeComputeWriteMark, Full, tr("Full binding")),
+                              PAIR(NativeComputeWriteMark, Cap64K, tr("64 KiB cap")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::GpuFenceBehavior>::Index(),
                           {

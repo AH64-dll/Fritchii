@@ -140,9 +140,13 @@ public:
 
     bool CanReportMemoryUsage() const;
 
-    u32 GetUniformBufferAlignment() const;
+    u32 GetUniformBufferAlignment() const {
+        return uniform_buffer_alignment;
+    }
 
-    u32 GetStorageBufferAlignment() const;
+    u32 GetStorageBufferAlignment() const {
+        return storage_buffer_alignment;
+    }
 
     /// Largest range a storage buffer binding may have
     u64 GetMaxStorageBufferRange() const;
@@ -323,6 +327,9 @@ private:
     VkDeviceSize multi_range_total{};
 
     StreamUniformRef last_stream_uniform{};
+
+    u32 uniform_buffer_alignment{1}; ///< Asked once per bound uniform buffer: kept here
+    u32 storage_buffer_alignment{1};
 
     bool limit_dynamic_storage_buffers = false;
     u32 max_dynamic_storage_buffers = (std::numeric_limits<u32>::max)();

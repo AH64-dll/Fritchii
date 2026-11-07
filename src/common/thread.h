@@ -120,6 +120,15 @@ enum class PinnedRole : u32 { GpuFront, GpuBack, GuestCore };
 /// on other hosts.
 void PinCurrentThread(PinnedRole role);
 
+/// EDEN_NX2_PIN_THREADS (Windows, on unless 0, with 6+ physical cores), used while the
+/// pin_gpu_threads setting is off: the split GPU thread's front and back and the Vulkan worker
+/// each get a whole physical core, by default cores 1, 2 and 3 of the first core complex, and the
+/// guest cores keep off them, so no heavy thread shares their core; the guest cores float over
+/// cores 0 and 4-7. EDEN_NX2_PIN_CORES and EDEN_NX2_PIN_GUEST set the layout (thread.cpp).
+/// `index`: the guest core.
+enum class HostThreadRole : u32 { GpuFront, GpuBack, VulkanWorker, GuestCore };
+void PinHostThread(HostThreadRole role, size_t index = 0);
+
 void RefreshThreadPolicies();
 void PollThreadPolicies();
 

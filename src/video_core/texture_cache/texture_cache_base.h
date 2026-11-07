@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <cstring>
 #include <deque>
 #include <limits>
 #include <map>
@@ -39,6 +41,7 @@
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/game_dlss_status.h"
+#include "video_core/nx2_bindmemo_stats.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/descriptor_table.h"
 #include "video_core/texture_cache/image_base.h"
@@ -66,6 +69,67 @@ struct ImageViewInOut {
     u32 index{};
     bool blacklist{};
     ImageViewId id{};
+};
+
+/// EDEN_NX2_TEX_PAGES: the host pointers of the guest pages one draw or dispatch reads its
+/// texture handles and TIC/TSC entries from, each page translated once instead of once per read.
+/// The reads then all see the mappings as they were at the draw's first read: the guest can't
+/// remap memory a pending draw reads without racing the GPU itself, and a host pointer points
+/// into guest RAM, which is never freed. Only resolved pages are kept as pointers; a cache lives
+/// for one draw.
+struct GuestPageCache {
+    static constexpr size_t NUM_ENTRIES = 8;
+    static constexpr GPUVAddr PAGE_BYTES = GPUVAddr{1} << 12; ///< Core::Memory::YUZU_PAGESIZE
+    static constexpr GPUVAddr NO_PAGE = ~GPUVAddr{0};          ///< never a page base
+
+    std::array<GPUVAddr, NUM_ENTRIES> pages{NO_PAGE, NO_PAGE, NO_PAGE, NO_PAGE,
+                                            NO_PAGE, NO_PAGE, NO_PAGE, NO_PAGE};
+    std::array<const u8*, NUM_ENTRIES> hosts{};
+    u32 next{};
+
+    /// Host memory of [addr, addr + size) when it lies in one mapped page, as
+    /// MemoryManager::GetPointer(addr) gives it; nullptr otherwise. `words`: the caller stands in
+    /// for MemoryManager::Read<u32>, so a page the syncpoint shim (or anything else
+    /// Nx2ReadNeedsDrain names) overlaps is remembered as nullptr: read it the slow way.
+    template <class MemoryManager>
+    [[nodiscard]] const u8* Get(const MemoryManager& gpu_memory, GPUVAddr addr, size_t size,
+                                bool words) noexcept {
+        const GPUVAddr offset = addr & (PAGE_BYTES - 1);
+        if (offset + size > PAGE_BYTES) {
+            return nullptr;
+        }
+        const GPUVAddr page = addr - offset;
+        for (size_t index = 0; index < NUM_ENTRIES; ++index) {
+            if (pages[index] == page) {
+                return hosts[index] != nullptr ? hosts[index] + offset : nullptr;
+            }
+        }
+        Nx2BindMemo::Note(Nx2BindMemo::Stat::PageTranslations);
+        const u8* host = gpu_memory.GetPointer(page);
+        if (host == nullptr && !words) {
+            return nullptr;
+        }
+        if (words && host != nullptr && gpu_memory.Nx2ReadNeedsDrain(page, PAGE_BYTES)) {
+            host = nullptr;
+        }
+        const size_t slot = next++ % NUM_ENTRIES;
+        pages[slot] = page;
+        hosts[slot] = host;
+        return host != nullptr ? host + offset : nullptr;
+    }
+
+    /// MemoryManager::Read<u32>(addr), from the translated page when it can.
+    template <class MemoryManager>
+    [[nodiscard]] u32 ReadWord(const MemoryManager& gpu_memory, GPUVAddr addr) noexcept {
+        if (const u8* const host = Get(gpu_memory, addr, sizeof(u32), true)) {
+            Nx2BindMemo::Note(Nx2BindMemo::Stat::HandleWords);
+            u32 value;
+            std::memcpy(&value, host, sizeof(value));
+            return value;
+        }
+        Nx2BindMemo::Note(Nx2BindMemo::Stat::HandleWordsSlow);
+        return gpu_memory.template Read<u32>(addr);
+    }
 };
 
 struct AsyncDecodeContext {
@@ -222,6 +286,15 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 public:
     /// Device pages this cache ever registered objects on (InnerInvalidation skips the rest).
     VideoCommon::PageFilter page_filter;
+    /// Device pages of images that were ever GPU-modified, never cleared: GetFlushArea finds
+    /// nothing to flush where none was (EDEN_NX2_TEXTURE_READ_FILTER).
+    VideoCommon::PageFilter gpu_modified_filter;
+    std::atomic<bool> gpu_modified_sparse{}; ///< A sparse image was: the filter says "maybe"
+
+    [[nodiscard]] bool MayHaveGpuModifiedImages(DAddr addr, u64 size) const {
+        return gpu_modified_sparse.load(std::memory_order_relaxed) ||
+               gpu_modified_filter.Any(addr, size);
+    }
 
     explicit TextureCache(Runtime&, Tegra::MaxwellDeviceMemoryManager&);
 
@@ -243,6 +316,14 @@ public:
     /// Fill image_view_ids with the graphics/compute images in indices
     void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
 
+    /// A binding memo hit for a blacklisted (written storage) image: keeps it from climbing to a
+    /// rescale, as FillImageViews' blacklist reset does on a miss.
+    void NoteBlacklistedBinding(ImageId image_id) noexcept {
+        if (image_id && image_id != NULL_IMAGE_ID) {
+            slot_images[image_id].scale_rating = 0;
+        }
+    }
+
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
 
@@ -262,6 +343,100 @@ public:
 
     /// Refresh the state for graphics/compute image view and sampler descriptors
     void SynchronizeDescriptors(bool compute);
+
+    /// Changes whenever a pipeline's cached texture bindings (view and sampler ids, descriptor
+    /// handles, rescaling bits) could be stale: images or views created, deleted, rescaled or
+    /// CPU modified, descriptor pools moved, and every frame (EDEN_NX2_BINDCACHE).
+    [[nodiscard]] u64 BindingsEpoch() const noexcept {
+        return bindings_epoch;
+    }
+
+    /// EDEN_NX2_BINDMEMO: one texture, image or sampler binding as FillImageViews and
+    /// GetSamplerId resolved it, with the guest TIC/TSC entries it was resolved from. It stands
+    /// while guest memory holds the same entries, the descriptor pools stay, and nothing happened
+    /// to its image that preparing the view again would act on (CPU writes, aliasing, deletion,
+    /// rescaling). The backend keeps its descriptor for the binding in `payload`.
+    struct alignas(64) BindingMemo {
+        // Line 0: key and what the lookup compares first.
+        u32 tic_handle;
+        u32 tsc_index; ///< ~0U: no sampler
+        u32 kind;      ///< the caller's binding kind (BINDING_KIND_COMPUTE included); 0: empty
+        ImageViewId view;
+        SamplerId sampler;
+        ImageId image;
+        u32 tic_limit;
+        u32 tsc_limit;
+        GPUVAddr tic_pool;
+        GPUVAddr tsc_pool;
+        const void* channel;
+        u32 tic_entry; ///< TIC entry index read, ~0U: none (out of the pool)
+        u32 tsc_entry; ///< TSC entry index read, ~0U: none
+        // Line 1
+        u64 epoch;
+        u64 image_serial;
+        u64 map_serial;
+        u64 touch_tick;
+        std::array<u64, 3> payload;
+        u16 rescaled;
+        u8 aliased;       ///< its image had aliases when recorded: the lookup checks their ticks
+        u8 map_dependent; ///< a null or buffer view whose resolution depends on the mappings
+        // Line 2
+        TICEntry tic;
+        TSCEntry tsc;
+    };
+    static constexpr u32 BINDING_KIND_COMPUTE = 1U << 31;
+
+    /// What every binding of one draw or dispatch is looked up and recorded against.
+    struct BindingLookup {
+        const void* channel;
+        GPUVAddr tic_pool;
+        GPUVAddr tsc_pool;
+        u32 tic_limit;
+        u32 tsc_limit;
+        u64 map_serial;
+        u64 clock; ///< BindingClock() when the lookups began
+        bool compute;
+        /// The TIC and TSC pages this draw's lookups translated (EDEN_NX2_TEX_PAGES).
+        mutable GuestPageCache pages{};
+    };
+
+    /// Where a binding key's memos are: computed once per binding of a draw
+    /// (EDEN_NX2_BINDMEMO_BATCH).
+    struct BindingProbe {
+        u64 hash;
+        size_t first; ///< the set's first way
+        u32 tag;
+    };
+
+    /// Taken after SynchronizeDescriptors, before the draw's or dispatch's first FindBinding.
+    [[nodiscard]] BindingLookup BeginBindingLookup(bool compute) const noexcept;
+
+    /// The key's set, with its tag line asked for ahead of the lookup.
+    [[nodiscard]] BindingProbe ProbeBinding(u32 tic_handle, u32 tsc_index, u32 kind) const noexcept;
+
+    /// Asks ahead for the lines a lookup of this key will read: its candidate memos and the
+    /// guest TIC and TSC entries the handle names. Changes nothing a lookup decides on.
+    void PrefetchBinding(const BindingLookup& lookup, const BindingProbe& probe, u32 tic_handle,
+                         u32 tsc_index) const noexcept;
+
+    /// The memo of this binding when resolving it again would give the same view, sampler and
+    /// descriptor with nothing to prepare; nullptr otherwise. Touches the image in the LRU once
+    /// per frame, as preparing the view would.
+    [[nodiscard]] BindingMemo* FindBinding(const BindingLookup& lookup, u32 tic_handle,
+                                           u32 tsc_index, u32 kind);
+    [[nodiscard]] BindingMemo* FindBinding(const BindingLookup& lookup, u32 tic_handle,
+                                           u32 tsc_index, u32 kind, const BindingProbe& probe);
+
+    /// Changes with every event that can make a binding memo stale.
+    [[nodiscard]] u64 BindingClock() const noexcept {
+        return binding_clock;
+    }
+
+    /// Remembers a binding FillImageViews/GetSamplerId just resolved, when nothing happened to
+    /// its image since `lookup` was taken and the image needs no preparation.
+    void RecordBinding(const BindingLookup& lookup, u32 tic_handle, u32 tsc_index, u32 kind,
+                       ImageViewId view_id, SamplerId sampler_id, const void* payload,
+                       size_t payload_size, bool rescaled);
 
     /// Updates the Render Targets if they can be rescaled
     /// @retval True if the Render Targets have been rescaled.
@@ -445,6 +620,20 @@ private:
     /// Find or create a view for a render target with the given image parameters
     [[nodiscard]] ImageViewId FindRenderTargetView(const ImageInfo& info, GPUVAddr gpu_addr);
 
+    /// EDEN_NX2_RT_LOOKUP_MEMO: the registers a render target lookup reads (slot kind first).
+    using RenderTargetLookupKey = std::array<u32, 12>;
+    /// FindRenderTargetView, answered from the memo while no image or view was created, deleted
+    /// or remapped (bindings_epoch) since a lookup with the same registers found exactly one
+    /// candidate image (so modification ticks did not pick it).
+    [[nodiscard]] ImageViewId FindRenderTargetViewMemo(const RenderTargetLookupKey& key,
+                                                       const ImageInfo& info, GPUVAddr gpu_addr);
+
+    /// EDEN_NX2_RT_FAST: whether UpdateRenderTargets' clean path would change nothing: the same
+    /// targets were prepared for a draw, no image was modified, created or deleted since, in the
+    /// same frame, and none needs an upload, alias sync or sparse backing.
+    [[nodiscard]] bool RenderTargetsStillPrepared() const;
+    void NoteRenderTargetsPrepared();
+
     /// Iterates over all the images in a region calling func
     template <typename Func>
     void ForEachImageInRegion(DAddr cpu_addr, size_t size, Func&& func);
@@ -495,6 +684,9 @@ private:
     /// Mark an image as modified from the GPU
     void MarkModification(ImageBase& image) noexcept;
 
+    /// Marks gpu_modified_filter before an image becomes GPU-modified.
+    void NoteGpuModified(const ImageBase& image) noexcept;
+
     /// Synchronize image aliases, copying data if needed
     void SynchronizeAliases(ImageId image_id);
 
@@ -544,10 +736,44 @@ private:
 
     RenderTargets render_targets;
     u64 render_targets_serial = 0;
+    struct RenderTargetLookupMemo {
+        RenderTargetLookupKey key{};
+        u64 epoch = 0; ///< bindings_epoch of the lookup; 0 never matches
+        u64 frame_bumps = 0; ///< frame_epoch_bumps of the lookup
+        const void* channel{}; ///< channel_state of the lookup (BindChannel moves no epoch)
+        const void* memory{}; ///< gpu_memory the lookup resolved addresses through
+        ImageViewId view{};
+    };
+    /// The bindings_epoch increments TickFrame made (the render target memo outlives them).
+    u64 frame_epoch_bumps = 0;
+    std::array<RenderTargetLookupMemo, 32> rt_lookup_memos{};
+    u32 find_image_matches = 0; ///< candidates the last FindImage found
+    struct RenderTargetsPrepared {
+        bool valid = false;
+        u64 serial = 0;
+        u64 modification_tick = 0;
+        u64 frame_tick = 0;
+        u64 bindings_epoch = 0;
+        std::array<ImageViewId, NUM_RT + 1> views{};
+    } rt_prepared;
     u32 rt_active_mask = 0;
     std::array<ImageId, 8> rt_image_id{};
     ImageId rt_depth_image_id{};
     u64 texture_bindings_serial = 0;
+    u64 bindings_epoch = 1; ///< See BindingsEpoch(); 0 never matches a cached binding
+    /// EDEN_NX2_BINDMEMO: 4-way sets of BindingMemo with a tag per way (0: empty) and the next way
+    /// each set replaces (allocated on first use), the serial of each image slot's last event,
+    /// and the clock both serials and binding_memo_epoch are drawn from.
+    std::vector<BindingMemo> binding_memos;
+    std::vector<u32> binding_tags;
+    std::vector<u8> binding_victims;
+    std::vector<u64> image_binding_serials;
+    u64 binding_clock = 1;
+    u64 binding_memo_epoch = 1; ///< every memo: an image rescaled
+    void BumpBindingSerial(ImageId image_id);
+    void BumpBindingEpoch() noexcept {
+        binding_memo_epoch = ++binding_clock;
+    }
     u64 last_feedback_loop_serial = 0;
     u64 last_feedback_texture_serial = 0;
     bool last_feedback_loop_result = false;

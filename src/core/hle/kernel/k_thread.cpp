@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <condition_variable>
 #include <mutex>
 #include <optional>
@@ -70,6 +71,14 @@ static void ResetThreadContext64(Kernel::Svc::ThreadContext& ctx, u64 stack_top,
 } // namespace
 
 namespace Kernel {
+    bool KThreadContextGuard::FlagMode() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_CONTEXT_GUARD");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
+
     namespace {
 
         struct ThreadLocalRegion {

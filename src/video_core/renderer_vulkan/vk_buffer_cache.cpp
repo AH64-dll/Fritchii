@@ -383,6 +383,8 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
       quad_index_pass(device, scheduler, descriptor_pool, staging_pool,
                       compute_pass_descriptor_queue),
       multi_range_buffers(device_) {
+    uniform_buffer_alignment = static_cast<u32>(device.GetUniformBufferAlignment());
+    storage_buffer_alignment = static_cast<u32>(device.GetStorageBufferAlignment());
     const VkDriverIdKHR driver_id = device.GetDriverID();
     const bool enable_vertex_repack = VertexRepackEnabled();
     LOG_INFO(Render_Vulkan, "69-byte vertex layout repacking {} ({})",
@@ -449,14 +451,6 @@ u64 BufferCacheRuntime::GetDeviceMemoryUsage() const {
 
 bool BufferCacheRuntime::CanReportMemoryUsage() const {
     return device.CanReportMemoryUsage();
-}
-
-u32 BufferCacheRuntime::GetUniformBufferAlignment() const {
-    return static_cast<u32>(device.GetUniformBufferAlignment());
-}
-
-u32 BufferCacheRuntime::GetStorageBufferAlignment() const {
-    return static_cast<u32>(device.GetStorageBufferAlignment());
 }
 
 u64 BufferCacheRuntime::GetMaxStorageBufferRange() const {
@@ -802,6 +796,40 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
     const u32 max_binding = (std::min)(bindings.max_index, device_max);
     const u32 binding_count = max_binding - min_binding;
     if (binding_count == 0) {
+        return;
+    }
+    // Most draws bind a few streams: record only those. The full HostBindings is ~1.3 KiB of
+    // the scheduler's 32 KiB command chunk on every draw that rebinds vertex buffers.
+    static constexpr u32 COMPACT_BINDINGS = 8;
+    if (binding_count <= COMPACT_BINDINGS) {
+        struct CompactBindings {
+            u32 first;
+            u32 count;
+            std::array<VkBuffer, COMPACT_BINDINGS> buffers;
+            std::array<VkDeviceSize, COMPACT_BINDINGS> offsets;
+            std::array<VkDeviceSize, COMPACT_BINDINGS> sizes;
+            std::array<VkDeviceSize, COMPACT_BINDINGS> strides;
+        } compact{};
+        compact.first = bindings.min_index;
+        compact.count = binding_count;
+        for (u32 i = 0; i < binding_count; ++i) {
+            compact.buffers[i] = buffer_handles[i];
+            compact.offsets[i] = bindings.offsets[i];
+            compact.sizes[i] = bindings.sizes[i];
+            compact.strides[i] = bindings.strides[i];
+        }
+        if (device.IsExtExtendedDynamicStateSupported()) {
+            scheduler.Record([compact](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindVertexBuffers2EXT(compact.first, compact.count, compact.buffers.data(),
+                                             compact.offsets.data(), compact.sizes.data(),
+                                             compact.strides.data());
+            });
+        } else {
+            scheduler.Record([compact](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindVertexBuffers(compact.first, compact.count, compact.buffers.data(),
+                                         compact.offsets.data());
+            });
+        }
         return;
     }
     if (device.IsExtExtendedDynamicStateSupported()) {
