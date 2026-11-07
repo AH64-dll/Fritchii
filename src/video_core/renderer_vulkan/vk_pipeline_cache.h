@@ -230,19 +230,21 @@ private:
 
     void QueueVulkanPipelineCacheFlush();
 
-    /// EDEN_NX2_COMPUTE_WARM=<file>: compute programs prepared from the game files are converted
-    /// (missing reads guessed) and built in the background, then thrown away. Nothing uses them;
-    /// they only fill the driver's shader cache, so a dispatch that later converts to the same
-    /// SPIR-V finds the driver build ready instead of waiting seconds for it.
-    void StartComputeWarm();
+    /// The title's warm-compute.bin (ShaderWarm::ComputeWarmPath, EDEN_NX2_COMPUTE_WARM=<file>
+    /// overrides): compute programs prepared from the game files are converted (missing reads
+    /// guessed) and built in the background, then thrown away. Nothing uses them; they only fill
+    /// the driver's shader cache, so a dispatch that later converts to the same SPIR-V finds the
+    /// driver build ready instead of waiting seconds for it.
+    void StartComputeWarm(u64 title_id);
     std::vector<std::jthread> compute_warm_threads;
     std::atomic<bool> compute_warm_done{true};
 
-    /// EDEN_NX2_GRAPHICS_WARM=<file> (with EDEN_NX2_GPL=1): vertex and fragment programs prepared
-    /// from the game files (tools/nx2/make_graphics_warm.py) are built as single-stage libraries
-    /// in the background after the compute warm-up, then released; the driver's disk cache keeps
-    /// them, so a later pipeline with those stages costs a link.
-    void StartGraphicsWarm();
+    /// The title's warm-graphics.bin (ShaderWarm::GraphicsWarmPath, EDEN_NX2_GRAPHICS_WARM=<file>
+    /// overrides; needs graphics pipeline libraries): vertex and fragment programs prepared from
+    /// the game files are built as single-stage libraries in the background after the compute
+    /// warm-up, then released; the driver's disk cache keeps them, so a later pipeline with those
+    /// stages costs a link.
+    void StartGraphicsWarm(u64 title_id);
     std::vector<std::jthread> graphics_warm_threads;
 
     const Device& device;

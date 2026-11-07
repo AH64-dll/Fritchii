@@ -25,6 +25,7 @@
 #include "common/cityhash.h"
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
+#include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
 #include "common/thread.h"
 #include "common/thread_worker.h"
@@ -61,6 +62,7 @@
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/shader_notify.h"
+#include "video_core/shader_warm/shader_warm_builder.h"
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -1683,16 +1685,131 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         state.statistics->Report();
     }
     if (!stop_loading.stop_requested()) {
-        StartComputeWarm();
-        StartGraphicsWarm();
+        StartComputeWarm(title_id);
+        StartGraphicsWarm(title_id);
     }
 }
 
-void PipelineCache::StartComputeWarm() {
-    const char* const path = std::getenv("EDEN_NX2_COMPUTE_WARM");
-    if (path == nullptr || *path == '\0' || !compute_warm_threads.empty()) {
+namespace {
+/// The warm-up file: the environment variable when set, else the title's file when it exists.
+std::string WarmFile(const char* variable, const std::filesystem::path& title_file) {
+    if (const char* const path = std::getenv(variable); path != nullptr && *path != '\0') {
+        return path;
+    }
+    std::error_code ec;
+    if (std::filesystem::exists(title_file, ec)) {
+        return Common::FS::PathToUTF8String(title_file);
+    }
+    return {};
+}
+
+/// The "already warmed" marker: warm file size and last-write time, entry count, GPU driver
+/// version and device ID, pipeline cache version. Next to the warm file, or in the title's
+/// shader folder when that folder is not writable.
+struct WarmStamp {
+    u64 size{};
+    s64 write_time{};
+    u64 entries{};
+    u32 driver{};
+    u32 device_id{};
+    u32 cache_version{};
+};
+
+std::optional<WarmStamp> CurrentStamp(const std::filesystem::path& file, const Device& device,
+                                      u64 entries) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(file, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    const auto time = std::filesystem::last_write_time(file, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    return WarmStamp{size, static_cast<s64>(time.time_since_epoch().count()), entries,
+                     device.GetDriverVersion(), device.GetDeviceID(), CACHE_VERSION};
+}
+
+std::array<std::filesystem::path, 2> MarkerPaths(const std::filesystem::path& file,
+                                                 const std::filesystem::path& title_file) {
+    const auto marker = VideoCommon::ShaderWarm::WarmMarkerPath(file);
+    return {marker, title_file.parent_path() / marker.filename()};
+}
+
+/// True when a marker matches the file and the device (the entry count is informative).
+bool WarmAlreadyDone(const std::filesystem::path& file, const std::filesystem::path& title_file,
+                     const Device& device) {
+    const auto stamp = CurrentStamp(file, device, 0);
+    if (!stamp) {
+        return false;
+    }
+    for (const auto& marker : MarkerPaths(file, title_file)) {
+        std::ifstream in(marker);
+        WarmStamp saved;
+        if (in >> saved.size >> saved.write_time >> saved.entries >> saved.driver >>
+            saved.device_id >> saved.cache_version) {
+            if (saved.size == stamp->size && saved.write_time == stamp->write_time &&
+                saved.driver == stamp->driver && saved.device_id == stamp->device_id &&
+                saved.cache_version == stamp->cache_version) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void WriteWarmMarker(const std::filesystem::path& file, const std::filesystem::path& title_file,
+                     const Device& device, u64 entries) {
+    const auto stamp = CurrentStamp(file, device, entries);
+    if (!stamp) {
         return;
     }
+    for (const auto& marker : MarkerPaths(file, title_file)) {
+        std::error_code ec;
+        std::filesystem::create_directories(marker.parent_path(), ec);
+        std::ofstream out(marker, std::ios::trunc);
+        out << stamp->size << ' ' << stamp->write_time << ' ' << stamp->entries << ' '
+            << stamp->driver << ' ' << stamp->device_id << ' ' << stamp->cache_version << '\n';
+        out.close();
+        if (out) {
+            return;
+        }
+    }
+}
+
+/// Lets one caller through every 250 ms (status bar updates from the warm-up threads).
+struct WarmProgressThrottle {
+    std::atomic<s64> last{};
+
+    bool Due() {
+        const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        s64 previous = last.load(std::memory_order_relaxed);
+        return now - previous >= 250 &&
+               last.compare_exchange_strong(previous, now, std::memory_order_relaxed);
+    }
+};
+} // Anonymous namespace
+
+void PipelineCache::StartComputeWarm(u64 title_id) {
+    if (!compute_warm_threads.empty()) {
+        return;
+    }
+    const std::string file_path = WarmFile("EDEN_NX2_COMPUTE_WARM",
+                                           VideoCommon::ShaderWarm::ComputeWarmPath(title_id));
+    if (file_path.empty()) {
+        return;
+    }
+    const char* const path = file_path.c_str();
+    const std::filesystem::path warm_file = Common::FS::ToU8String(file_path);
+    const std::filesystem::path title_file = VideoCommon::ShaderWarm::ComputeWarmPath(title_id);
+    if (WarmAlreadyDone(warm_file, title_file, device)) {
+        LOG_INFO(Render_Vulkan, "Nx2Perf compute_warm: already done for this file and driver");
+        return;
+    }
+    size_t file_entries = 0;
+    bool read_ok = false;
     // Read the whole file here (its own reader: the disk cache loader deletes files it rejects).
     struct Entry {
         ComputePipelineCacheKey key;
@@ -1732,15 +1849,20 @@ void PipelineCache::StartComputeWarm() {
                 break;
             }
             file.read(reinterpret_cast<char*>(&entry.key), sizeof(entry.key));
+            ++file_entries;
             // Programs already in the disk cache were built at boot; leave them out.
             if (!compute_cache.contains(entry.key)) {
                 entries->push_back(std::move(entry));
             }
         }
+        read_ok = file.tellg() == end;
     } catch (const std::exception& e) {
         LOG_WARNING(Render_Vulkan, "Nx2Perf compute_warm: reading {} failed: {}", path, e.what());
     }
     if (entries->empty()) {
+        if (read_ok && file_entries != 0) {
+            WriteWarmMarker(warm_file, title_file, device, file_entries);
+        }
         return;
     }
     struct Progress {
@@ -1748,6 +1870,7 @@ void PipelineCache::StartComputeWarm() {
         std::atomic<size_t> built{};
         std::atomic<size_t> failed{};
         std::atomic<size_t> running{};
+        WarmProgressThrottle throttle;
         std::chrono::steady_clock::time_point begin{std::chrono::steady_clock::now()};
     };
     auto progress = std::make_shared<Progress>();
@@ -1755,10 +1878,12 @@ void PipelineCache::StartComputeWarm() {
     constexpr size_t NumThreads = 4;
     progress->running = NumThreads;
     compute_warm_done = false;
+    shader_notify.SetWarmProgress(1, 0, entries->size());
     LOG_INFO(Render_Vulkan, "Nx2Perf compute_warm: {} programs to build on {} low priority threads",
              entries->size(), NumThreads);
     for (size_t thread = 0; thread < NumThreads; ++thread) {
-        compute_warm_threads.emplace_back([this, entries, progress](std::stop_token stop) {
+        compute_warm_threads.emplace_back([this, entries, progress, warm_file, title_file,
+                                           file_entries, read_ok](std::stop_token stop) {
             Common::SetCurrentThreadName("VkComputeWarm");
             Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
             while (!stop.stop_requested()) {
@@ -1781,12 +1906,20 @@ void PipelineCache::StartComputeWarm() {
                 (ok ? progress->built : progress->failed).fetch_add(1);
                 entry.env = FileEnvironment{};
                 const size_t done = progress->built + progress->failed;
+                if (progress->throttle.Due()) {
+                    shader_notify.SetWarmProgress(1, done, entries->size());
+                }
                 if (done % 500 == 0) {
                     LOG_INFO(Render_Vulkan, "Nx2Perf compute_warm: {} of {} done", done,
                              entries->size());
                 }
             }
             if (progress->running.fetch_sub(1) == 1) {
+                shader_notify.SetWarmProgress(0, 0, 0);
+                if (read_ok && !stop.stop_requested() &&
+                    progress->built + progress->failed >= entries->size()) {
+                    WriteWarmMarker(warm_file, title_file, device, file_entries);
+                }
                 compute_warm_done = true;
                 LOG_INFO(Render_Vulkan,
                          "Nx2Perf compute_warm: finished, {} built, {} failed, {} not reached, "
@@ -1802,10 +1935,20 @@ void PipelineCache::StartComputeWarm() {
     }
 }
 
-void PipelineCache::StartGraphicsWarm() {
-    const char* const path = std::getenv("EDEN_NX2_GRAPHICS_WARM");
-    if (path == nullptr || *path == '\0' || !graphics_warm_threads.empty() ||
-        !device.IsExtGraphicsPipelineLibrarySupported()) {
+void PipelineCache::StartGraphicsWarm(u64 title_id) {
+    if (!graphics_warm_threads.empty() || !device.IsExtGraphicsPipelineLibrarySupported()) {
+        return;
+    }
+    const std::string file_path = WarmFile("EDEN_NX2_GRAPHICS_WARM",
+                                           VideoCommon::ShaderWarm::GraphicsWarmPath(title_id));
+    if (file_path.empty()) {
+        return;
+    }
+    const char* const path = file_path.c_str();
+    const std::filesystem::path warm_file = Common::FS::ToU8String(file_path);
+    const std::filesystem::path title_file = VideoCommon::ShaderWarm::GraphicsWarmPath(title_id);
+    if (WarmAlreadyDone(warm_file, title_file, device)) {
+        LOG_INFO(Render_Vulkan, "Nx2Perf graphics_warm: already done for this file and driver");
         return;
     }
     // Streamed: the file is 1.5 GB; workers take the next entry under the reader's lock.
@@ -1817,6 +1960,9 @@ void PipelineCache::StartGraphicsWarm() {
         std::atomic<size_t> built{};
         std::atomic<size_t> failed_builds{};
         std::atomic<size_t> running{};
+        size_t read{}; ///< Entries taken from the file (under the mutex)
+        std::streamoff position{};
+        WarmProgressThrottle throttle;
         std::chrono::steady_clock::time_point begin{};
     };
     auto reader = std::make_shared<Reader>();
@@ -1851,7 +1997,8 @@ void PipelineCache::StartGraphicsWarm() {
              "the compute warm-up",
              path, static_cast<long long>(reader->end) / (1024 * 1024), NumThreads);
     for (size_t thread = 0; thread < NumThreads; ++thread) {
-        graphics_warm_threads.emplace_back([this, reader](std::stop_token stop) {
+        graphics_warm_threads.emplace_back([this, reader, warm_file,
+                                            title_file](std::stop_token stop) {
             Common::SetCurrentThreadName("VkGraphicsWarm");
             Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
             while (!stop.stop_requested() && !compute_warm_done) {
@@ -1885,6 +2032,8 @@ void PipelineCache::StartGraphicsWarm() {
                         }
                         env.Deserialize(reader->file);
                         reader->file.read(reinterpret_cast<char*>(&key), sizeof(key));
+                        ++reader->read;
+                        reader->position = reader->file.tellg();
                     } catch (const std::exception& e) {
                         LOG_WARNING(Render_Vulkan, "Nx2Perf graphics_warm: read failed: {}",
                                     e.what());
@@ -1902,11 +2051,36 @@ void PipelineCache::StartGraphicsWarm() {
                 }
                 (ok ? reader->built : reader->failed_builds).fetch_add(1);
                 const size_t done = reader->built + reader->failed_builds;
+                if (reader->throttle.Due()) {
+                    // The file has no entry count: estimate it from the bytes read so far.
+                    size_t total{};
+                    {
+                        std::scoped_lock lock{reader->mutex};
+                        const std::streamoff header = 12;
+                        const std::streamoff end = reader->end;
+                        if (reader->position > header) {
+                            total = static_cast<size_t>(
+                                static_cast<double>(reader->read) *
+                                static_cast<double>(end - header) /
+                                static_cast<double>(reader->position - header));
+                        }
+                    }
+                    shader_notify.SetWarmProgress(2, done, std::max(total, done));
+                }
                 if (done % 2000 == 0) {
                     LOG_INFO(Render_Vulkan, "Nx2Perf graphics_warm: {} done", done);
                 }
             }
             if (reader->running.fetch_sub(1) == 1) {
+                shader_notify.SetWarmProgress(0, 0, 0);
+                bool complete = false;
+                {
+                    std::scoped_lock lock{reader->mutex};
+                    complete = !reader->failed && reader->end == reader->position;
+                }
+                if (complete && !stop.stop_requested()) {
+                    WriteWarmMarker(warm_file, title_file, device, reader->read);
+                }
                 LOG_INFO(Render_Vulkan,
                          "Nx2Perf graphics_warm: finished, {} built, {} failed, {:.0f} s",
                          reader->built.load(), reader->failed_builds.load(),

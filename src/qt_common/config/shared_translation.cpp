@@ -293,7 +293,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, use_graphics_pipeline_library,
            tr("Shader libraries (faster first-time shader builds)"),
            tr("Builds each shader stage once and links them into pipelines, so new shaders "
-              "cause shorter stutters.\nUsed on NVIDIA and AMD GPUs.\nTakes effect after "
+              "cause shorter stutters.\nUsed on NVIDIA and AMD GPUs. The graphics half of the "
+              "shader warm-up (Prepare shaders in the game list) needs it.\nTakes effect after "
               "restarting the game."));
     INSERT(Settings, enable_compute_pipelines, tr("Enable Compute Pipelines (Intel Vulkan Only)"),
            tr("Required by some games.\nThis setting only exists for Intel "
