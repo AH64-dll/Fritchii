@@ -274,4 +274,10 @@ if(ANDROID)
     target_link_libraries(common PRIVATE android)
 endif()
 
+if (MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_FLAGS_RELEASE MATCHES "-flto")
+    # As the kernel (src/core): fibers migrate between host threads, and with a newer Ocarina PGO
+    # profile ThinLTO dropped Fiber's definitions that the kernel's plain objects call.
+    set_source_files_properties(fiber.cpp PROPERTIES COMPILE_OPTIONS -fno-lto)
+endif()
+
 create_target_directory_groups(common)
