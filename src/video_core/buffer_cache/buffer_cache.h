@@ -20,6 +20,7 @@
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -931,7 +932,9 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     // binding is up to 8 MiB past it, and marking all of it defers the CPU's later writes to those
     // pages until the next fence and has fences copy the over-marked range back.
     u64 mark = binding.size;
-    if (native_pointer && is_written && binding.size != 0) {
+    // EDEN_NX2_EXP1=1: mark the whole binding as before (#415's A/B).
+    if (native_pointer && is_written && binding.size != 0 &&
+        VideoCore::Nx2Debug::Experiment(1) == 0) {
         switch (Settings::values.native_compute_write_mark.GetValue()) {
         case Settings::NativeComputeWriteMark::Auto: {
             const auto& qmd = launch_desc;
