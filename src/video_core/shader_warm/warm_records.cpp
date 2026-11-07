@@ -255,7 +255,7 @@ RuntimeStats ReadRuntimeStats(const std::vector<std::filesystem::path>& caches) 
             continue;
         }
         if (size < 12 || std::memcmp(data.data(), "yuzucach", 8) != 0 ||
-            Get<u32>(data, 8) != WarmCacheVersion) {
+            !IsReadableRuntimeCacheVersion(Get<u32>(data, 8))) {
             continue;
         }
         const std::span<const u8> bytes{data};
