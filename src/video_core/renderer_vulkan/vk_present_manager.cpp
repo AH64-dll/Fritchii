@@ -409,7 +409,12 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
          mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) &&
         !Settings::values.frame_gen.GetValue() && Settings::values.use_speed_limit.GetValue() &&
         Settings::values.current_speed_mode.GetValue() != Settings::SpeedMode::Turbo;
-    pacer.Refresh(Clock::now(), allowed);
+    // The refresh rate of the display the window is on (the HWND on Windows).
+    const auto& window_info = render_window.GetWindowInfo();
+    pacer.Refresh(Clock::now(), allowed,
+                  window_info.type == Core::Frontend::WindowSystemType::Windows
+                      ? window_info.render_surface
+                      : nullptr);
     if (const u64 want = pacer.Outstanding(); pacer.Pacing() && want != 0) {
         // The next target counts from the refresh the previous frame was shown at.
         Common::Nx2Timeline::Span span{"present: wait until shown"};

@@ -10,8 +10,12 @@
 #include "video_core/renderer_vulkan/vk_host_pacer.h"
 
 #ifdef _WIN32
+#include <cwchar>
+#include <string_view>
+#include <vector>
 #include <windows.h>
 #include <dwmapi.h>
+#include "common/string_util.h"
 #pragma comment(lib, "dwmapi.lib")
 #endif
 
@@ -25,31 +29,150 @@ Ns ToNs(double ns) {
 }
 } // Anonymous namespace
 
-std::optional<double> QueryRefreshPeriodNs() {
 #ifdef _WIN32
+namespace {
+struct DwmPeriod {
+    std::optional<double> measured; ///< The compositor's measured period
+    std::optional<double> nominal;
+};
+
+DwmPeriod QueryDwmPeriod() {
+    DwmPeriod result;
     DWM_TIMING_INFO info{};
     info.cbSize = sizeof(info);
-    if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &info)) &&
-        info.rateRefresh.uiNumerator != 0 && info.rateRefresh.uiDenominator != 0) {
-        const double nominal = 1e9 * info.rateRefresh.uiDenominator / info.rateRefresh.uiNumerator;
-        // The compositor's measured period: a "120 Hz" display may run at 119.98, and the game's
-        // frame clock follows this (genlock). The nominal rate when it looks off.
-        LARGE_INTEGER frequency{};
-        if (info.qpcRefreshPeriod != 0 && QueryPerformanceFrequency(&frequency) &&
-            frequency.QuadPart != 0) {
-            const double measured = 1e9 * static_cast<double>(info.qpcRefreshPeriod) /
-                                    static_cast<double>(frequency.QuadPart);
-            if (std::abs(measured - nominal) < nominal * 0.01) {
-                return measured;
+    if (FAILED(DwmGetCompositionTimingInfo(nullptr, &info)) ||
+        info.rateRefresh.uiNumerator == 0 || info.rateRefresh.uiDenominator == 0) {
+        return result;
+    }
+    result.nominal = 1e9 * info.rateRefresh.uiDenominator / info.rateRefresh.uiNumerator;
+    LARGE_INTEGER frequency{};
+    if (info.qpcRefreshPeriod != 0 && QueryPerformanceFrequency(&frequency) &&
+        frequency.QuadPart != 0) {
+        result.measured = 1e9 * static_cast<double>(info.qpcRefreshPeriod) /
+                          static_cast<double>(frequency.QuadPart);
+    }
+    return result;
+}
+
+bool Agrees(double a, double b) {
+    return std::abs(a - b) < b * 0.01;
+}
+
+/// The exact rate of the active display path whose source is GDI display `device` (119.982 Hz
+/// rather than 120), or 0.
+double QueryPathPeriod(const wchar_t* device) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        UINT32 path_count = 0;
+        UINT32 mode_count = 0;
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) !=
+            ERROR_SUCCESS) {
+            return 0.0;
+        }
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
+        const LONG status = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(),
+                                               &mode_count, modes.data(), nullptr);
+        if (status == ERROR_INSUFFICIENT_BUFFER) {
+            continue; // The configuration changed in between
+        }
+        if (status != ERROR_SUCCESS) {
+            return 0.0;
+        }
+        for (UINT32 i = 0; i < path_count; ++i) {
+            const DISPLAYCONFIG_PATH_INFO& path = paths[i];
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+            source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            source.header.size = sizeof(source);
+            source.header.adapterId = path.sourceInfo.adapterId;
+            source.header.id = path.sourceInfo.id;
+            if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS ||
+                std::wcscmp(source.viewGdiDeviceName, device) != 0) {
+                continue;
+            }
+            DISPLAYCONFIG_RATIONAL rate = path.targetInfo.refreshRate;
+            if ((rate.Numerator == 0 || rate.Denominator == 0) &&
+                path.targetInfo.modeInfoIdx < mode_count &&
+                modes[path.targetInfo.modeInfoIdx].infoType ==
+                    DISPLAYCONFIG_MODE_INFO_TYPE_TARGET) {
+                rate = modes[path.targetInfo.modeInfoIdx]
+                           .targetMode.targetVideoSignalInfo.vSyncFreq;
+            }
+            if (rate.Numerator != 0 && rate.Denominator != 0) {
+                return 1e9 * static_cast<double>(rate.Denominator) /
+                       static_cast<double>(rate.Numerator);
             }
         }
-        return nominal;
+        return 0.0;
+    }
+    return 0.0;
+}
+} // Anonymous namespace
+#endif
+
+std::optional<DisplayRefresh> DisplayRefreshQuery::Query([[maybe_unused]] void* native_window) {
+#ifdef _WIN32
+    const DwmPeriod dwm = QueryDwmPeriod();
+
+    const HMONITOR monitor =
+        native_window != nullptr
+            ? MonitorFromWindow(static_cast<HWND>(native_window), MONITOR_DEFAULTTONEAREST)
+            : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof(info);
+    if (monitor != nullptr && GetMonitorInfoW(monitor, &info)) {
+        const bool primary = (info.dwFlags & MONITORINFOF_PRIMARY) != 0;
+        const std::string gdi_name = Common::UTF16ToUTF8(std::wstring_view{info.szDevice});
+        // "\\.\DISPLAY2" -> "DISPLAY2"
+        std::string name = gdi_name.substr(gdi_name.find_last_of('\\') + 1);
+        if (primary) {
+            name += ", primary";
+        }
+
+        DEVMODEW mode{};
+        mode.dmSize = sizeof(mode);
+        const u32 hz = EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode) &&
+                               mode.dmDisplayFrequency > 1
+                           ? static_cast<u32>(mode.dmDisplayFrequency)
+                           : 0;
+        // The display configuration is the slow part: read it again only when the window moved
+        // to another display or that display's mode changed, or now and then.
+        const auto now = std::chrono::steady_clock::now();
+        if (gdi_name != device || hz != nominal_hz || now >= stale_at) {
+            device = gdi_name;
+            nominal_hz = hz;
+            rational_ns = QueryPathPeriod(info.szDevice);
+            stale_at = now + std::chrono::seconds{30};
+        }
+
+        std::optional<DisplayRefresh> result;
+        if (rational_ns > 0.0) {
+            result = DisplayRefresh{rational_ns, name + ", display config"};
+        } else if (hz != 0) {
+            result = DisplayRefresh{1e9 / hz, name + ", display settings"};
+        }
+        if (result) {
+            // DWM's timing is the primary display's. Its measured period is the most precise
+            // one there, and the game's frame clock follows it (genlock).
+            if (primary && dwm.measured && Agrees(*dwm.measured, result->period_ns)) {
+                return DisplayRefresh{*dwm.measured, name + ", DWM"};
+            }
+            return result;
+        }
+    }
+
+    // The window's display is unknown: the primary display from DWM, measured when it agrees
+    // with the nominal rate (a "120 Hz" display may run at 119.98).
+    if (dwm.nominal) {
+        if (dwm.measured && Agrees(*dwm.measured, *dwm.nominal)) {
+            return DisplayRefresh{*dwm.measured, "primary, DWM"};
+        }
+        return DisplayRefresh{*dwm.nominal, "primary, DWM nominal"};
     }
     DEVMODEW mode{};
     mode.dmSize = sizeof(mode);
     if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) &&
         mode.dmDisplayFrequency > 1) {
-        return 1e9 / mode.dmDisplayFrequency;
+        return DisplayRefresh{1e9 / mode.dmDisplayFrequency, "primary, display settings"};
     }
 #endif
     return std::nullopt;
@@ -66,15 +189,21 @@ void HostPacer::NoteQueued(Clock::time_point queued) {
     last_queued = queued;
 }
 
-void HostPacer::Refresh(Clock::time_point now, bool allowed) {
+void HostPacer::Refresh(Clock::time_point now, bool allowed, void* native_window) {
     if (now >= next_refresh_query) {
         next_refresh_query = now + std::chrono::seconds{2};
-        if (const auto period = QueryRefreshPeriodNs(); period && *period > 2e6 && *period < 50e6) {
-            if (!refresh_known || std::abs(*period - refresh_ns) > refresh_ns * 0.01) {
-                LOG_INFO(Render_Vulkan, "Host pacing: display refresh {:.4f} Hz", 1e9 / *period);
+        if (const auto refresh = refresh_query.Query(native_window);
+            refresh && refresh->period_ns > 2e6 && refresh->period_ns < 50e6) {
+            const double period = refresh->period_ns;
+            if (!refresh_known || std::abs(period - refresh_ns) > refresh_ns * 0.01 ||
+                refresh->display != refresh_display) {
+                LOG_INFO(Render_Vulkan, "Host pacing: display refresh {:.4f} Hz (monitor {})",
+                         1e9 / period, refresh->display);
+                // A new rate or another display: its own refresh grid.
                 vblank.reset();
+                refresh_display = refresh->display;
             }
-            refresh_ns = *period;
+            refresh_ns = period;
             refresh_known = true;
         }
     }

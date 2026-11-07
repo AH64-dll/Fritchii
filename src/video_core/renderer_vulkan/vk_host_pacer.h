@@ -7,10 +7,31 @@
 #include <chrono>
 #include <deque>
 #include <optional>
+#include <string>
 
 #include "common/common_types.h"
 
 namespace Vulkan {
+
+struct DisplayRefresh {
+    double period_ns;
+    std::string display; ///< Which display and source, for the log
+};
+
+/// The refresh period of the display a window is on (Windows; nullopt elsewhere or on failure).
+/// Keeps the display's rate between queries so the display configuration is only read again
+/// when the window moves to another display, its mode changes, or every 30 s.
+class DisplayRefreshQuery {
+public:
+    /// `native_window`: the HWND on Windows; null queries the primary display.
+    [[nodiscard]] std::optional<DisplayRefresh> Query(void* native_window);
+
+private:
+    std::string device;   ///< GDI name of the display the rate below belongs to
+    u32 nominal_hz{};     ///< Its integer rate when the rate was read
+    double rational_ns{}; ///< From the display configuration; 0: unavailable
+    std::chrono::steady_clock::time_point stale_at{};
+};
 
 /// Host frame pacer (EDEN_NX2_HOST_PACE, live switch; 1 = on, the default, 0 = measure only).
 ///
@@ -36,8 +57,9 @@ public:
         return pacing;
     }
 
-    /// Re-reads the switch and the display's refresh period now and then.
-    void Refresh(Clock::time_point now, bool allowed);
+    /// Re-reads the switch and the refresh period of the display `native_window` is on (see
+    /// DisplayRefreshQuery) now and then.
+    void Refresh(Clock::time_point now, bool allowed, void* native_window);
 
     /// When the next frame should be handed to the swapchain; `now` or earlier = at once.
     [[nodiscard]] Clock::time_point Target(Clock::time_point now);
@@ -82,6 +104,8 @@ private:
     double refresh_ns{1e9 / 60.0};
     bool refresh_known{};
     Clock::time_point next_refresh_query{};
+    DisplayRefreshQuery refresh_query;
+    std::string refresh_display;
 
     std::optional<Clock::time_point> last_queued;
     double content_ns{1e9 / 60.0};
@@ -101,8 +125,5 @@ private:
     u32 frames{}, held{}, missed{}, lost{}, caught_up{};
     double interval_sum_ms{}, interval_max_ms{}, hold_sum_ms{}, latency_sum_ms{};
 };
-
-/// The display refresh period from the OS compositor (Windows); nullopt elsewhere or on failure.
-[[nodiscard]] std::optional<double> QueryRefreshPeriodNs();
 
 } // namespace Vulkan
