@@ -848,17 +848,20 @@ void PipelineCache::SaveUsedPipelines() {
 }
 
 namespace {
-// EDEN_NX2_PIPELINE_CLEAN=1 (default off): see CurrentGraphicsPipelineClean.
-bool PipelineCleanEnabled() {
-    static const bool enabled = [] {
+// EDEN_NX2_PIPELINE_CLEAN=1 or EDEN_NX2_EXP19=1 (live; default off): see
+// CurrentGraphicsPipelineClean. EXP19=2: with the patches of zortos293/Lichii#641
+// (EDEN_NX2_PIPE_SKIP, EDEN_NX2_PIPE_PATCH).
+int PipelineCleanMode() {
+    static const bool env = [] {
         const char* value = std::getenv("EDEN_NX2_PIPELINE_CLEAN");
         return value != nullptr && value[0] != '0';
     }();
-    return enabled;
+    const int experiment = VideoCore::Nx2Debug::Experiment(19);
+    return experiment != 0 ? experiment : (env ? 1 : 0);
 }
 } // Anonymous namespace
 
-void PipelineCache::BuildCleanWatch() {
+void PipelineCache::BuildCleanWatch(bool patch) {
     using Range = CleanLookup::Range;
     const Maxwell& regs = maxwell3d->regs;
     const DynamicFeatures& features = dynamic_features;
@@ -873,6 +876,9 @@ void PipelineCache::BuildCleanWatch() {
     const auto watch = [&](const auto& field) { watch_into(ranges, field); };
 
     // Every register FixedPipelineState::Refresh (and what it calls) reads with these features.
+    // With `patch`, the blend registers are left out (the dual-source bit is compared instead,
+    // and the attachments follow Dirty::Blending), and so are the vertex attribute formats with
+    // dynamic vertex input (the types follow Dirty::VertexInput), as Refresh itself does.
     // Refresh itself, always:
     watch(regs.transform_feedback_enabled);
     watch(regs.depth_mode);
@@ -880,9 +886,11 @@ void PipelineCache::BuildCleanWatch() {
     watch(regs.tessellation);
     watch(regs.patch_vertices);
     watch(regs.anti_alias_samples_mode);
-    watch(regs.blend);                    // ComputeAttachment0DualSourceBlend
-    watch(regs.blend_per_target_enabled); // ComputeAttachment0DualSourceBlend
-    watch(regs.blend_per_target[0]);      // ComputeAttachment0DualSourceBlend
+    if (!patch) {
+        watch(regs.blend);                    // ComputeAttachment0DualSourceBlend
+        watch(regs.blend_per_target_enabled); // ComputeAttachment0DualSourceBlend
+        watch(regs.blend_per_target[0]);      // ComputeAttachment0DualSourceBlend
+    }
     watch(regs.alpha_test_enabled);
     watch(regs.alpha_test_func);
     watch(regs.alpha_test_ref);
@@ -901,7 +909,9 @@ void PipelineCache::BuildCleanWatch() {
     }
     watch(regs.point_size);
     // Dirty::VertexInput (both branches) and the static vertex repack:
-    watch(regs.vertex_attrib_format);
+    if (!patch || !features.has_dynamic_vertex_input) {
+        watch(regs.vertex_attrib_format);
+    }
     const bool repack = !features.has_dynamic_vertex_input && features.has_static_vertex_repack;
     if (!features.has_dynamic_vertex_input) {
         watch(regs.vertex_stream_instances);
@@ -949,10 +959,12 @@ void PipelineCache::BuildCleanWatch() {
     }
     // Dirty::Blending, BlendingAttachment::Refresh (no extended dynamic state 3 blending):
     if (!features.has_extended_dynamic_state_3_blend) {
-        watch(regs.color_mask_common);
-        watch(regs.color_mask);
-        watch(regs.blend_per_target);
-        watch(regs.iterated_blend);
+        if (!patch) {
+            watch(regs.color_mask_common);
+            watch(regs.color_mask);
+            watch(regs.blend_per_target);
+        }
+        watch(regs.iterated_blend); // No dirty flag
     }
     // DynamicState::Refresh3:
     if (!features.has_dynamic_state3_logic_op_enable) {
@@ -998,8 +1010,11 @@ void PipelineCache::BuildCleanWatch() {
     }
     clean.xfb_snapshot.assign(xfb_words, 0);
     clean.built = true;
-    LOG_INFO(Render_Vulkan, "EDEN_NX2_PIPELINE_CLEAN: watching {} register words in {} ranges",
-             words, clean.ranges.size());
+    clean.patch = patch;
+    clean.pipeline = nullptr;
+    LOG_INFO(Render_Vulkan,
+             "EDEN_NX2_PIPELINE_CLEAN: watching {} register words in {} ranges{}", words,
+             clean.ranges.size(), patch ? " (with patches)" : "");
 }
 
 bool PipelineCache::CleanInputsUnchanged() const {
@@ -1050,24 +1065,34 @@ void PipelineCache::TakeCleanSnapshot() {
 // engine hint. When all of these equal their values at the last Refresh and the flags are
 // clear, Refresh would rewrite the same key and Next(graphics_key) would return
 // current_pipeline (whose key it is): the lookup returns it as that fast path does.
-GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean() {
+// With `patch` (zortos293/Lichii#641): the dual-source blend bit is compared instead of the blend
+// registers, and a raised VertexInput (dynamic vertex input) or Blending flag redoes only that
+// part of the key, which Next then looks up.
+GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
         clean.pipeline = nullptr;
         return nullptr;
     }
-    if (!clean.built) {
-        BuildCleanWatch();
+    if (!clean.built || clean.patch != patch) {
+        BuildCleanWatch(patch);
     }
     const auto& flags = maxwell3d->dirty.flags;
     const bool blending_dirty =
         !dynamic_features.has_extended_dynamic_state_3_blend && flags[Dirty::Blending];
+    const bool vertex_input_dirty = flags[Dirty::VertexInput];
+    const bool patch_blending = patch && blending_dirty;
+    const bool patch_vertex_input =
+        patch && vertex_input_dirty && dynamic_features.has_dynamic_vertex_input;
     if (clean.pipeline != nullptr && clean.pipeline == current_pipeline &&
-        clean.maxwell3d == maxwell3d && !flags[Dirty::VertexInput] &&
-        !flags[Dirty::ViewportSwizzles] && !blending_dirty &&
+        clean.maxwell3d == maxwell3d && (!vertex_input_dirty || patch_vertex_input) &&
+        !flags[Dirty::ViewportSwizzles] && (!blending_dirty || patch_blending) &&
         clean.hashes == graphics_key.unique_hashes &&
         clean.topology == maxwell3d->draw_manager.draw_state.topology &&
-        clean.engine_state == maxwell3d->engine_state && CleanInputsUnchanged()) {
+        clean.engine_state == maxwell3d->engine_state &&
+        (!patch || FixedPipelineState::DualSourceBlend(maxwell3d->regs) ==
+                       (graphics_key.state.attachment0_dual_source_blend != 0)) &&
+        CleanInputsUnchanged()) {
         ++clean.hits;
     } else {
         ++clean.misses;
@@ -1080,22 +1105,38 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean() {
         } else if (now - clean.last_log >= std::chrono::seconds{10}) {
             const double seconds = std::chrono::duration<double>(now - clean.last_log).count();
             LOG_INFO(Render_Vulkan,
-                     "EDEN_NX2_PIPELINE_CLEAN per second: lookups without Refresh {}, "
-                     "with Refresh {}",
+                     "EDEN_NX2_PIPELINE_CLEAN per second: lookups without Refresh {} (patched "
+                     "{}), with Refresh {}",
                      static_cast<u64>(static_cast<double>(clean.hits) / seconds),
+                     static_cast<u64>(static_cast<double>(clean.patches) / seconds),
                      static_cast<u64>(static_cast<double>(clean.misses) / seconds));
             clean.last_log = now;
             clean.hits = 0;
+            clean.patches = 0;
             clean.misses = 0;
         }
     }
     if (clean.pipeline != nullptr) {
-        current_pipeline->MarkUsed(frame_count);
-        return BuiltPipeline(current_pipeline);
+        if (!patch_blending && !patch_vertex_input) {
+            current_pipeline->MarkUsed(frame_count);
+            return BuiltPipeline(current_pipeline);
+        }
+        // Every other Refresh input is unchanged, so the snapshot stands. As RefreshGraphicsKey
+        // under the raised flags; VertexInput stays raised for the command buffer update.
+        ++clean.patches;
+        clean.pipeline = nullptr;
+        if (patch_vertex_input) {
+            vertex_attribute_types = FixedPipelineState::DynamicAttributeTypes(maxwell3d->regs);
+            graphics_key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
+                vertex_attribute_types, graphics_key.unique_hashes, vertex_attribute_masks);
+        }
+        if (patch_blending) {
+            graphics_key.state.RefreshBlending(*maxwell3d);
+        }
+    } else {
+        TakeCleanSnapshot();
+        RefreshGraphicsKey();
     }
-
-    TakeCleanSnapshot();
-    RefreshGraphicsKey();
     if (current_pipeline) {
         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
         if (next) {
@@ -1131,9 +1172,11 @@ void PipelineCache::RefreshGraphicsKey() {
 }
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
-    if (PipelineCleanEnabled()) {
-        return CurrentGraphicsPipelineClean();
+    if (const int clean_mode = PipelineCleanMode(); clean_mode != 0) {
+        return CurrentGraphicsPipelineClean(clean_mode == 2);
     }
+    // Switched off live: the next switch on starts from a full Refresh.
+    clean.pipeline = nullptr;
 
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;

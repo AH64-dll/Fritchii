@@ -198,23 +198,7 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
     if (maxwell3d.dirty.flags[Dirty::VertexInput]) {
         if (features.has_dynamic_vertex_input) {
             // Dirty flag will be reset by the command buffer update
-            static constexpr std::array LUT{
-                0u, // Invalid
-                1u, // SignedNorm
-                1u, // UnsignedNorm
-                2u, // SignedInt
-                3u, // UnsignedInt
-                1u, // UnsignedScaled
-                1u, // SignedScaled
-                1u, // Float
-            };
-            const auto& attrs = regs.vertex_attrib_format;
-            attribute_types = 0;
-            for (size_t i = 0; i < Maxwell::NumVertexAttributes; ++i) {
-                const u32 mask = attrs[i].constant != 0 ? 0 : 3;
-                const u32 type = LUT[static_cast<size_t>(attrs[i].type.Value())];
-                attribute_types |= static_cast<u64>(type & mask) << (i * 2);
-            }
+            attribute_types = DynamicAttributeTypes(regs);
         } else {
             maxwell3d.dirty.flags[Dirty::VertexInput] = false;
             enabled_divisors = 0;
@@ -255,19 +239,7 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
     }
     if (!extended_dynamic_state_3_blend) {
         if (maxwell3d.dirty.flags[Dirty::Blending]) {
-            maxwell3d.dirty.flags[Dirty::Blending] = false;
-            for (size_t index = 0; index < attachments.size(); ++index) {
-                attachments[index].Refresh(regs, index);
-                auto& attachment = attachments[index];
-                if (color_write_enable_dynamic && attachment.mask_r == 0 &&
-                    attachment.mask_g == 0 && attachment.mask_b == 0 &&
-                    attachment.mask_a == 0) {
-                    attachment.mask_r.Assign(1);
-                    attachment.mask_g.Assign(1);
-                    attachment.mask_b.Assign(1);
-                    attachment.mask_a.Assign(1);
-                }
-            }
+            RefreshBlending(maxwell3d);
         }
     }
     dynamic_state.Refresh3(regs, features);
@@ -286,6 +258,47 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
                 repack_mask, binding, regs.vertex_streams[binding].stride));
         }
     }
+}
+
+void FixedPipelineState::RefreshBlending(Tegra::Engines::Maxwell3D& maxwell3d) {
+    const Maxwell& regs = maxwell3d.regs;
+    maxwell3d.dirty.flags[Dirty::Blending] = false;
+    for (size_t index = 0; index < attachments.size(); ++index) {
+        attachments[index].Refresh(regs, index);
+        auto& attachment = attachments[index];
+        if (color_write_enable_dynamic && attachment.mask_r == 0 && attachment.mask_g == 0 &&
+            attachment.mask_b == 0 && attachment.mask_a == 0) {
+            attachment.mask_r.Assign(1);
+            attachment.mask_g.Assign(1);
+            attachment.mask_b.Assign(1);
+            attachment.mask_a.Assign(1);
+        }
+    }
+}
+
+u64 FixedPipelineState::DynamicAttributeTypes(const Maxwell& regs) noexcept {
+    static constexpr std::array LUT{
+        0u, // Invalid
+        1u, // SignedNorm
+        1u, // UnsignedNorm
+        2u, // SignedInt
+        3u, // UnsignedInt
+        1u, // UnsignedScaled
+        1u, // SignedScaled
+        1u, // Float
+    };
+    const auto& attrs = regs.vertex_attrib_format;
+    u64 types = 0;
+    for (size_t i = 0; i < Maxwell::NumVertexAttributes; ++i) {
+        const u32 mask = attrs[i].constant != 0 ? 0 : 3;
+        const u32 type = LUT[static_cast<size_t>(attrs[i].type.Value())];
+        types |= static_cast<u64>(type & mask) << (i * 2);
+    }
+    return types;
+}
+
+bool FixedPipelineState::DualSourceBlend(const Maxwell& regs) noexcept {
+    return ComputeAttachment0DualSourceBlend(regs);
 }
 
 void FixedPipelineState::BlendingAttachment::Refresh(const Maxwell& regs, size_t index) {

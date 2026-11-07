@@ -111,6 +111,9 @@ inline std::atomic<int> g_host_pace{-1};
 /// GPU range keeps its translation and resolved buffer (UBO_REBIND), 2 = storage bindings reuse
 /// their last FindBuffer result (STORAGE_MEMO), 4 = buffers touch the LRU once per frame. All
 /// while the mappings and the set of buffers are unchanged (BufferCache::binding_epoch).
+/// EXP19 (graphics pipeline lookup without Refresh, PipelineCache::CurrentGraphicsPipelineClean):
+/// 1 = as EDEN_NX2_PIPELINE_CLEAN=1, 2 = also #641's patches (blend registers left to the
+/// dual-source bit and Dirty::Blending, attribute types redone alone under Dirty::VertexInput).
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 

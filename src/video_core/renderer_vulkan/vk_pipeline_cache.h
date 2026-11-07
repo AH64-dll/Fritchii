@@ -146,11 +146,12 @@ private:
     /// bound programs read (see VideoCommon::KeyedAttributeTypes).
     void RefreshGraphicsKey();
 
-    /// EDEN_NX2_PIPELINE_CLEAN: CurrentGraphicsPipeline without FixedPipelineState::Refresh nor
-    /// the key comparison while nothing Refresh reads changed since the last lookup.
-    [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineClean();
+    /// EDEN_NX2_PIPELINE_CLEAN / EDEN_NX2_EXP19: CurrentGraphicsPipeline without
+    /// FixedPipelineState::Refresh nor the key comparison while nothing Refresh reads changed
+    /// since the last lookup. `patch`: EXP19=2.
+    [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineClean(bool patch);
     /// The registers Refresh reads with these features, as (first word, words) ranges.
-    void BuildCleanWatch();
+    void BuildCleanWatch(bool patch);
     [[nodiscard]] bool CleanInputsUnchanged() const;
     void TakeCleanSnapshot();
 
@@ -160,6 +161,7 @@ private:
             u32 count;
         };
         bool built{};
+        bool patch{};                  ///< Built for CurrentGraphicsPipelineClean(true)
         std::vector<Range> ranges;     ///< Read by every Refresh
         std::vector<Range> xfb_ranges; ///< Read while transform feedback is enabled
         std::vector<u32> snapshot;     ///< ranges' words at the last Refresh
@@ -171,6 +173,7 @@ private:
         /// current_pipeline when its key was graphics_key after the last Refresh, else null.
         GraphicsPipeline* pipeline{};
         u64 hits{};
+        u64 patches{};
         u64 misses{};
         std::chrono::steady_clock::time_point last_log{};
     } clean;
