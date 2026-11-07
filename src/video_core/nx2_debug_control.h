@@ -82,6 +82,11 @@ inline std::atomic<int> g_host_pace{-1};
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
 /// (E:\OotRemakeEmulation\work\EXPERIMENTS.md lists which fix uses which slot). 0 = off.
+/// EXP8 (texture upload hitches), bits: 1 = keep idle upload staging buffers up to 32 MiB
+/// (StagingBufferPool::ReleaseLevel), 2 = no guest upload for a new image that GPU copies
+/// overwrite whole (TextureCache::JoinImages), 4 = large 2D levels untiled on the transcode
+/// workers too (UnswizzleImage), 8 = guest memory of uploaded textures not hinted cold
+/// (TextureCache::TickFrame).
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 

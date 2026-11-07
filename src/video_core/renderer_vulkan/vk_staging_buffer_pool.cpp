@@ -15,6 +15,7 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/literals.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -282,6 +283,25 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     auto& staging = cache[log2];
     auto& entries = staging.entries;
     const size_t old_size = entries.size();
+
+    // EDEN_NX2_EXP8 bit 1: keep two idle upload buffers per level up to 32 MiB (under 128 MiB in
+    // all). Each level is swept every 64 frames, so after a pause each upload over 8 MiB (past
+    // the stream buffer's regions) got a new dedicated allocation, written to for the first time
+    // (16 MiB on an RTX 4080, idle system: 0.4 ms to create, 1.2 ms more for the first write).
+    constexpr size_t KeepMaxLog2 = 25;
+    constexpr size_t KeepPerLevel = 2;
+    if (&cache == &upload_cache && log2 <= KeepMaxLog2 &&
+        (VideoCore::Nx2Debug::Experiment(8) & 1) != 0) {
+        size_t idle = 0;
+        std::erase_if(entries, [this, &idle](const StagingBuffer& entry) {
+            return scheduler.IsFree(entry.tick) && ++idle > KeepPerLevel;
+        });
+        staging.delete_index = 0;
+        if (staging.iterate_index > entries.size()) {
+            staging.iterate_index = 0;
+        }
+        return;
+    }
 
     const auto is_deletable = [this](const StagingBuffer& entry) {
         return scheduler.IsFree(entry.tick);

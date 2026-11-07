@@ -18,4 +18,7 @@ struct MemoryInfo {
  */
 [[nodiscard]] const MemoryInfo& GetMemInfo();
 
+/// Page faults of this process so far, soft and hard (0 where unknown).
+[[nodiscard]] u64 GetProcessPageFaults();
+
 } // namespace Common

@@ -20,6 +20,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
+#include "common/memory_detect.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
@@ -464,8 +465,12 @@ void TextureCache<P>::TickFrame() {
     TickAsyncDecode();
     TickAsyncUnswizzle();
     if (frame_tick % 600 == 0 && !uploaded_ranges.empty()) {
-        for (const auto& [address, size] : uploaded_ranges) {
-            device_memory.HintCold(address, size);
+        // EDEN_NX2_EXP8 bit 8: none. An image created again over cold memory (re-created after
+        // eviction, or a render target at a new size) faults all of it back in while uploading.
+        if ((VideoCore::Nx2Debug::Experiment(8) & 8) == 0) {
+            for (const auto& [address, size] : uploaded_ranges) {
+                device_memory.HintCold(address, size);
+            }
         }
         uploaded_ranges.clear();
     }
@@ -1785,21 +1790,30 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     const bool upload_trace = VideoCore::Nx2Debug::Experiment(7) != 0;
     const auto upload_begin = upload_trace ? std::chrono::steady_clock::now()
                                            : std::chrono::steady_clock::time_point{};
+    auto staging_end = upload_begin;
+    // Page faults of the whole process meanwhile: ~256 per MiB when the guest memory was paged
+    // out (cold-hinted) or the staging memory is new.
+    const u64 faults_begin = upload_trace ? Common::GetProcessPageFaults() : 0;
     if (!UploadInChunks(image)) {
         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
+        if (upload_trace) [[unlikely]] {
+            staging_end = std::chrono::steady_clock::now();
+        }
         UploadImageContents(image, staging);
         runtime.InsertUploadMemoryBarrier();
     }
     if (upload_trace) [[unlikely]] {
-        const double ms = std::chrono::duration<double, std::milli>(
-                              std::chrono::steady_clock::now() - upload_begin)
-                              .count();
+        using Ms = std::chrono::duration<double, std::milli>;
+        const double ms = Ms(std::chrono::steady_clock::now() - upload_begin).count();
         static std::atomic<u32> logged{};
         if (ms > 2.0 && logged.fetch_add(1, std::memory_order_relaxed) < 300) {
             LOG_WARNING(HW_GPU,
-                        "Slow upload {:.2f} ms: format {} type {} {}x{}x{} levels {} layers {}, "
-                        "{} KiB guest, {} KiB host, flags {:#x}",
-                        ms, static_cast<u32>(image.info.format), static_cast<u32>(image.info.type),
+                        "Slow upload {:.2f} ms (staging {:.2f} ms, {} page faults): format {} "
+                        "type {} {}x{}x{} levels {} layers {}, {} KiB guest, {} KiB host, "
+                        "flags {:#x}",
+                        ms, Ms(staging_end - upload_begin).count(),
+                        Common::GetProcessPageFaults() - faults_begin,
+                        static_cast<u32>(image.info.format), static_cast<u32>(image.info.type),
                         image.info.size.width, image.info.size.height, image.info.size.depth,
                         image.info.resources.levels, image.info.resources.layers,
                         image.guest_size_bytes >> 10, MapSizeBytes(image) >> 10,
@@ -2786,9 +2800,110 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             return false;
         }
     };
-    if (overwritten_by_clear()) {
+    // Whether one of the GPU copies below writes all of a single-level 2D image, so an upload
+    // before it is never seen. Ocarina of Time creates a D32 image at each new size of a
+    // dynamic-resolution target over the same memory, uploading 6-14 MiB of it each time.
+    const auto overwritten_by_copies = [&] {
+        const ImageInfo& image_info = new_image.info;
+        constexpr ImageFlagBits unusual = ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
+                                          ImageFlagBits::SparseTiles |
+                                          ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked;
+        if (image_info.type != ImageType::e2D || image_info.resources.levels != 1 ||
+            image_info.resources.layers != 1 || image_info.num_samples != 1 ||
+            True(new_image.flags & (unusual | ImageFlagBits::Converted |
+                                    ImageFlagBits::AsynchronousDecode))) {
+            return false;
+        }
+        const auto blocks = [](const ImageInfo& of, s32 level) {
+            const Extent3D size = MipSize(of.size, static_cast<u32>(level));
+            return Extent2D{
+                .width = Common::DivCeil(size.width, DefaultBlockWidth(of.format)),
+                .height = Common::DivCeil(size.height, DefaultBlockHeight(of.format)),
+            };
+        };
+        const Extent2D new_blocks = blocks(image_info, 0);
+        const auto covers = [&](const ImageInfo& overlap_info, s32 level) {
+            const Extent2D overlap_blocks = blocks(overlap_info, level);
+            return overlap_blocks.width >= new_blocks.width &&
+                   overlap_blocks.height >= new_blocks.height;
+        };
+        for (const JoinCopy& copy : join_copies_to_do) {
+            const ImageBase& overlap = slot_images[copy.id];
+            if (overlap.info.type != ImageType::e2D || overlap.info.num_samples != 1 ||
+                True(overlap.flags & unusual) ||
+                GetFormatType(overlap.info.format) != GetFormatType(image_info.format) ||
+                BytesPerBlock(overlap.info.format) != BytesPerBlock(image_info.format) ||
+                overlap.info.astc_opaque != image_info.astc_opaque) {
+                continue;
+            }
+            if (!copy.is_alias) {
+                // Copied whole (MakeShrinkImageCopies) when the GPU wrote it.
+                const std::optional<SubresourceBase> base = new_image.TryFindBase(overlap.gpu_addr);
+                if (True(overlap.flags & ImageFlagBits::GpuModified) && base &&
+                    base->level == 0 && base->layer == 0) {
+                    return true;
+                }
+                continue;
+            }
+            if (!overlap.IsSafeGpuCopy()) {
+                continue;
+            }
+            // The extent AddImageAlias gives the copy: the smaller of the two at the base found.
+            constexpr auto options = RelaxedOptions::Size | RelaxedOptions::Format;
+            if (std::ranges::find(join_left_aliased_ids, copy.id) != join_left_aliased_ids.end()) {
+                const std::optional<SubresourceBase> base =
+                    FindSubresource(image_info, overlap, new_image.gpu_addr, options, false, true);
+                if (base && covers(overlap.info, base->level)) {
+                    return true;
+                }
+            } else {
+                const std::optional<SubresourceBase> base =
+                    FindSubresource(overlap.info, new_image, overlap.gpu_addr, options, false, true);
+                if (base && base->level == 0 && base->layer == 0 && covers(overlap.info, 0)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    const bool clear_skip = overwritten_by_clear();
+    // EDEN_NX2_EXP8 bit 2: skip the upload the copies overwrite.
+    const bool copy_skip =
+        !clear_skip && (VideoCore::Nx2Debug::Experiment(8) & 2) != 0 && overwritten_by_copies();
+    if (VideoCore::Nx2Debug::Experiment(7) != 0 && new_image.guest_size_bytes >= 4_MiB)
+        [[unlikely]] {
+        // Why a large new image was (or was not) uploaded from guest memory.
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 300) {
+            u32 aliases = 0;
+            u32 gpu_written = 0;
+            for (const JoinCopy& copy : join_copies_to_do) {
+                aliases += copy.is_alias ? 1 : 0;
+                const bool gpu = True(slot_images[copy.id].flags & ImageFlagBits::GpuModified);
+                gpu_written += gpu ? 1 : 0;
+            }
+            LOG_WARNING(HW_GPU,
+                        "New image format {} {}x{}x{} levels {} layers {} at {:#x}: {} copies "
+                        "({} aliases, {} GPU-written), {} bad overlaps, clearing {}, covered {}, "
+                        "upload {}",
+                        static_cast<u32>(new_info.format), new_info.size.width,
+                        new_info.size.height, new_info.size.depth, new_info.resources.levels,
+                        new_info.resources.layers, new_image.gpu_addr, join_copies_to_do.size(),
+                        aliases, gpu_written, join_bad_overlap_ids.size(),
+                        clearing_render_targets, overwritten_by_copies(),
+                        clear_skip  ? "skipped (clear)"
+                        : copy_skip ? "skipped (copies)"
+                                    : "done");
+        }
+    }
+    if (clear_skip) {
         // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when
         // IsFullClear agrees the clear covers the whole image, and uploads it otherwise.
+        runtime.TransitionImageLayout(new_image);
+    } else if (copy_skip) {
+        // As RefreshContents leaves it, with the contents the copies write.
+        new_image.flags &= ~ImageFlagBits::CpuModified;
+        TrackImage(new_image, new_image_id);
         runtime.TransitionImageLayout(new_image);
     } else {
         // TODO: Only upload what we need
