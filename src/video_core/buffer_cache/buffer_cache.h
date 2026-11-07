@@ -1865,6 +1865,11 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         } else if (any_cpu_dirty &&
                    memory_tracker.IsRegionCpuModified(page, Core::DEVICE_PAGESIZE)) {
             reason = BankCpuDirty;
+        } else if (snapshot.changed_frame != ~u64{0} &&
+                   frame_tick - snapshot.changed_frame < HotFrames) {
+            // Changed lately: likely per-draw data, rewritten by paths none of the flags see
+            // (EXP9=2 found ~1 such change in 15 s without this rule).
+            reason = BankHot;
         } else if (frame_check && snapshot.checked_frame != frame_tick) {
             reason = BankFrame;
         }
@@ -1879,6 +1884,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             continue;
         }
         ++stats.changed[reason];
+        snapshot.changed_frame = frame_tick;
         std::memcpy(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE);
         memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
     }
@@ -1893,12 +1899,13 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     LOG_INFO(HW_GPU,
              "Native bank check (EXP9={}, 5 s): {} binds, {} new pages, {} skipped; compared / "
              "changed: collected CPU writes {} / {}, buffer cache writes {} / {}, recheck {} / {}, "
-             "CPU-modified {} / {}, frame check {} / {}, verify only {} / {}; missed {}, missed "
-             "without the frame check {}",
+             "CPU-modified {} / {}, hot {} / {}, frame check {} / {}, verify only {} / {}; missed "
+             "{}, missed without the frame check {}",
              mode, stats.binds, stats.pages_new, stats.pages_skipped, compared[BankCollected],
              changed[BankCollected], compared[BankWritten], changed[BankWritten],
              compared[BankRecheck], changed[BankRecheck], compared[BankCpuDirty],
-             changed[BankCpuDirty], compared[BankFrame], changed[BankFrame], compared[BankNone],
+             changed[BankCpuDirty], compared[BankHot], changed[BankHot], compared[BankFrame],
+             changed[BankFrame], compared[BankNone],
              changed[BankNone], verify ? changed[BankNone] : 0,
              verify ? changed[BankNone] + changed[BankFrame] : 0);
     stats = {};

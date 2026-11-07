@@ -489,6 +489,8 @@ public:
         /// EDEN_NX2_EXP9: frame_tick of the page's last compare, and whether the next bind
         /// compares it again (a flagged write's bytes may land after the compare that took it).
         u64 checked_frame = ~u64{0};
+        /// frame_tick when the page was last seen changed: such pages are compared on every bind.
+        u64 changed_frame = ~u64{0};
         bool recheck = false;
     };
     std::unordered_map<DAddr, NativeBankPage> native_indirect_page_snapshots;
@@ -506,11 +508,14 @@ public:
     } native_bank_stats;
     /// EDEN_NX2_EXP9 != 0: why bank pages were compared and which of them had changed, by the
     /// first reason that applies (NativeBankReason), logged every 5 s.
+    /// EDEN_NX2_EXP9: a page that changed within this many frames is compared on every bind.
+    static constexpr u64 HotFrames = 120;
     enum NativeBankReason : size_t {
         BankCollected, ///< Collected CPU writes (Core::g_collected_write_pages)
         BankWritten,   ///< Writes the buffer cache saw (Core::g_buffer_write_pages)
         BankRecheck,   ///< Flagged at the previous bind
         BankCpuDirty,  ///< CPU-modified in the tracker
+        BankHot,       ///< Changed within the last HotFrames frames (per-draw data)
         BankFrame,     ///< Not compared yet this frame
         BankNone,      ///< No reason: EXP9=2 compares these only to verify
         BankReasons,
