@@ -3312,12 +3312,8 @@ private:
     void CallMacroMethod(Core::System& system, u32 method, std::span<const u32> parameters);
 
     /// Whether state register writes that keep the register's value are dropped (CallMethod).
-    static bool SkipSameValueWrites() {
-        static const bool skip = [] {
-            const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
-            return value == nullptr || value[0] != '0';
-        }();
-        return skip;
+    bool SkipSameValueWrites() const {
+        return skip_same_value_writes;
     }
 
     /// Handles writes to the macro uploading register.
@@ -3429,6 +3425,10 @@ private:
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
+    // EDEN_NX2_SKIP_SAME and EDEN_NX2_PERF_VERIFY, read in the constructor (after the switch
+    // files are loaded): every method checks them, so no static guard on the hot path.
+    bool skip_same_value_writes{true};
+    bool perf_verify{};
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,
     // mode before, path), printed when the sides disagree.
     struct ControlWrite {
