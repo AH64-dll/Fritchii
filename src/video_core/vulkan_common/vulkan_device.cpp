@@ -1679,18 +1679,6 @@ void Device::RemoveUnsuitableExtensions() {
     // The guest's own M=16 N=8 K=16 shape is preferred; without it, a 16x16x16 shape runs HMMA
     // through shared memory with the compute subgroups forced to 32 lanes.
     {
-        const auto shapes = physical.GetCooperativeMatrixPropertiesKHR();
-        const auto has_shape = [&](u32 columns) {
-            return std::ranges::any_of(shapes, [=](const VkCooperativeMatrixPropertiesKHR& shape) {
-                return shape.MSize == 16 && shape.NSize == columns && shape.KSize == 16 &&
-                       shape.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                       shape.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                       shape.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                       shape.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                       shape.saturatingAccumulation == VK_FALSE &&
-                       shape.scope == VK_SCOPE_SUBGROUP_KHR;
-            });
-        };
         // AMD's driver also advertises the extension on GPUs without matrix cores (GCN, RDNA1,
         // RDNA2) and crashes in amdvlk64.dll building these pipelines on RDNA2. RDNA3 brought
         // matrix cores together with accelerated mixed-signedness dot4, which the driver reports.
@@ -1727,6 +1715,20 @@ void Device::RemoveUnsuitableExtensions() {
                             features.vulkan_memory_model.vulkanMemoryModelDeviceScope &&
                             extensions.subgroup_size_control &&
                             features.subgroup_size_control.computeFullSubgroups;
+        // Gated-off devices are not asked for their shapes.
+        const auto shapes = usable ? physical.GetCooperativeMatrixPropertiesKHR()
+                                   : std::vector<VkCooperativeMatrixPropertiesKHR>{};
+        const auto has_shape = [&](u32 columns) {
+            return std::ranges::any_of(shapes, [=](const VkCooperativeMatrixPropertiesKHR& shape) {
+                return shape.MSize == 16 && shape.NSize == columns && shape.KSize == 16 &&
+                       shape.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                       shape.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                       shape.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                       shape.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                       shape.saturatingAccumulation == VK_FALSE &&
+                       shape.scope == VK_SCOPE_SUBGROUP_KHR;
+            });
+        };
         cooperative_hmma_16x8x16 =
             usable && has_shape(8) &&
             (properties.subgroup_properties.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
