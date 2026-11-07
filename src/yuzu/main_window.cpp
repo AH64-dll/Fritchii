@@ -374,6 +374,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     Common::FS::CreateEdenPaths();
     this->config = std::make_unique<QtConfig>();
+    MigrateFriztiSettings();
 
     Common::Log::Filter filter;
     filter.ParseFilterString(Settings::values.log_filter.GetValue());
@@ -565,6 +566,29 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     if (!launched_with_game && !Settings::values.oot_fps_asked.GetValue()) {
         QTimer::singleShot(0, this, &MainWindow::AskOotFrameRate);
     }
+}
+
+// Frizti builds change the defaults Ocarina of Time needs, but a default only reaches a config
+// that never saved its own value, and older Lichii builds saved (seeded) theirs. Once per
+// revision, set the tuned values; later changes by the player are kept.
+void MainWindow::MigrateFriztiSettings() {
+    constexpr u32 Revision = 1;
+    const u32 applied = Settings::values.frizti_settings_revision.GetValue();
+    if (applied >= Revision) {
+        return;
+    }
+    LOG_INFO(Frontend, "Frizti settings revision {} -> {}: applying the tuned settings", applied,
+             Revision);
+    Settings::values.gpu_accuracy.SetValue(Settings::GpuAccuracy::Low);
+    Settings::values.dma_accuracy.SetValue(Settings::DmaAccuracy::Default);
+    Settings::values.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Default);
+    Settings::values.vsync_mode.SetValue(Settings::VSyncMode::Mailbox);
+    Settings::values.async_presentation.SetValue(true);
+    Settings::values.use_asynchronous_shaders.SetValue(true);
+    Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Docked);
+    Settings::values.memory_layout_mode.SetValue(Settings::MemoryLayout::Memory_8Gb);
+    Settings::values.frizti_settings_revision.SetValue(Revision);
+    config->SaveAllValues();
 }
 
 void MainWindow::AskOotFrameRate() {

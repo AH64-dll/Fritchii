@@ -376,6 +376,8 @@ private slots:
     void OnConfigure();
     /// Asks whether Ocarina of Time runs at 60 or 30 FPS (Settings::values.oot_30fps).
     void AskOotFrameRate();
+    /// Applies the Frizti tuned settings once per revision (frizti_settings_revision).
+    void MigrateFriztiSettings();
     void OnConfigureTas();
     void OnDecreaseVolume();
     void OnIncreaseVolume();
