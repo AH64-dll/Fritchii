@@ -377,10 +377,7 @@ private:
     /// The accuracy can change while the game runs (settings dialog, Settings::UpdateGPUAccuracy
     /// at each command list end): callers read it once per decision.
     static bool DelayFences() {
-        const bool level_high = VideoCore::Nx2Debug::AccuratePart(16);
-        return Settings::IsGPUFenceBehaviorDefault()
-                   ? level_high
-                   : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
+        return VideoCore::Nx2Debug::DelayedFences();
     }
 
     bool ShouldWait() const {

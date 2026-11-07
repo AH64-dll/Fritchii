@@ -75,6 +75,14 @@ inline std::atomic<int> g_dma_snapshot{-1};
     return Settings::IsGPULevelHigh() || (parts & part) != 0;
 }
 
+/// Whether fences run their callbacks (fence-timed releases among them) once the host GPU passed
+/// the work before them, not when made (FenceManager::DelayFences).
+[[nodiscard]] inline bool DelayedFences() {
+    return Settings::IsGPUFenceBehaviorDefault()
+               ? AccuratePart(16)
+               : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
+}
+
 /// EDEN_NX2_HOST_PACE: the host frame pacer (vk_host_pacer.h). 1 = on (default), 0 = only
 /// measure how long each frame was shown.
 inline std::atomic<int> g_host_pace{-1};
@@ -93,6 +101,9 @@ inline std::atomic<int> g_host_pace{-1};
 /// them once it ran them (the read waits for that much); 2 = the same, but a dispatch still
 /// queued drains as before. +4 (5, 6): compute report semaphores noted as before, 16 bytes or
 /// anything when unmapped (GpuSplit::NoteReleaseWriter).
+/// EXP12 (EDEN_NX2_SEM_FAST acquires read current but unmet, puller.cpp ReleaseFencesForReadable):
+/// 1 = their fence release waits only for the queued writers the read can't account for, full
+/// drain only if still unmet; 2 = suspend then too, without the full drain; 3 = measure only.
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 

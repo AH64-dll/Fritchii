@@ -55,6 +55,7 @@ enum class DrainSite : u32 {
     FrontVerify,    ///< EDEN_NX2_FRONT_VERIFY
     MacroDmaCheck,  ///< EDEN_NX2_CMDPAGE_DIAG: a macro's memory read repeated after a full drain
     DispatchWait,   ///< EXP10: a macro memory read waits for the dispatches sent since it flushed
+    FenceWriters,   ///< EXP12: a fence release waits for the writers a semaphore read can't see
     Count,
 };
 
@@ -63,7 +64,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma writes",
     "macro dma flush",
     "gp sync fence", "map",           "front start", "front verify",  "macro dma check",
-    "macro dma dispatch",
+    "macro dma dispatch", "fence writers",
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -633,6 +634,20 @@ public:
     /// after that release, so an acquire it meets needs no drain. EDEN_NX2_ACQUIRE_QUEUED=0 off.
     /// `miss` (when no payload): 1 no release recorded, 2 it already ran, 3 a later write.
     std::optional<u32> QueuedReleasePayload(u64 device, GPUVAddr address, u32* miss = nullptr);
+    /// EXP12: the ring position past the queued work that may write the u32 at `device` without
+    /// the front knowing its words, so a semaphore read that waits for or overlays the noted
+    /// writes (EDEN_NX2_SEM_FAST) can't account for it: compute and copies (their QMD and report
+    /// releases among them), unranged writers, a release recorded for the word, and queued
+    /// functions (maps). Draws that store to the word mark its page GPU-written once they ran.
+    [[nodiscard]] u64 UntrackedWriterPosition(u64 device) const {
+        u64 target =
+            (std::max)({last_writer_position, last_unranged_position, last_function_position});
+        if (const QueuedRelease& release = queued_releases[(device >> 2) % queued_releases.size()];
+            release.device == device) {
+            target = (std::max)(target, release.position);
+        }
+        return (std::min)(target, write_position);
+    }
     /// The entry just sent also writes [address, address + size) of `memory`, noted by device
     /// page (other mappings may alias it, and the caches keep state per page).
     void NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size);

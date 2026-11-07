@@ -387,9 +387,131 @@ void ReleaseFences(DmaPusher& dma_pusher) {
               VideoCommon::DrainSite::FenceRelease);
 }
 
+// EDEN_NX2_EXP12: the fence releases of acquires whose word the front read current but unmet
+// (ReleaseFencesForReadable), logged every 5 s. Front thread only.
+struct FenceWriterStats {
+    using Clock = std::chrono::steady_clock;
+
+    u64 acquires{};   ///< Readable acquires unmet before their fence release
+    u64 delayed{};    ///< With EXP12 on, not applied: fences are delayed (GPU accuracy High)
+    u64 waits{};      ///< Waits for the back to run the writers the read can't account for
+    u64 wait_ns{};
+    u64 met{};        ///< Met once the back ran those writers
+    u64 full{};       ///< Full drains (EXP12 0 or 3, 1 when still unmet)
+    u64 full_ns{};    ///< Their time (from the target on, when there was one)
+    u64 full_met{};   ///< Met after the full drain
+    u64 suspended{};  ///< EXP12=2: unmet, suspended without the full drain
+    u64 saved_ns{};   ///< EXP12=3: the full drains' time past the target, of acquires met there
+    u64 resumed{};    ///< Readable acquires suspended after their fence release, resumed since
+    u64 resume_ns{};  ///< Their time from the acquire to the resume
+    Clock::time_point since{};
+
+    static FenceWriterStats& Get() {
+        static FenceWriterStats stats;
+        return stats;
+    }
+
+    static u64 Nanoseconds(Clock::time_point begin, Clock::time_point end) {
+        return static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+    }
+
+    void Tick() {
+        const auto now = Clock::now();
+        if (since == Clock::time_point{}) {
+            since = now;
+            return;
+        }
+        const double window = std::chrono::duration<double>(now - since).count();
+        if (window < 5.0) {
+            return;
+        }
+        const auto rate = [window](u64 count) { return static_cast<double>(count) / window; };
+        const auto ms = [window](u64 ns) { return static_cast<double>(ns) / 1e6 / window; };
+        LOG_INFO(HW_GPU,
+                 "Fence writer waits (EXP12={}): {:.0f} readable acquires/s unmet before their "
+                 "fence release ({:.0f}/s not applied, delayed fences); writer waits {:.0f}/s "
+                 "{:.2f} ms/s, met there {:.0f}/s; full drains {:.0f}/s {:.2f} ms/s, met after "
+                 "them {:.0f}/s; suspended without one {:.0f}/s; full drain past the writers of "
+                 "acquires met there (EXP12=3) {:.2f} ms/s; resumed {:.0f}/s, {:.0f} us from "
+                 "acquire to resume",
+                 VideoCore::Nx2Debug::Experiment(12), rate(acquires), rate(delayed), rate(waits),
+                 ms(wait_ns), rate(met), rate(full), ms(full_ns), rate(full_met), rate(suspended),
+                 ms(saved_ns), rate(resumed),
+                 resumed != 0 ? static_cast<double>(resume_ns) / 1e3 / resumed : 0.0);
+        *this = {};
+        since = now;
+    }
+};
+
 } // Anonymous namespace
 
 static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& word);
+
+// The fence release of an acquire whose word SemaphoreReadableNow read current but unmet: the
+// drain only matters for writes that read can't account for. Returns whether the acquire is met.
+// EDEN_NX2_EXP12 (live, 0 = off): the back first runs only the queued work that may write the
+// word without the front knowing its words (GpuSplit::UntrackedWriterPosition: compute and
+// copies, with their QMD and report releases, unranged writers, a release recorded for the word,
+// queued functions), the fence release queued behind everything as before. 1 = met there: go
+// on, the fences released on the back in order; still unmet: the full drain as before.
+// 2 = unmet there too suspends without the full drain (the channel polls as usual). 3 = the full
+// drain always, timed past that point (measures what 1 saves). Not with delayed fences, whose
+// releases land when the host GPU passed them, not when the back runs them.
+static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
+                                     const Puller::PendingAcquire& acquire) {
+    using Clock = FenceWriterStats::Clock;
+    auto& stats = FenceWriterStats::Get();
+    const auto met = [&] {
+        u32 word{};
+        return Nx2SemaphoreWaiters::Get().Latched(owner) ||
+               (SemaphoreReadableNow(dma_pusher, acquire.address, word) && acquire.Matches(word));
+    };
+    ++stats.acquires;
+    const int mode = VideoCore::Nx2Debug::Experiment(12);
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (mode <= 0 || mode > 3 || !device || !split.Active() ||
+        VideoCore::Nx2Debug::DelayedFences()) {
+        stats.delayed += mode != 0 ? 1 : 0;
+        const auto begin = Clock::now();
+        ReleaseFences(dma_pusher);
+        const bool result = met();
+        ++stats.full;
+        stats.full_ns += FenceWriterStats::Nanoseconds(begin, Clock::now());
+        stats.full_met += result ? 1 : 0;
+        stats.Tick();
+        return result;
+    }
+    const u64 target = split.UntrackedWriterPosition(*device);
+    split.Defer([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+    split.NoteMemoryWrite();
+    const auto begin = Clock::now();
+    if (split.WaitUntil(target, VideoCommon::DrainSite::FenceWriters)) {
+        ++stats.waits;
+    }
+    const auto reached = Clock::now();
+    stats.wait_ns += FenceWriterStats::Nanoseconds(begin, reached);
+    const bool met_there = met();
+    stats.met += met_there ? 1 : 0;
+    if (mode == 3 || (mode == 1 && !met_there)) {
+        split.Drain(VideoCommon::DrainSite::FenceRelease);
+        const u64 ns = FenceWriterStats::Nanoseconds(reached, Clock::now());
+        const bool result = met();
+        ++stats.full;
+        stats.full_ns += ns;
+        stats.full_met += result ? 1 : 0;
+        stats.saved_ns += mode == 3 && met_there ? ns : 0;
+        stats.Tick();
+        return result;
+    }
+    // A host-level wait for the commands after it, as the drain was; the fences go out at once.
+    split.NoteSync();
+    split.Publish();
+    stats.suspended += met_there ? 0 : 1;
+    stats.Tick();
+    return met_there;
+}
 
 bool Puller::PendingAcquire::Matches(u32 current) const {
     switch (static_cast<GpuSemaphoreOperation>(operation)) {
@@ -497,6 +619,12 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // counting those made the count odd ("suspended") at random, so submit-time snapshots were
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
+        if (pending_acquire->readable_release) {
+            auto& stats = FenceWriterStats::Get();
+            ++stats.resumed;
+            stats.resume_ns += FenceWriterStats::Nanoseconds(
+                pending_acquire->since, FenceWriterStats::Clock::now());
+        }
         pending_acquire.reset();
         dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
         Nx2SemaphoreWaiters::Get().Remove(this);
@@ -719,14 +847,17 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
             waiters.Add(this, *device, acquire.value, acquire.operation);
         }
-        ReleaseFences(dma_pusher);
-        const bool met_now = readable
-                                 ? (SemaphoreReadableNow(dma_pusher, acquire.address, word) &&
-                                    acquire.Matches(word))
-                                 : acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address));
+        bool met_now;
+        if (readable) {
+            met_now = ReleaseFencesForReadable(dma_pusher, this, acquire);
+        } else {
+            ReleaseFences(dma_pusher);
+            met_now = acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address));
+        }
         if (!waiters.Latched(this) && !met_now) {
             pending_acquire = acquire;
             pending_acquire->last_drain = std::chrono::steady_clock::now();
+            pending_acquire->readable_release = readable;
             dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
             record(AcquireTrace::Suspended);

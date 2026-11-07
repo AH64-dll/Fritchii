@@ -83,6 +83,8 @@ public:
         u32 unmet_polls{};
         /// When the back was last drained for this acquire: registration, then every drained poll.
         std::chrono::steady_clock::time_point last_drain{};
+        /// Suspended after the fence release of a word read current (EXP12's resume counts).
+        bool readable_release{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };
