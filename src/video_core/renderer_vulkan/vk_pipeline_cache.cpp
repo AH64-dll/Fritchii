@@ -1368,6 +1368,14 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         return;
     }
     if (!pipeline_cache_filename.empty()) {
+        // A later load (another title or program) stops the earlier warm-ups and waits for them,
+        // so StartComputeWarm and StartGraphicsWarm can start this title's and warm_cancel is
+        // only cleared once no thread of the earlier load is left.
+        warm_cancel = true;
+        graphics_warm_threads.clear();
+        compute_warm_threads.clear();
+        warm_stop_callback.reset();
+        compute_warm_done = true;
         serialization_thread.WaitForRequests();
         if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
             SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
