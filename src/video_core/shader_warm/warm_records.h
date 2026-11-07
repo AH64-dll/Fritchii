@@ -12,13 +12,16 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/pipeline_cache_files.h"
 
 namespace VideoCommon::ShaderWarm {
 
 /// Warm file records, byte for byte what tools/nx2/make_compute_warm.py and
 /// tools/nx2/make_graphics_warm.py write (their headers document every field and guess).
 
-constexpr u32 WarmCacheVersion = 53;
+/// Warm files and the runtime caches they are built from use the pipeline cache version: the
+/// emulator loads a warm file only when it matches, so the two must move together.
+constexpr u32 WarmCacheVersion = VideoCommon::VulkanPipelineCacheVersion;
 constexpr size_t GraphicsKeySize = 1056;
 constexpr size_t AttributeTypesOffset = 112;
 /// Per slot most common nonzero vertex attribute type, a default measured on one test title (see
