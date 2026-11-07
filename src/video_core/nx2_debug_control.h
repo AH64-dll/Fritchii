@@ -120,6 +120,9 @@ inline void LoadExperiments() {
         // that may have written them (EDEN_NX2_DMA_SNAPSHOT=10 verify: 0 differed in 2 x 90 s
         // walking). GPU front idle 81 -> 105 ms/s, waits for the back 368 -> 338 ms/s.
         g_experiments[10].store(1, std::memory_order_relaxed);
+        // EXP14: unchanged macro register writes dropped before FrontWrite's other checks.
+        // Castle Town, profile toggle: front macro 250 -> 236 ms/s, push 77 -> 70 ms/s.
+        g_experiments[14].store(1, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {

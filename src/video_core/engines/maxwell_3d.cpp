@@ -1081,6 +1081,7 @@ struct Maxwell3D::FrontState {
     bool instance_loop{};
     /// EDEN_NX2_EXP2, read in Front(): same-value index_buffer.first writes are not sent.
     int same_experiment{};
+    int early_same{}; ///< EXP14, read once per front call like same_experiment
     /// An inline or small index draw (which binds an index buffer not taken from the registers)
     /// was sent since the last index_buffer.count write. Starts set: nothing is known.
     bool other_index_draw{true};
@@ -1229,6 +1230,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         front_macros = true;
     }
     front->same_experiment = VideoCore::Nx2Debug::Experiment(2);
+    front->early_same = VideoCore::Nx2Debug::Experiment(14);
     return *front;
 }
 
@@ -1312,6 +1314,16 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         fs.shadow[method] = argument;
     } else if (fs.control == Regs::ShadowRamControl::Replay) {
         value = fs.shadow[method];
+    }
+    // EXP14: an unchanged state register (6.6M of Ocarina's 11.4M macro writes a second) is
+    // dropped before the checks below, as the same-value skip further down would.
+    if (!execution_mask[method] && fs.regs[method] == value && shadow_kept && fs.skip_same &&
+        fs.same_experiment == 0 && fs.early_same != 0) [[likely]] {
+        if (Profile::Enabled()) [[unlikely]] {
+            Profile::Add(Profile::Counter::MethodWrites, 1);
+            Profile::Add(Profile::Counter::SameValueWrites, 1);
+        }
+        return;
     }
     if (Profile::Enabled()) [[unlikely]] {
         Profile::Add(Profile::Counter::MethodWrites, 1);
