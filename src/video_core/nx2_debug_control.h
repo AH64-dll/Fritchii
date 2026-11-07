@@ -104,6 +104,9 @@ inline std::atomic<int> g_host_pace{-1};
 /// EXP12 (EDEN_NX2_SEM_FAST acquires read current but unmet, puller.cpp ReleaseFencesForReadable):
 /// 1 = their fence release waits only for the queued writers the read can't account for, full
 /// drain only if still unmet; 2 = suspend then too, without the full drain; 3 = measure only.
+/// EXP17 = 1: a small streamed uniform buffer binds again any stage or slot's copy of the same
+/// guest range made in the current command buffer, when the bytes still match
+/// (BindSmallUniformReusing; zortos293/Lichii#641 EDEN_NX2_UBO_RANGE_REUSE).
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 

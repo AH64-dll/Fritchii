@@ -1676,10 +1676,12 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
             // The same bytes as this slot's previous bind, in the same command buffer: bind that
             // stream allocation again instead of allocating and copying (uniform_stream_reuse.h).
-            // EDEN_NX2_UBOREUSE=0 turns it off.
+            // EDEN_NX2_UBOREUSE=0 turns it off. EDEN_NX2_EXP17=1: any stage or slot's copy of
+            // the same range is bound again too.
             if (VideoCommon::UniformStreamReuseEnabled()) {
                 streamed = VideoCommon::BindSmallUniformReusing(
-                    runtime, device_memory, stage, index, binding_index, device_addr, size);
+                    runtime, device_memory, stage, index, binding_index, device_addr, size,
+                    VideoCore::Nx2Debug::Experiment(17) != 0);
             }
         }
         if (!streamed) {
