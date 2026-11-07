@@ -1236,7 +1236,8 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
         auto rebuilt{CreateComputePipeline(key, shader, entry.mapped_pointers)};
         if (rebuilt.pipeline) {
             if (entry.pipeline) {
-                retired_compute_pipelines.push_back(std::move(entry.pipeline));
+                retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                       std::move(entry.pipeline));
             }
             rebuilt.rebuilds = entry.rebuilds + 1;
             entry = std::move(rebuilt);
@@ -1659,6 +1660,10 @@ void PipelineCache::TickFrame() {
     ++frame_count;
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
         evicted_pipelines.pop_front();
+    }
+    while (!retired_compute_pipelines.empty() &&
+           scheduler.IsFree(retired_compute_pipelines.front().first)) {
+        retired_compute_pipelines.pop_front();
     }
     constexpr u64 EvictCheckFrames = 600;
     if (frame_count % EvictCheckFrames == 0) {
