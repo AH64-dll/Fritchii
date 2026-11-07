@@ -107,6 +107,7 @@ add_executable(tests
     common/ring_buffer.cpp
     common/scratch_buffer.cpp
     common/slot_vector.cpp
+    common/thread_pinning.cpp
     common/undefined_fix.cpp
     common/unique_function.cpp
     common/zstd_compression.cpp

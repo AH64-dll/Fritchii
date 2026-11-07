@@ -22,6 +22,7 @@
 #include "common/nx2_sample_profile.h"
 #include "common/assert.h"
 #include "common/thread.h"
+#include "common/thread_pinning.h"
 #ifdef __APPLE__
 #include <mach/mach.h>
 #elif defined(__HAIKU__)
@@ -567,6 +568,45 @@ std::vector<KAFFINITY> GroupZeroMasks(LOGICAL_PROCESSOR_RELATIONSHIP relation) {
 
 /// Logical processors PinCurrentThread gave the GPU front and back threads.
 std::atomic<u64> pinned_gpu_mask{};
+
+Common::ThreadPinning::Topology ReadPinningTopology() {
+    Common::ThreadPinning::Topology topology;
+    DWORD length = 0;
+    GetLogicalProcessorInformationEx(RelationAll, nullptr, &length);
+    std::vector<u8> buffer(length);
+    if (length == 0 ||
+        !GetLogicalProcessorInformationEx(
+            RelationAll, reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data()),
+            &length)) {
+        return topology;
+    }
+    for (DWORD offset = 0; offset < length;) {
+        const auto* entry = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
+            buffer.data() + offset);
+        if (entry->Size == 0) {
+            break;
+        }
+        if (entry->Relationship == RelationProcessorCore) {
+            const PROCESSOR_RELATIONSHIP& core = entry->Processor;
+            for (WORD i = 0; i < core.GroupCount; ++i) {
+                topology.logical_processors +=
+                    static_cast<u32>(std::popcount(static_cast<u64>(core.GroupMask[i].Mask)));
+            }
+            if (core.GroupCount > 0 && core.GroupMask[0].Group == 0) {
+                topology.cores.push_back(
+                    {static_cast<u64>(core.GroupMask[0].Mask), core.EfficiencyClass});
+            }
+        } else if (entry->Relationship == RelationCache) {
+            const CACHE_RELATIONSHIP& cache = entry->Cache;
+            if (cache.Level == 3 && cache.Type != CacheInstruction &&
+                cache.GroupMask.Group == 0) {
+                topology.l3.push_back({static_cast<u64>(cache.GroupMask.Mask), cache.CacheSize});
+            }
+        }
+        offset += entry->Size;
+    }
+    return topology;
+}
 } // Anonymous namespace
 #endif
 
@@ -679,40 +719,40 @@ void SetCurrentThreadToPerformanceCores() {
 
 void PinCurrentThread(PinnedRole role) {
 #ifdef _WIN32
-    // Off with EDEN_NX2_PIN_THREADS=0. On by default with 6 or more physical cores: the split's
-    // back did about 8% more draws a second at Lake Hylia (Ryzen 7 7800X3D), its worst window
-    // 29 -> 54 fps, once no SMT sibling shared its core.
-    static const char* const setting = std::getenv("EDEN_NX2_PIN_THREADS");
-    if (setting != nullptr && setting[0] == '0') {
-        return;
-    }
-    // Physical cores of processor group 0, as masks of their logical processors.
-    static const std::vector<KAFFINITY> cores = GroupZeroMasks(RelationProcessorCore);
-    // Core 0 takes most interrupts: the GPU threads get cores 1 and 2.
-    if (cores.size() < (setting != nullptr && setting[0] == '1' ? 4U : 6U)) {
-        return;
-    }
-    const KAFFINITY front = cores[1];
-    const KAFFINITY back = cores[2];
-    KAFFINITY mask{};
+    // Off with EDEN_NX2_PIN_THREADS=0, forced with 1, otherwise on with enough performance cores
+    // (ThreadPinning::MakePlan): the split's back did about 8% more draws a second at Lake Hylia
+    // (Ryzen 7 7800X3D), its worst window 29 -> 54 fps, once no SMT sibling shared its core.
+    static const ThreadPinning::Plan plan = [] {
+        const auto mode = ThreadPinning::ParseMode(std::getenv("EDEN_NX2_PIN_THREADS"));
+        const ThreadPinning::Topology topology = ReadPinningTopology();
+        const ThreadPinning::Plan result = ThreadPinning::MakePlan(topology, mode);
+        LOG_INFO(Common, "Thread pinning: {}", ThreadPinning::Describe(result, topology, mode));
+        return result;
+    }();
+    u64 mask{};
     switch (role) {
     case PinnedRole::GpuFront:
-        mask = front;
+        mask = plan.front;
         break;
     case PinnedRole::GpuBack:
-        mask = back;
+        mask = plan.back;
         break;
     case PinnedRole::GuestCore:
-        for (const KAFFINITY core : cores) {
-            mask |= core;
-        }
-        mask &= ~(front | back);
+        mask = plan.guest;
         break;
     }
-    if (mask != 0 && SetThreadAffinityMask(GetCurrentThread(), mask) != 0 &&
-        role != PinnedRole::GuestCore) {
-        pinned_gpu_mask.fetch_or(mask, std::memory_order_relaxed);
+    if (mask != 0) {
+        GROUP_AFFINITY affinity{};
+        affinity.Mask = static_cast<KAFFINITY>(mask);
+        affinity.Group = 0;
+        if (!SetThreadGroupAffinity(GetCurrentThread(), &affinity, nullptr)) {
+            LOG_WARNING(Common, "Could not pin thread: {}", GetLastErrorMsg());
+        } else if (role != PinnedRole::GuestCore) {
+            pinned_gpu_mask.fetch_or(mask, std::memory_order_relaxed);
+        }
     }
+#else
+    (void)role;
 #endif
 }
 

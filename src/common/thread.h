@@ -109,8 +109,9 @@ void SetCurrentThreadPriority(ThreadPriority new_priority);
 void SetCurrentThreadName(const char* name);
 void SetCurrentThreadToPerformanceCores();
 
-/// EDEN_NX2_PIN_THREADS=1 (Windows): one physical core each for the split GPU thread's halves and
-/// the guest cores kept off them, so an SMT sibling never shares the GPU threads' core.
+/// Windows: one physical performance core each for the split GPU thread's halves and the guest
+/// cores kept off them, so an SMT sibling never shares the GPU threads' core. See
+/// ThreadPinning::MakePlan for when it applies; EDEN_NX2_PIN_THREADS=0 turns it off, 1 forces it.
 enum class PinnedRole : u32 { GpuFront, GpuBack, GuestCore };
 void PinCurrentThread(PinnedRole role);
 /// Windows: the processor group 0 logical processors background work should use to stay off the

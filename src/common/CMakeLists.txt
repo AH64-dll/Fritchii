@@ -126,6 +126,8 @@ add_library(
     swap.h
     thread.cpp
     thread.h
+    thread_pinning.cpp
+    thread_pinning.h
     nx2_sample_profile.cpp
     nx2_timeline.cpp
     nx2_timeline.h
