@@ -79,8 +79,48 @@ inline std::atomic<int> g_dma_snapshot{-1};
 /// measure how long each frame was shown.
 inline std::atomic<int> g_host_pace{-1};
 
+/// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
+/// slots for batches of fixes built together and A/B-tested in one session
+/// (E:\OotRemakeEmulation\work\EXPERIMENTS.md lists which fix uses which slot). 0 = off.
+inline constexpr int ExperimentCount = 64;
+inline std::atomic<int> g_experiments[ExperimentCount]{};
+
+inline void LoadExperiments() {
+    static const bool loaded = [] {
+        for (int n = 0; n < ExperimentCount; ++n) {
+            const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
+            if (const char* value = std::getenv(name.c_str())) {
+                g_experiments[n].store(std::atoi(value), std::memory_order_relaxed);
+            }
+        }
+        return true;
+    }();
+    static_cast<void>(loaded);
+}
+
+/// The value of experiment switch `n` (EDEN_NX2_EXP<n>), 0 unless set.
+[[nodiscard]] inline int Experiment(int n) {
+    LoadExperiments();
+    return g_experiments[n].load(std::memory_order_relaxed);
+}
+
 /// The live switch called `name`, or null.
 [[nodiscard]] inline std::atomic<int>* FindSwitch(std::string_view name) {
+    if (constexpr std::string_view prefix = "EDEN_NX2_EXP";
+        name.size() > prefix.size() && name.substr(0, prefix.size()) == prefix) {
+        int n = 0;
+        for (const char c : name.substr(prefix.size())) {
+            if (c < '0' || c > '9') {
+                return nullptr;
+            }
+            n = n * 10 + (c - '0');
+        }
+        if (n >= ExperimentCount) {
+            return nullptr;
+        }
+        LoadExperiments();
+        return &g_experiments[n];
+    }
     if (name == "EDEN_NX2_DMA_WAIT_WRITERS") {
         return &g_dma_wait_writers;
     }
