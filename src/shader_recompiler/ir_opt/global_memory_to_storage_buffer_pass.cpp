@@ -2165,7 +2165,7 @@ size_t StorageBufferLimit(const HostTranslateInfo& host_info) {
     return limit;
 }
 
-void JoinStorageInfo(Info& base, Info& source) {
+void JoinStorageInfo(Info& base, Info& source, size_t limit) {
     base.requires_coherent_global_memory |= source.requires_coherent_global_memory;
     base.native_global_bounds |= source.native_global_bounds;
     auto& descriptors = base.storage_buffers_descriptors;
@@ -2185,6 +2185,10 @@ void JoinStorageInfo(Info& base, Info& source) {
             }
             it->is_written |= desc.is_written;
             continue;
+        }
+        if (descriptors.size() >= limit) {
+            throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
+                                          descriptors.size() + 1, limit);
         }
         descriptors.push_back(desc);
     }

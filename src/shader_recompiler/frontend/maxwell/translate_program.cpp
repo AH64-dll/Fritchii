@@ -490,7 +490,7 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
 }
 
 IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b,
-                                    Environment& env_vertex_b) {
+                                    Environment& env_vertex_b, const HostTranslateInfo& host_info) {
     IR::Program result{};
     Optimization::VertexATransformPass(vertex_a);
     Optimization::VertexBTransformPass(vertex_b);
@@ -513,7 +513,9 @@ IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b
     result.info.stores.mask |= vertex_b.info.stores.mask;
 
     Optimization::JoinTextureInfo(result.info, vertex_b.info);
-    Optimization::JoinStorageInfo(result.info, vertex_b.info);
+    // The two halves are one stage: their storage buffers share its limit.
+    Optimization::JoinStorageInfo(result.info, vertex_b.info,
+                                  Optimization::StorageBufferLimit(host_info));
     Optimization::DeadCodeEliminationPass(result);
     if (Settings::values.renderer_debug) {
         Optimization::VerificationPass(result);

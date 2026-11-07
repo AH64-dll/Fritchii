@@ -1854,7 +1854,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             // VertexB path when VertexA is present.
             auto& program_va{programs[0]};
             auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
-            programs[index] = MergeDualVertexPrograms(program_va, program_vb, env);
+            programs[index] = MergeDualVertexPrograms(program_va, program_vb, env, host_info);
         }
 
         if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
