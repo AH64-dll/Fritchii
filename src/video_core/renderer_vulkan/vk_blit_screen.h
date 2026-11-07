@@ -46,6 +46,8 @@ struct FramebufferTextureInfo {
     u32 height{};
     u32 scaled_width{};
     u32 scaled_height{};
+    bool already_upscaled{};
+    bool anti_aliased{};
 };
 
 class BlitScreen {

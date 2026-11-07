@@ -52,11 +52,17 @@ public:
     ComputePipeline& operator=(const ComputePipeline&) = delete;
     ComputePipeline(const ComputePipeline&) = delete;
 
+    using BindCommand = std::function<void(vk::CommandBuffer)>;
+
     [[nodiscard]] bool Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                  Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
                                  BufferCache& buffer_cache, TextureCache& texture_cache,
                                  TextureCacheRuntime& texture_runtime,
-                                 std::optional<ByteAddressedShadow>& shadow);
+                                 std::optional<ByteAddressedShadow>& shadow,
+                                 BindCommand* deferred_bind = nullptr);
+
+    static constexpr u64 Ocarina1440pShader = 0x6bd913e1f34e83ebULL;
+    [[nodiscard]] bool CanReplaceOcarinaUpscale() const;
 
     bool IsBound() const noexcept {
         return static_cast<bool>(pipeline);

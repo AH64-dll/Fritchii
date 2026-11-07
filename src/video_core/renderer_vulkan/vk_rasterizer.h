@@ -255,6 +255,13 @@ private:
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
     void FrameDumpPass(const Framebuffer* framebuffer);
+#ifdef EGLANTINE_STREAMLINE
+    bool OcarinaDlssEnabled() const;
+    void TrackOcarinaCamera();
+    void TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect);
+    bool TryOcarinaDlss(const ComputePipeline& pipeline, bool replace);
+    void ReadOcarinaActor(struct OcarinaActorMesh& mesh);
+#endif
     /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
     bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
     /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
@@ -293,6 +300,35 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+#ifdef EGLANTINE_STREAMLINE
+    std::optional<u64> oot_camera_sample_frame;
+    struct OcarinaMotionTrace {
+        const Tegra::MemoryManager* camera_channel{};
+        const Tegra::MemoryManager* depth_channel{};
+        u64 depth_frame{};
+        GPUVAddr depth_address{};
+        u32 depth_tic{};
+        VkExtent2D extent{};
+        std::array<f32, 16> current{};
+        std::array<f32, 16> previous{};
+    } oot_motion;
+    std::unique_ptr<class OcarinaLiveDlss> oot_live_dlss;
+    bool oot_live_failed{};
+    const char* oot_fallback_reason{};
+    u32 oot_fallback_repeats{};
+    std::optional<u64> oot_dlss_frame;
+    std::optional<u64> oot_4k_scene_frame;
+    VkImage oot_4k_guest_present{};
+    struct OcarinaActorPose {
+        u64 frame{};
+        const Tegra::MemoryManager* channel{};
+        GPUVAddr vertex{};
+        GPUVAddr indices{};
+        s32 base_vertex{};
+        std::array<f32, 4> origin{};
+        std::array<f32, 280 * 12> bones{};
+    } oot_actor, oot_previous_actor;
+#endif
     u64 render_trace_frame = 0;
     u32 render_trace_draws = 0;
     u32 render_trace_clears = 0;

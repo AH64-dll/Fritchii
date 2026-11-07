@@ -344,11 +344,22 @@ void ComputePipeline::RunBuild() {
     build_task = nullptr;
 }
 
+bool ComputePipeline::CanReplaceOcarinaUpscale() const {
+    const bool known_shader =
+        shader_hash == 0xe40f5efb5480e692ULL || shader_hash == Ocarina1440pShader;
+    return known_shader && !info.stores_global_memory &&
+           info.image_buffer_descriptors.empty() && info.image_descriptors.size() == 1 &&
+           info.image_descriptors.front().count == 1 && info.image_descriptors.front().is_written &&
+           !info.image_descriptors.front().is_read && !info.image_descriptors.front().is_byte_addressed &&
+           std::ranges::none_of(info.storage_buffers_descriptors, &Shader::StorageBufferDescriptor::is_written);
+}
+
 bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                 Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
                                 BufferCache& buffer_cache, TextureCache& texture_cache,
                                 TextureCacheRuntime& texture_runtime,
-                                std::optional<ByteAddressedShadow>& shadow) {
+                                std::optional<ByteAddressedShadow>& shadow,
+                                BindCommand* deferred_bind) {
     shadow.reset();
     guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
 
@@ -453,7 +464,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
         return value && *value != '\0' && *value != '0';
     }();
-    if (record_sampled) {
+    if (record_sampled || deferred_bind) {
         sampled_images.clear();
         const size_t first = Shader::NumDescriptors(info.texture_buffer_descriptors) +
                              Shader::NumDescriptors(info.image_buffer_descriptors);
@@ -629,7 +640,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
 
     const bool bind_descriptor_buffer{
-        uses_descriptor_buffer && scheduler.UpdateDescriptorBufferChunk(descriptor_buffer_chunk)};
+        uses_descriptor_buffer &&
+        (deferred_bind || scheduler.UpdateDescriptorBufferChunk(descriptor_buffer_chunk))};
 
     if (shadow) {
         image_index = Shader::NumDescriptors(info.texture_buffer_descriptors) +
@@ -646,7 +658,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
 
     const bool is_rescaling = !info.texture_descriptors.empty() || !info.image_descriptors.empty();
-    scheduler.Record([this, descriptor_data, is_rescaling, descriptor_buffer_offset,
+    auto bind = [this, descriptor_data, is_rescaling, descriptor_buffer_offset,
                       descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
         if (bind_descriptor_buffer) {
@@ -680,7 +692,12 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0,
                                       descriptor_set, nullptr);
         }
-    });
+    };
+    if (deferred_bind) {
+        *deferred_bind = std::move(bind);
+    } else {
+        scheduler.Record(std::move(bind));
+    }
     return true;
 }
 

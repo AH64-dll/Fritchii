@@ -1,0 +1,32 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D scene_depth;
+layout(binding = 1, rg16f) uniform writeonly image2D motion;
+
+layout(push_constant, row_major) uniform Parameters {
+    mat4 clip_to_previous_clip;
+} params;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = imageSize(motion);
+    if (any(greaterThanEqual(pixel, extent))) {
+        return;
+    }
+
+    vec2 size = vec2(extent);
+    float depth = texelFetch(scene_depth, pixel, 0).r;
+    vec2 screen = (vec2(pixel) + 0.5) / size;
+    // The captured Zelda path is unjittered, with [-1, 1] clip depth and negative viewport height.
+    vec4 clip = vec4(screen * vec2(2, -2) + vec2(-1, 1), depth * 2 - 1, 1);
+    vec4 previous = params.clip_to_previous_clip * clip;
+    vec2 pixels = vec2(0);
+    if (depth >= 0 && depth <= 1 && previous.w > 1e-6) {
+        vec2 displacement = (previous.xy / previous.w - clip.xy) * vec2(0.5, -0.5) * size;
+        if (all(lessThanEqual(abs(displacement), vec2(65504)))) {
+            pixels = displacement;
+        }
+    }
+    imageStore(motion, pixel, vec4(pixels, 0, 0));
+}

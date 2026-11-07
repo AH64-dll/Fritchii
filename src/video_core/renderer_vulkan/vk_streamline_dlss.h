@@ -29,7 +29,7 @@ public:
     };
 
     struct Inputs {
-        Image color;          ///< Jittered linear colour at the render size.
+        Image color;          ///< Jittered colour at the render size.
         Image depth;          ///< Device depth (reversed) at the render size.
         Image motion_vectors; ///< Motion to the previous frame at the render size.
         VkExtent2D render_size;
@@ -39,6 +39,8 @@ public:
         /// Turns a motion vector into render pixels (the render size for UV offsets).
         std::array<f32, 2> motion_vector_scale;
         bool reset;
+        bool depth_inverted = true;
+        bool hdr = true; ///< Linear HDR colour. False for tonemapped, perceptually encoded colour.
     };
 
     /// Throws vk::Exception when Streamline has no DLSS for this device.
@@ -49,6 +51,10 @@ public:
     /// Records one evaluation into the output image (RGBA16F at the upscale size, GENERAL
     /// layout). Returns false when DLSS can't run, so the caller can fall back to FSR 3.1.
     bool Upscale(const Inputs& inputs);
+
+    [[nodiscard]] bool Failed() const noexcept {
+        return failed.load();
+    }
 
     [[nodiscard]] VkImage OutputImage() const noexcept {
         return *output_image;
@@ -70,6 +76,7 @@ private:
     void* set_options{}; ///< slDLSSSetOptions
     VkExtent2D render_extent{};
     VkExtent2D upscale_extent{};
+    bool hdr_input = true;
     u32 frame_index{};
     vk::Image output_image;
     vk::ImageView output_view;
