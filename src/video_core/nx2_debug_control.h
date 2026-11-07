@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/settings.h"
 
 /// Requests from the debug server (EDEN_NX2_DEBUG_SERVER, docs/nx2/debug-mcp.md) to the thread
 /// that owns the rasterizer. The server posts them from its own thread; RasterizerVulkan takes
@@ -61,6 +62,19 @@ inline std::atomic<int> g_loop_skip{-1};
 /// reads), 10 = on and verify every skipped read against the drained path, 0 = off.
 inline std::atomic<int> g_dma_snapshot{-1};
 
+/// EDEN_NX2_ACCURATE_PARTS (live switch, bit mask, 0 = none): parts of GPU accuracy High in Fast
+/// mode, the split GPU thread kept, to find which one stops a flicker that Accurate mode stops.
+/// 1 = counter reports written once their host query completes (synced), 2 = precise occlusion
+/// queries, 4 = CPU reads of GPU-written images download them, 8 = CPU writes flush GPU data
+/// before invalidating it, 16 = fences wait for the GPU work before them.
+inline std::atomic<int> g_accurate_parts{-1};
+
+/// Whether GPU accuracy High is on, or the EDEN_NX2_ACCURATE_PARTS bit `part` asks for it.
+[[nodiscard]] inline bool AccuratePart(int part) {
+    return Settings::IsGPULevelHigh() ||
+           (SwitchValue(g_accurate_parts, "EDEN_NX2_ACCURATE_PARTS") & part) != 0;
+}
+
 /// EDEN_NX2_HOST_PACE: the host frame pacer (vk_host_pacer.h). 1 = on (default), 0 = only
 /// measure how long each frame was shown.
 inline std::atomic<int> g_host_pace{-1};
@@ -78,6 +92,9 @@ inline std::atomic<int> g_host_pace{-1};
     }
     if (name == "EDEN_NX2_DMA_SNAPSHOT") {
         return &g_dma_snapshot;
+    }
+    if (name == "EDEN_NX2_ACCURATE_PARTS") {
+        return &g_accurate_parts;
     }
     if (name == "EDEN_NX2_LOOP_SKIP") {
         return &g_loop_skip;

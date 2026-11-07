@@ -14,6 +14,7 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "core/frontend/graphics_context.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/control/scheduler.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/gpu.h"
@@ -178,7 +179,7 @@ void ThreadManager::InvalidateRegion(DAddr addr, u64 size) {
 }
 
 void ThreadManager::FlushAndInvalidateRegion(DAddr addr, u64 size, bool is_async) {
-    if (Settings::IsGPULevelHigh()) {
+    if (VideoCore::Nx2Debug::AccuratePart(8)) {
         if (!is_async) {
             PushCommand(FlushRegionCommand(addr, size), false, is_async);
         } else {

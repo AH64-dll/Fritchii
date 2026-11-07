@@ -1776,7 +1776,7 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
             return true;
         }
     }
-    if (!Settings::IsGPULevelHigh()) {
+    if (!VideoCore::Nx2Debug::AccuratePart(4)) {
         return false;
     }
     if (True(which & VideoCommon::CacheType::TextureCache)) {
@@ -1990,7 +1990,7 @@ void RasterizerVulkan::ReleaseFences(bool force) {
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
                                                 VideoCommon::CacheType which) {
-    if (Settings::IsGPULevelHigh()) {
+    if (VideoCore::Nx2Debug::AccuratePart(8)) {
         FlushRegion(addr, size, which);
     }
     InvalidateRegion(addr, size, which);

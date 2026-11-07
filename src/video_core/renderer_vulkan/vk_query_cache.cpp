@@ -13,6 +13,7 @@
 #include "common/container/unordered_map.h"
 #include <utility>
 #include <vector>
+#include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "common/bit_util.h"
 #include "common/common_types.h"
@@ -175,7 +176,7 @@ public:
 
         scheduler.Record([query_pool = current_query_pool,
                                  query_index = current_bank_slot](vk::CommandBuffer cmdbuf) {
-            const bool use_precise = Settings::IsGPULevelHigh();
+            const bool use_precise = VideoCore::Nx2Debug::AccuratePart(2);
             cmdbuf.BeginQuery(query_pool, static_cast<u32>(query_index),
                               use_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
         });
