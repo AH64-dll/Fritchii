@@ -475,6 +475,67 @@ TEST_CASE("Loaded pointers that compete with a pair do not take the last storage
     CHECK(program.Count(IR::Opcode::LoadGlobal128) == 0);
 }
 
+TEST_CASE("Pointer table entries are charged only for bindings the first pass left free",
+          "[shader][storage_buffer]") {
+    // The loop reads its records through the table entry at *c0[0x30] or *c0[0x38], loaded before
+    // it. That load binds c0[0x30] and c0[0x38] in the first pass, and with 28 more pointers they
+    // leave a binding for each entry. The loop is collected first: charged for its holder as well,
+    // the first entry shut out the second, as Ocarina of Time's foliage culling compute
+    // 331e607152ce78d5 bound 4 of its 8 per-type instance tables.
+    KernelProgram fixture;
+    fixture.env.native = true;
+    fixture.entry.AddBranch(&fixture.loop);
+    fixture.loop.AddBranch(&fixture.loop);
+    fixture.program.blocks = {&fixture.entry, &fixture.loop};
+    fixture.program.post_order_blocks = {&fixture.loop, &fixture.entry};
+    IR::IREmitter entry{fixture.entry};
+    const IR::U32 lane{entry.LocalInvocationIdX()};
+    const IR::U1 first{entry.ILessThan(lane, entry.Imm32(16), false)};
+    const IR::U32 holder_low{entry.Select(first, Word(entry, 0x30), Word(entry, 0x38))};
+    const IR::U32 holder_high{entry.Select(first, Word(entry, 0x34), Word(entry, 0x3c))};
+    const IR::Value table{entry.LoadGlobal64(Address(entry, holder_low, holder_high))};
+    for (u32 slot = 0; slot < Shader::Info::MAX_SSBOS - 4; ++slot) {
+        const u32 offset{0x100 + slot * 8};
+        static_cast<void>(
+            entry.LoadGlobal32(Address(entry, Word(entry, offset), Word(entry, offset + 4))));
+    }
+    IR::IREmitter body{fixture.loop};
+    const IR::U32 record{body.IAdd(IR::U32{body.CompositeExtract(table, 0)},
+                                   body.ShiftLeftLogical(lane, body.Imm32(4)))};
+    static_cast<void>(
+        body.LoadGlobal128(Address(body, record, IR::U32{body.CompositeExtract(table, 1)})));
+
+    CHECK(fixture.TrackedOffsets().size() == Shader::Info::MAX_SSBOS);
+    CHECK(std::ranges::count_if(fixture.program.info.storage_buffers_descriptors,
+                                [](const auto& desc) { return desc.indirect_offset != ~0U; }) == 2);
+}
+
+TEST_CASE("Pointer table entries that would overflow the storage buffers are left out",
+          "[shader][storage_buffer]") {
+    // Records at c0[0x30] or in the table *c0[0x38], at an offset c0[0x40] the environment cannot
+    // tell from a pointer. The table entry competes with the pair, so with it the access binds
+    // every candidate, c0[0x40] too: 33 storage buffers with 29 more pointers. The program keeps
+    // the 30 of the pass without table entries.
+    KernelProgram fixture;
+    fixture.env.native = true;
+    IR::IREmitter ir{fixture.entry};
+    const IR::Value table{
+        ir.LoadGlobal64(ir.PackUint2x32(ir.GetCbuf(ir.Imm32(0), ir.Imm32(0x38), 64, false)))};
+    const IR::U1 direct{ir.ILessThan(ir.LocalInvocationIdX(), ir.Imm32(16), false)};
+    const IR::U32 low{ir.Select(direct, Word(ir, 0x30), IR::U32{ir.CompositeExtract(table, 0)})};
+    const IR::U32 high{ir.Select(direct, Word(ir, 0x34), IR::U32{ir.CompositeExtract(table, 1)})};
+    static_cast<void>(ir.LoadGlobal128(Address(ir, ir.IAdd(low, Word(ir, 0x40)), high)));
+    for (u32 slot = 0; slot < Shader::Info::MAX_SSBOS - 3; ++slot) {
+        const u32 offset{0x100 + slot * 8};
+        static_cast<void>(ir.LoadGlobal32(Address(ir, Word(ir, offset), Word(ir, offset + 4))));
+    }
+
+    CHECK(fixture.TrackedOffsets().size() == Shader::Info::MAX_SSBOS - 2);
+    CHECK_FALSE(fixture.program.info.native_global_bounds);
+    CHECK(std::ranges::none_of(fixture.program.info.storage_buffers_descriptors,
+                               [](const auto& desc) { return desc.indirect_offset != ~0U; }));
+}
+
 TEST_CASE("NVN fallback descriptors use guest slots rather than compact binding indices",
           "[shader][storage_buffer]") {
     Shader::Info info{};
