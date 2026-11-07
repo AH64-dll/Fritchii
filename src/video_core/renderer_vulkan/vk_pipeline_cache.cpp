@@ -837,7 +837,8 @@ bool PreloadAllPipelines() {
 } // Anonymous namespace
 
 PipelineCache::~PipelineCache() {
-    // Stop the warm-up first: its builds use the members below.
+    // Stop the warm-ups first: their builds use the members below.
+    graphics_warm_threads.clear();
     compute_warm_threads.clear();
     StopBackgroundPipelines();
     workers.WaitForRequests();
@@ -1683,6 +1684,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
     if (!stop_loading.stop_requested()) {
         StartComputeWarm();
+        StartGraphicsWarm();
     }
 }
 
@@ -1752,6 +1754,7 @@ void PipelineCache::StartComputeWarm() {
     static const GuessMissing guess{};
     constexpr size_t NumThreads = 4;
     progress->running = NumThreads;
+    compute_warm_done = false;
     LOG_INFO(Render_Vulkan, "Nx2Perf compute_warm: {} programs to build on {} low priority threads",
              entries->size(), NumThreads);
     for (size_t thread = 0; thread < NumThreads; ++thread) {
@@ -1784,6 +1787,7 @@ void PipelineCache::StartComputeWarm() {
                 }
             }
             if (progress->running.fetch_sub(1) == 1) {
+                compute_warm_done = true;
                 LOG_INFO(Render_Vulkan,
                          "Nx2Perf compute_warm: finished, {} built, {} failed, {} not reached, "
                          "{:.0f} s",
@@ -1792,6 +1796,122 @@ void PipelineCache::StartComputeWarm() {
                                                     progress->built + progress->failed),
                          std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                                        progress->begin)
+                             .count());
+            }
+        });
+    }
+}
+
+void PipelineCache::StartGraphicsWarm() {
+    const char* const path = std::getenv("EDEN_NX2_GRAPHICS_WARM");
+    if (path == nullptr || *path == '\0' || !graphics_warm_threads.empty() ||
+        !device.IsExtGraphicsPipelineLibrarySupported()) {
+        return;
+    }
+    // Streamed: the file is 1.5 GB; workers take the next entry under the reader's lock.
+    struct Reader {
+        std::mutex mutex;
+        std::ifstream file;
+        std::streampos end{};
+        bool failed{};
+        std::atomic<size_t> built{};
+        std::atomic<size_t> failed_builds{};
+        std::atomic<size_t> running{};
+        std::chrono::steady_clock::time_point begin{};
+    };
+    auto reader = std::make_shared<Reader>();
+    try {
+        reader->file.open(std::filesystem::path{path}, std::ios::binary | std::ios::ate);
+        if (!reader->file.is_open()) {
+            LOG_WARNING(Render_Vulkan, "Nx2Perf graphics_warm: cannot open {}", path);
+            return;
+        }
+        reader->file.exceptions(std::ifstream::failbit);
+        reader->end = reader->file.tellg();
+        reader->file.seekg(0, std::ios::beg);
+        std::array<char, 8> magic{};
+        u32 version{};
+        reader->file.read(magic.data(), magic.size())
+            .read(reinterpret_cast<char*>(&version), sizeof(version));
+        constexpr std::array<char, 8> expected_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
+        if (magic != expected_magic || version != CACHE_VERSION) {
+            LOG_WARNING(Render_Vulkan, "Nx2Perf graphics_warm: {} is not a version {} file",
+                        path, CACHE_VERSION);
+            return;
+        }
+    } catch (const std::exception& e) {
+        LOG_WARNING(Render_Vulkan, "Nx2Perf graphics_warm: opening {} failed: {}", path,
+                    e.what());
+        return;
+    }
+    constexpr size_t NumThreads = 4;
+    reader->running = NumThreads;
+    LOG_INFO(Render_Vulkan,
+             "Nx2Perf graphics_warm: {} ({} MB) queued on {} low priority threads, starts after "
+             "the compute warm-up",
+             path, static_cast<long long>(reader->end) / (1024 * 1024), NumThreads);
+    for (size_t thread = 0; thread < NumThreads; ++thread) {
+        graphics_warm_threads.emplace_back([this, reader](std::stop_token stop) {
+            Common::SetCurrentThreadName("VkGraphicsWarm");
+            Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+            while (!stop.stop_requested() && !compute_warm_done) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{200});
+            }
+            {
+                std::scoped_lock lock{reader->mutex};
+                if (reader->begin == std::chrono::steady_clock::time_point{}) {
+                    reader->begin = std::chrono::steady_clock::now();
+                }
+            }
+            static const GuessMissing guess{};
+            GraphicsPipelineLibraryCache::SetNoRetainOnThisThread(true);
+            ShaderPools pools;
+            while (!stop.stop_requested()) {
+                FileEnvironment env;
+                GraphicsPipelineCacheKey key{};
+                {
+                    std::scoped_lock lock{reader->mutex};
+                    if (reader->failed || reader->file.tellg() == reader->end) {
+                        break;
+                    }
+                    try {
+                        u32 num_envs{};
+                        reader->file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+                        if (num_envs != 1) {
+                            LOG_WARNING(Render_Vulkan,
+                                        "Nx2Perf graphics_warm: unexpected entry, stopping");
+                            reader->failed = true;
+                            break;
+                        }
+                        env.Deserialize(reader->file);
+                        reader->file.read(reinterpret_cast<char*>(&key), sizeof(key));
+                    } catch (const std::exception& e) {
+                        LOG_WARNING(Render_Vulkan, "Nx2Perf graphics_warm: read failed: {}",
+                                    e.what());
+                        reader->failed = true;
+                        break;
+                    }
+                }
+                env.SetGuessMissing(&guess);
+                bool ok = false;
+                try {
+                    Shader::Environment* const env_ptr = &env;
+                    ok = WarmGraphicsLibraries(pools, key, std::span{&env_ptr, 1});
+                } catch (const std::exception& e) {
+                    LOG_DEBUG(Render_Vulkan, "graphics_warm: {}", e.what());
+                }
+                (ok ? reader->built : reader->failed_builds).fetch_add(1);
+                const size_t done = reader->built + reader->failed_builds;
+                if (done % 2000 == 0) {
+                    LOG_INFO(Render_Vulkan, "Nx2Perf graphics_warm: {} done", done);
+                }
+            }
+            if (reader->running.fetch_sub(1) == 1) {
+                LOG_INFO(Render_Vulkan,
+                         "Nx2Perf graphics_warm: finished, {} built, {} failed, {:.0f} s",
+                         reader->built.load(), reader->failed_builds.load(),
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                       reader->begin)
                              .count());
             }
         });

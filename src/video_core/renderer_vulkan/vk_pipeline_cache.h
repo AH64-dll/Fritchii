@@ -236,6 +236,14 @@ private:
     /// SPIR-V finds the driver build ready instead of waiting seconds for it.
     void StartComputeWarm();
     std::vector<std::jthread> compute_warm_threads;
+    std::atomic<bool> compute_warm_done{true};
+
+    /// EDEN_NX2_GRAPHICS_WARM=<file> (with EDEN_NX2_GPL=1): vertex and fragment programs prepared
+    /// from the game files (tools/nx2/make_graphics_warm.py) are built as single-stage libraries
+    /// in the background after the compute warm-up, then released; the driver's disk cache keeps
+    /// them, so a later pipeline with those stages costs a link.
+    void StartGraphicsWarm();
+    std::vector<std::jthread> graphics_warm_threads;
 
     const Device& device;
     Scheduler& scheduler;

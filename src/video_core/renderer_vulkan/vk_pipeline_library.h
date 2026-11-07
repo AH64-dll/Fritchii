@@ -107,6 +107,10 @@ public:
     std::shared_ptr<const GplLibrary> GetOrCreate(GplPart part, const std::string& key,
                                                   const Builder& build, u64 name);
 
+    /// While set on a thread, libraries it builds are not kept in the cache (the graphics
+    /// warm-up: only the driver's disk cache keeps them, 60,000 kept libraries would not fit).
+    static void SetNoRetainOnThisThread(bool no_retain) noexcept;
+
     void RecordLink(bool optimized, std::chrono::nanoseconds time);
     void RecordHeldDraw(std::chrono::nanoseconds time);
     void RecordFallback();
