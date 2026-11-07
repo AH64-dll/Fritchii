@@ -771,13 +771,17 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
             return fail("Writing the warm-up files failed");
         }
     }
-    // New files: the markers of the old ones no longer apply.
-    fs::remove(WarmMarkerPath(compute_path), ec);
-    fs::remove(WarmMarkerPath(graphics_path), ec);
+    // New files: the markers and counts of the old ones no longer apply. Each is removed right
+    // before its file is replaced, so a failed replacement leaves the other file's marker intact.
+    std::error_code ignored;
+    fs::remove(WarmMarkerPath(compute_path), ignored);
+    fs::remove(WarmCountPath(compute_path), ignored);
     fs::rename(compute_tmp, compute_path, ec);
     if (ec) {
         return fail("Cannot replace " + Common::FS::PathToUTF8String(compute_path));
     }
+    fs::remove(WarmMarkerPath(graphics_path), ignored);
+    fs::remove(WarmCountPath(graphics_path), ignored);
     fs::rename(graphics_tmp, graphics_path, ec);
     if (ec) {
         return fail("Cannot replace " + Common::FS::PathToUTF8String(graphics_path));
