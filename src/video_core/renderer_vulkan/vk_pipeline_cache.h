@@ -271,6 +271,8 @@ private:
     std::atomic_bool background_active{};
     std::atomic_bool background_stop{};
     std::atomic<size_t> background_left{};
+    /// Numbers the background threads for the EDEN_NX2_EXP5 thread limit.
+    std::atomic<size_t> background_slots{};
     size_t background_taken{}; ///< Under background_mutex
     std::chrono::steady_clock::time_point background_start{};
     /// Last: destroyed (its threads joined) before the state above.

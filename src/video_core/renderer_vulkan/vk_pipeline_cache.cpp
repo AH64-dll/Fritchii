@@ -38,6 +38,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
@@ -751,6 +752,42 @@ size_t BackgroundPipelineThreads() {
     return std::clamp<size_t>(std::thread::hardware_concurrency() / 4, 1, 6);
 }
 
+// EXPERIMENT EDEN_NX2_EXP5 (live, read by each background build): background pipeline builds
+// competed with the game's few busy threads (Ocarina of Time 49 instead of 60 fps for the 45-80 s
+// they took). 0 = as before (below normal priority, any core). 1 = idle priority, so every game
+// thread and the GPU thread's own pipeline builders run first, and off the cores pinned to the GPU
+// threads (and off their L3 where the CPU has two), on efficiency cores on hybrid CPUs. 2..16 = as
+// 1, with at most that many building at once.
+int QuietPrebuildMode() {
+    return VideoCore::Nx2Debug::Experiment(5);
+}
+
+void PlacePrebuildThread(bool quiet) {
+    thread_local bool placed_quiet = false;
+    thread_local u64 placed_mask = 0;
+    // The GPU threads pin themselves when they start, which can be after the first builds.
+    const u64 mask = quiet ? Common::BackgroundWorkCpuMask() : 0;
+    if (quiet == placed_quiet && mask == placed_mask) {
+        return;
+    }
+    if (quiet) {
+        Common::SetCurrentThreadIdlePriority();
+        Common::SetCurrentThreadToEfficiencyCores();
+    } else {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        Common::SetCurrentThreadToBackgroundWork();
+    }
+    Common::SetCurrentThreadCpuMask(mask);
+    placed_quiet = quiet;
+    placed_mask = mask;
+    static std::atomic<u64> logged{~u64{0}};
+    const u64 state = quiet ? mask | (u64{1} << 63) : 0;
+    if (logged.exchange(state, std::memory_order_relaxed) != state) {
+        LOG_INFO(Render_Vulkan, "Background pipeline threads: {} priority, CPU mask {:#x}",
+                 quiet ? "idle" : "below normal", mask);
+    }
+}
+
 // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
 bool PreloadAllPipelines() {
     static const bool all = [] {
@@ -1409,6 +1446,17 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         for (auto& deferred : std::views::reverse(deferred_graphics)) {
             background_workers->QueueWork([this, key = deferred.first,
                                            envs_ = std::move(deferred.second)]() mutable {
+                thread_local const size_t slot =
+                    background_slots.fetch_add(1, std::memory_order_relaxed);
+                for (;;) {
+                    const int mode = QuietPrebuildMode();
+                    PlacePrebuildThread(mode != 0);
+                    if (mode < 2 || slot < static_cast<size_t>(mode) ||
+                        background_stop.load(std::memory_order_relaxed)) {
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+                }
                 bool build = !background_stop.load(std::memory_order_relaxed);
                 if (build) {
                     std::scoped_lock lock{background_mutex};
@@ -1638,7 +1686,21 @@ void PipelineCache::EvictUnusedPipelines() {
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::TakeBackgroundPipeline(
     const GraphicsPipelineCacheKey& key) {
-    std::scoped_lock lock{background_mutex};
+    std::unique_lock lock{background_mutex, std::defer_lock};
+    if (QuietPrebuildMode() == 0) {
+        lock.lock();
+    } else {
+        // The background threads hold this briefly, but at idle priority one can be preempted
+        // while holding it: the GPU thread then builds the pipeline itself rather than wait. Not
+        // claimed, its background build (if any) stays in background_ready, unused.
+        const auto give_up = std::chrono::steady_clock::now() + std::chrono::microseconds{200};
+        while (!lock.try_lock()) {
+            if (std::chrono::steady_clock::now() > give_up) {
+                return nullptr;
+            }
+            std::this_thread::yield();
+        }
+    }
     if (const auto it = background_ready.find(key); it != background_ready.end()) {
         auto pipeline = std::move(it->second);
         background_ready.erase(it);

@@ -6,6 +6,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -536,6 +538,35 @@ void SelectCurrentThreadCpuSets(const std::vector<ULONG>& ids) {
         LOG_WARNING(Common, "SetThreadSelectedCpuSets failed: {}", Common::GetLastErrorMsg());
     }
 }
+
+/// Masks of processor group 0's logical processors that share a `relation` (a physical core, or
+/// with RelationCache an L3 cache).
+std::vector<KAFFINITY> GroupZeroMasks(LOGICAL_PROCESSOR_RELATIONSHIP relation) {
+    std::vector<KAFFINITY> result;
+    DWORD length = 0;
+    GetLogicalProcessorInformationEx(relation, nullptr, &length);
+    std::vector<u8> buffer(length);
+    auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data());
+    if (length == 0 || !GetLogicalProcessorInformationEx(relation, info, &length)) {
+        return result;
+    }
+    for (DWORD offset = 0; offset < length;) {
+        auto* entry =
+            reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
+        if (entry->Relationship == RelationProcessorCore && entry->Processor.GroupCount > 0 &&
+            entry->Processor.GroupMask[0].Group == 0) {
+            result.push_back(entry->Processor.GroupMask[0].Mask);
+        } else if (entry->Relationship == RelationCache && entry->Cache.Level == 3 &&
+                   entry->Cache.GroupMask.Group == 0) {
+            result.push_back(entry->Cache.GroupMask.Mask);
+        }
+        offset += entry->Size;
+    }
+    return result;
+}
+
+/// Logical processors PinCurrentThread gave the GPU front and back threads.
+std::atomic<u64> pinned_gpu_mask{};
 } // Anonymous namespace
 #endif
 
@@ -656,25 +687,7 @@ void PinCurrentThread(PinnedRole role) {
         return;
     }
     // Physical cores of processor group 0, as masks of their logical processors.
-    static const std::vector<KAFFINITY> cores = [] {
-        std::vector<KAFFINITY> result;
-        DWORD length = 0;
-        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
-        std::vector<u8> buffer(length);
-        auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data());
-        if (!GetLogicalProcessorInformationEx(RelationProcessorCore, info, &length)) {
-            return result;
-        }
-        for (DWORD offset = 0; offset < length;) {
-            auto* entry =
-                reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
-            if (entry->Processor.GroupCount > 0 && entry->Processor.GroupMask[0].Group == 0) {
-                result.push_back(entry->Processor.GroupMask[0].Mask);
-            }
-            offset += entry->Size;
-        }
-        return result;
-    }();
+    static const std::vector<KAFFINITY> cores = GroupZeroMasks(RelationProcessorCore);
     // Core 0 takes most interrupts: the GPU threads get cores 1 and 2.
     if (cores.size() < (setting != nullptr && setting[0] == '1' ? 4U : 6U)) {
         return;
@@ -696,9 +709,64 @@ void PinCurrentThread(PinnedRole role) {
         mask &= ~(front | back);
         break;
     }
-    if (mask != 0) {
-        SetThreadAffinityMask(GetCurrentThread(), mask);
+    if (mask != 0 && SetThreadAffinityMask(GetCurrentThread(), mask) != 0 &&
+        role != PinnedRole::GuestCore) {
+        pinned_gpu_mask.fetch_or(mask, std::memory_order_relaxed);
     }
+#endif
+}
+
+u64 BackgroundWorkCpuMask() {
+#ifdef _WIN32
+    const u64 pinned = pinned_gpu_mask.load(std::memory_order_relaxed);
+    if (pinned == 0) {
+        return 0;
+    }
+    DWORD_PTR process{};
+    DWORD_PTR system{};
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &process, &system)) {
+        return 0;
+    }
+    const u64 rest = static_cast<u64>(process) & ~pinned;
+    if (rest == 0) {
+        return 0;
+    }
+    // Several L3 caches (Ryzen 9 with two CCDs): the other CCD's cores, so the work does not
+    // evict what the GPU threads keep in theirs, when that leaves enough of them.
+    static const std::vector<KAFFINITY> l3_caches = GroupZeroMasks(RelationCache);
+    u64 other_caches = rest;
+    for (const KAFFINITY cache : l3_caches) {
+        if ((static_cast<u64>(cache) & pinned) != 0) {
+            other_caches &= ~static_cast<u64>(cache);
+        }
+    }
+    return std::popcount(other_caches) >= 4 ? other_caches : rest;
+#else
+    return 0;
+#endif
+}
+
+void SetCurrentThreadCpuMask(u64 mask) {
+#ifdef _WIN32
+    if (mask == 0) {
+        DWORD_PTR process{};
+        DWORD_PTR system{};
+        if (!GetProcessAffinityMask(GetCurrentProcess(), &process, &system) || process == 0) {
+            return;
+        }
+        mask = process;
+    }
+    SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(mask));
+#else
+    static_cast<void>(mask);
+#endif
+}
+
+void SetCurrentThreadIdlePriority() {
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+#else
+    SetCurrentThreadPriority(ThreadPriority::Low);
 #endif
 }
 
