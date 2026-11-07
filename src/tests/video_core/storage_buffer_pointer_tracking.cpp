@@ -9,8 +9,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
-#include "shader_recompiler/environment.h"
 #include "shader_recompiler/backend/nvn_storage_descriptor.h"
+#include "shader_recompiler/environment.h"
+#include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
@@ -526,6 +527,20 @@ TEST_CASE("Pointer table entries stay within the stage's storage buffer limit",
     CHECK(fixture.TrackedOffsets().size() == 31);
     CHECK(std::ranges::count_if(fixture.program.info.storage_buffers_descriptors,
                                 [](const auto& desc) { return desc.indirect_offset != ~0U; }) == 1);
+}
+
+TEST_CASE("Programs that read more pointers than a stage binds are rejected",
+          "[shader][storage_buffer]") {
+    KernelProgram fixture;
+    fixture.env.native = true;
+    fixture.storage_buffer_limit = 4;
+    IR::IREmitter ir{fixture.entry};
+    for (u32 slot = 0; slot < 5; ++slot) {
+        const u32 offset{0x100 + slot * 8};
+        static_cast<void>(ir.LoadGlobal32(Address(ir, Word(ir, offset), Word(ir, offset + 4))));
+    }
+
+    CHECK_THROWS_AS(fixture.TrackedOffsets(), Shader::NotImplementedException);
 }
 
 TEST_CASE("Pointer table entries that would overflow the storage buffers are left out",
