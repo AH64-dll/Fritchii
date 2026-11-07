@@ -158,6 +158,14 @@ void GpuSplit::Stop() {
     pending_write_count = 0;
     writer_range_count = 0;
     last_unbounded_writer_position = 0;
+    writer_range_memory = nullptr;
+    writer_range_sealed = 0;
+    last_dispatch_position = 0;
+    last_unrecorded_dispatch_position = 0;
+    dispatch_records = false;
+    back_dispatch_records = false;
+    dispatch_write_count.store(0, std::memory_order_relaxed);
+    back_entry_position = 0;
     async_writes.clear();
     last_sync_position = 0;
     last_memory_write_position = 0;
@@ -702,6 +710,14 @@ void GpuSplit::NoteWriterRange(const Tegra::MemoryManager& memory, GPUVAddr addr
     if (last_function_position > consumed_cache) {
         consumed_cache = consumed.load(std::memory_order_acquire);
     }
+    if (writer_range_count > writer_range_sealed && &memory == writer_range_memory &&
+        address == writer_range_address && size == writer_range_size &&
+        writer_range_function == last_function_position &&
+        last_function_position <= consumed_cache) {
+        writer_ranges[(writer_range_count - 1) % writer_ranges.size()].position = write_position;
+        return;
+    }
+    writer_range_memory = nullptr;
     const bool sparse = address < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed) &&
                         Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) < address + size;
     const std::optional<DAddr> device =
@@ -714,6 +730,117 @@ void GpuSplit::NoteWriterRange(const Tegra::MemoryManager& memory, GPUVAddr addr
     }
     writer_ranges[writer_range_count++ % writer_ranges.size()] = {write_position, *device,
                                                                   *device + size};
+    writer_range_memory = &memory;
+    writer_range_address = address;
+    writer_range_size = size;
+    writer_range_function = last_function_position;
+}
+
+void GpuSplit::NoteDispatchWriter() {
+    last_dispatch_position = write_position;
+    ++dispatches_sent;
+    // The back records from the position it is told to, in ring order: the dispatch just sent
+    // ran before that. Live switching EXP10 on or off counts it as unrecorded.
+    const bool records = VideoCore::Nx2Debug::Experiment(10) != 0;
+    if (records != dispatch_records) {
+        dispatch_records = records;
+        last_unrecorded_dispatch_position = write_position;
+        Defer([this, records] { back_dispatch_records = records; }, Effect::None);
+    } else if (!records) {
+        last_unrecorded_dispatch_position = write_position;
+    }
+}
+
+GpuSplit::DispatchCheck GpuSplit::DispatchesMayWriteSince(u64 since, u64 begin, u64 size, bool wait,
+                                                          u64& checked, bool& waited) {
+    if (last_dispatch_position <= since) {
+        return DispatchCheck::Miss;
+    }
+    if (last_unrecorded_dispatch_position > since) {
+        return DispatchCheck::Unbounded;
+    }
+    if (consumed_cache < last_dispatch_position) {
+        consumed_cache = consumed.load(std::memory_order_acquire);
+    }
+    if (consumed_cache < last_dispatch_position) {
+        if (!wait) {
+            return DispatchCheck::Queued;
+        }
+        WaitFor(last_dispatch_position, DrainSite::DispatchWait);
+        waited = true;
+    }
+    // The back recorded every dispatch sent since before storing a position past it (acquired
+    // by WaitFor or above). Records start at the entry that ran them: since and later is after
+    // the snapshot.
+    const u64 end = begin + size;
+    const u64 count = dispatch_write_count.load(std::memory_order_acquire);
+    const u64 oldest = count - (std::min)(count, DispatchWriteSlots);
+    u64 index = count;
+    bool reached = false;
+    for (u64 scanned = 0; index > (std::max)(checked, oldest); --index, ++scanned) {
+        if (scanned == MaxDispatchScan) {
+            return DispatchCheck::ScanLimit;
+        }
+        const DispatchWrite& write = dispatch_writes[(index - 1) % DispatchWriteSlots];
+        if (write.position.load(std::memory_order_relaxed) < since) {
+            reached = true;
+            break;
+        }
+        const u64 write_begin = write.begin.load(std::memory_order_relaxed);
+        const u64 write_end = write.end.load(std::memory_order_relaxed);
+        if (write_begin < end && begin < write_end) {
+            return write_end == ~u64{0} && write_begin == 0 ? DispatchCheck::Unbounded
+                                                            : DispatchCheck::Overlap;
+        }
+    }
+    // Writes between `checked` and the oldest remembered were forgotten; the back may have
+    // reused the slots read meanwhile (it only appends for dispatches sent after the newest).
+    if ((!reached && oldest > checked) ||
+        dispatch_write_count.load(std::memory_order_acquire) >= index + DispatchWriteSlots) {
+        return DispatchCheck::ScanLimit;
+    }
+    checked = count;
+    return DispatchCheck::Miss;
+}
+
+GpuSplit::DispatchStats GpuSplit::GetDispatchStats() const {
+    DispatchStats stats{};
+    stats.sent = dispatches_sent;
+    stats.bounded = dispatches_bounded.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < stats.unbounded.size(); ++i) {
+        stats.unbounded[i] = dispatches_unbounded[i].load(std::memory_order_relaxed);
+    }
+    return stats;
+}
+
+void GpuSplit::AppendDispatchWrite(u64 begin, u64 end) {
+    const u64 count = dispatch_write_count.load(std::memory_order_relaxed);
+    DispatchWrite& write = dispatch_writes[count % DispatchWriteSlots];
+    write.position.store(back_entry_position, std::memory_order_relaxed);
+    write.begin.store(begin, std::memory_order_relaxed);
+    write.end.store(end, std::memory_order_relaxed);
+    dispatch_write_count.store(count + 1, std::memory_order_release);
+}
+
+void GpuSplit::RecordDispatchUnbounded(DispatchUnbounded reason) {
+    AppendDispatchWrite(0, ~u64{0});
+    if (!dispatch_unbounded) {
+        dispatch_unbounded = true;
+        auto& counter = dispatches_unbounded[static_cast<size_t>(reason)];
+        counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    }
+}
+
+void GpuSplit::FinishDispatch(bool ran, bool replaced) {
+    if (replaced) {
+        RecordDispatchUnbounded(DispatchUnbounded::Replaced);
+    } else if (ran && !dispatch_confirmed) {
+        RecordDispatchUnbounded(DispatchUnbounded::Unconfirmed);
+    }
+    if (!dispatch_unbounded) {
+        dispatches_bounded.store(dispatches_bounded.load(std::memory_order_relaxed) + 1,
+                                 std::memory_order_relaxed);
+    }
 }
 
 u64 GpuSplit::SettleWrites() {
@@ -903,6 +1030,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         u64 last_store = read_position;
         while (read_position != available) {
             const size_t index = read_position & RingMask;
+            back_entry_position = read_position;
             const size_t size =
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
             read_position += size != 0 ? size : RingWords - index;

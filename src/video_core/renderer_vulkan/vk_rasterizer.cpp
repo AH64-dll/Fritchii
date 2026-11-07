@@ -34,6 +34,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/gpu_split.h"
 #include "video_core/native_query_trace.h"
 #include "video_core/native_indirect_reset.h"
 #include "video_core/render_trace.h"
@@ -1589,6 +1590,29 @@ void RasterizerVulkan::DispatchCompute() {
                              texture_cache, texture_cache_runtime, byte_addressed_shadow)) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
+    }
+    if (VideoCommon::GpuSplit::RecordingDispatch()) {
+        // EXP10: the buffer cache recorded the buffers the dispatch marks written; add its
+        // images and the indirect arguments ObtainBuffer drops the GPU-written state of.
+        auto& split = VideoCommon::GpuSplit::Get();
+        for (const VideoCommon::ImageViewId id : pipeline->WrittenImages()) {
+            const ImageView& view = texture_cache.GetImageView(id);
+            const Image* const image = view.BackingImage();
+            if (image == nullptr || view.image_id == VideoCommon::NULL_IMAGE_ID) {
+                continue;
+            }
+            if (image->cpu_addr_end > image->cpu_addr) {
+                split.RecordDispatchWrite(image->cpu_addr, image->cpu_addr_end - image->cpu_addr);
+            } else {
+                split.RecordDispatchUnbounded(VideoCommon::GpuSplit::DispatchUnbounded::Image);
+            }
+        }
+        if (const auto indirect = kepler_compute->GetIndirectComputeAddress()) {
+            if (const auto device = gpu_memory->GpuToCpuAddress(*indirect)) {
+                split.RecordDispatchWrite(*device, 12);
+            }
+        }
+        split.ConfirmDispatch();
     }
     SCOPE_EXIT {
         if (!frame_dump.Capturing() && !flash_watch.WatchesPasses()) {

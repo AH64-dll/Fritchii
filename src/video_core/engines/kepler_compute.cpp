@@ -16,6 +16,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include "common/algorithm.h"
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
 #include "common/logging.h"
@@ -373,6 +374,12 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     qmd_address, fmt::join(descriptor, ","));
             }
         }
+        // EXP10: the split's front reads what the dispatches and releases this runs write.
+        auto& split = VideoCommon::GpuSplit::Get();
+        split.BeginDispatchRecord();
+        SCOPE_EXIT {
+            split.EndDispatchRecord();
+        };
         const auto error = native_qmd.Signal(qmd_address, argument,
             [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;
@@ -396,6 +403,12 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             },
             [&](u64 address, u32 payload, u32 flags) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(payload))) return false;
+                if (VideoCommon::GpuSplit::RecordingDispatch()) {
+                    // A payload release writes up to a report's 16 bytes, at a later fence.
+                    if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                        split.RecordDispatchWrite(*device, 16);
+                    }
+                }
                 if (flags & (1U << 26)) {
                     rasterizer->SignalFence([this, address, payload] {
                         const u32 value = memory_manager.Read<u32>(address) + payload;
@@ -651,11 +664,27 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         (void)fe_upscale_jitter.Take();
     }
     bool dispatched = true;
+    // EXP10 (GpuSplit::BeginDispatchRecord): what the dispatch writes. A rejected program writes
+    // nothing besides what its bindings marked before (recorded as they were marked).
+    auto& split = VideoCommon::GpuSplit::Get();
+    const bool recording = VideoCommon::GpuSplit::RecordingDispatch();
+    bool skipped = false;
+    bool replaced = false;
+    if (recording) {
+        split.StartDispatch();
+    }
+    SCOPE_EXIT {
+        if (recording) {
+            split.FinishDispatch(!skipped, replaced);
+        }
+    };
     try {
         rasterizer->DispatchCompute();
     } catch (const VideoCommon::FireEmblemUpscale::DispatchReplaced&) {
+        replaced = true;
         return true;
     } catch (const Shader::Exception& error) {
+        skipped = true;
         if (Common::DkbFrameTrace::Enabled()) {
             static thread_local Common::DkbFrameTrace::RateLimit limit;
             static thread_local u64 rejected{};
@@ -685,6 +714,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         }
     }
     if (dlss_chain.output_pass) {
+        replaced = true; // A replacement upscale may run
         return FinishDlssEvaluation() || dispatched;
     }
     return dispatched;
@@ -1294,6 +1324,10 @@ struct KeplerCompute::FrontState {
     /// both hold and a later write of the same value can be dropped.
     std::bitset<0xe00> plain_sent;
     u64 calls{}; ///< Macro calls, for EDEN_NX2_SPLIT_VERIFY
+    /// The inline upload's destination from its last exec_upload (FrontNoteUpload), if known.
+    GPUVAddr upload_address{};
+    u64 upload_size{};
+    bool upload_known{};
 };
 
 namespace {
@@ -1472,38 +1506,78 @@ VideoCommon::SplitWriteTracker::Effect KeplerCompute::FrontEffect(u32 method) co
     }
 }
 
-void KeplerCompute::FrontNoteWriter(VideoCommon::GpuSplit& split, const FrontState& fs,
-                                    u32 method, u32 argument) {
-    // What ProcessNativeMethod writes memory for: plain registers, the macro code and bindings
-    // and the QMD actions it ignores write nothing, a report semaphore its 16 bytes.
+void KeplerCompute::FrontNoteWriter(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                                    u32 argument) {
+    // What ProcessNativeMethod writes memory for: QMD launches and inline QMDs dispatch, a report
+    // semaphore writes its 16 bytes, the inline upload its destination. The other registers
+    // below the macros (plain or not), the macro code and bindings and the QMD actions it
+    // ignores write nothing.
     using Kind = VideoCommon::GpuSplit::WriterKind;
-    if (FrontEffect(method) == VideoCommon::SplitWriteTracker::Effect::None) {
-        return;
-    }
     switch (method) {
-    case 0xae:
-        return;
     case 0xaf:
-        if ((argument & 2) == 0) {
-            return;
+        if ((argument & 2) != 0) {
+            split.NoteDispatchWriter();
         }
-        break;
+        return;
     case 0xb0:
-        if ((argument & 15) <= 1) {
-            return;
+        if ((argument & 15) > 1) {
+            split.NoteDispatchWriter();
         }
-        break;
+        return;
+    case 0x107:
+        split.NoteDispatchWriter();
+        return;
     case 0x6c3:
         split.NoteWriterRange(memory_manager,
                               (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) |
                                   fs.registers[0x6c1],
-                              16, Kind::Compute);
+                              16, Kind::Release);
+        return;
+    case KEPLER_COMPUTE_REG_INDEX(exec_upload):
+        FrontNoteUpload(fs, argument);
+        return;
+    case KEPLER_COMPUTE_REG_INDEX(data_upload):
+        if (fs.upload_known) {
+            split.NoteWriterRange(memory_manager, fs.upload_address, fs.upload_size, Kind::Upload);
+        } else {
+            split.NoteUnboundedWriter(Kind::Upload);
+        }
         return;
     default:
-        break;
+        if (method >= 0xe00) {
+            split.NoteUnboundedWriter(Kind::Compute);
+        }
+        return;
     }
-    const bool dispatch = method == 0xaf || method == 0xb0 || method == 0x107;
-    split.NoteUnboundedWriter(dispatch ? Kind::Dispatch : Kind::Compute);
+}
+
+void KeplerCompute::FrontNoteUpload(FrontState& fs, u32 exec) {
+    // What Upload::State writes for the data after this exec_upload, from the same registers
+    // (the upload block is shared with the older class).
+    constexpr u32 base = KEPLER_COMPUTE_REG_INDEX(upload);
+    const auto reg = [&fs](u32 offset) { return fs.registers[base + offset]; };
+    const u64 line_length = reg(0);
+    const u64 lines = reg(1);
+    fs.upload_address = (GPUVAddr{reg(2)} << 32) | reg(3);
+    fs.upload_size = 0;
+    fs.upload_known = true;
+    if (line_length == 0 || lines == 0) {
+        return; // Writes nothing (copy_size 0)
+    }
+    if ((exec & 1) != 0) {
+        fs.upload_size = u64{reg(4)} * (lines - 1) + line_length;
+        return;
+    }
+    // Block linear: SwizzleSubrect writes back the whole surface it reads.
+    const u32 width = reg(6);
+    const u32 x_offset = reg(10);
+    const u32 shift = Common::FoldRight(
+        4U, [](u32 x, u32 y) { return (std::min)(x, static_cast<u32>(std::countr_zero(y))); },
+        width, static_cast<u32>(line_length), x_offset, static_cast<u32>(fs.upload_address));
+    const u32 block = reg(5);
+    fs.upload_size = Tegra::Texture::CalculateSize(true, 1U << shift, width >> shift, reg(7),
+                                                   reg(8), (block >> 4) & 15, (block >> 8) & 15);
+    fs.upload_known = fs.upload_size != 0;
 }
 
 void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u32 method) {
@@ -1567,7 +1641,9 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment,
                       FrontEffect(method));
     FrontNoteWrites(split, fs, method);
-    for (u32 i = 0; i < amount; ++i) {
+    // An inline upload's words all write its one range.
+    const u32 notes = method == KEPLER_COMPUTE_REG_INDEX(data_upload) ? 1 : amount;
+    for (u32 i = 0; i < notes; ++i) {
         FrontNoteWriter(split, fs, method, base_start[i]);
     }
 }

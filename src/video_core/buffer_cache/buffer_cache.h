@@ -22,6 +22,7 @@
 #include "video_core/buffer_cache/multi_range_refresh.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
+#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
@@ -2392,6 +2393,9 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync) {
+    if (VideoCommon::GpuSplit::RecordingDispatch()) [[unlikely]] {
+        VideoCommon::GpuSplit::Get().RecordDispatchWrite(device_addr, size);
+    }
     if constexpr (!IS_OPENGL) {
         if (needs_sync) {
             Buffer& buffer = slot_buffers[buffer_id];

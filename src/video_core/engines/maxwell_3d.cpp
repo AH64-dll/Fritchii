@@ -1094,7 +1094,14 @@ struct Maxwell3D::FrontState {
     /// Macro DMA read snapshots (EDEN_NX2_DMA_SNAPSHOT, from EvilOOT's dma-snapshot fix): device
     /// pages a drained read flushed whole, and the split position right after. Cleared past 8192
     /// pages.
-    std::unordered_map<u64, u64> dma_snapshots;
+    struct DmaSnapshot {
+        u64 position;
+        /// EXP10: the noted compute and copy ranges and recorded dispatch writes already found
+        /// to miss the page (GpuSplit::WritersMayWriteSince, DispatchesMayWriteSince).
+        u64 writer_ranges;
+        u64 dispatch_writes;
+    };
+    std::unordered_map<u64, DmaSnapshot> dma_snapshots;
 };
 
 namespace {
@@ -1965,11 +1972,17 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             static u64 report_reads{};
             static std::array<u64, 4> miss_reasons{};
             // EXP10: compute and copies sent since count only where their writes may reach the
-            // bytes read (GpuSplit::WritersMayWriteSince); those dispatches and copies whose
-            // ranges the front can't tell still count for every read.
-            const bool ranged_writers = VideoCore::Nx2Debug::Experiment(10) != 0;
+            // pages read: the ranges the fronts noted (GpuSplit::WritersMayWriteSince), the
+            // writes the back recorded for the dispatches (DispatchesMayWriteSince, once it ran
+            // them: 1 waits for that, 2 drains instead). Copies and other work whose ranges
+            // nobody can tell still count for every read.
+            const int exp10 = VideoCore::Nx2Debug::Experiment(10);
+            const bool ranged_writers = exp10 != 0;
+            using DispatchCheck = VideoCommon::GpuSplit::DispatchCheck;
             static u64 writer_unbounded{};
             static u64 writer_overlaps{};
+            static std::array<u64, static_cast<size_t>(DispatchCheck::Count)> dispatch_checks{};
+            static u64 dispatch_waits{};
             static u64 range_skips{};
             static u64 range_differences{};
             bool range_skip = false;
@@ -1984,7 +1997,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     break;
                 }
                 // Compute/copy sent since, unranged writer sent since, noted write.
-                const u64 since = it->second;
+                auto& snapshot = it->second;
+                const u64 since = snapshot.position;
                 const bool writer_since = split.LastWriterPosition() > since;
                 u32 reason = 4;
                 if (!ranged_writers) {
@@ -1992,7 +2006,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                              : split.LastUnrangedPosition() > since ? 2
                              : split.NotedWriteSince(since, *device, read_bytes) ? 3
                                                                                  : 4;
-                } else if (split.WritersMayWriteSince(since, *device, read_bytes)) {
+                } else if (split.WritersMayWriteSince(since, page << 12, 0x1000,
+                                                      &snapshot.writer_ranges)) {
+                    // Whole pages: the ranges found to miss one need no second look.
                     reason = 1;
                     ++(split.LastUnboundedWriterPosition() > since ? writer_unbounded
                                                                    : writer_overlaps);
@@ -2001,7 +2017,17 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 } else if (split.NotedWriteSince(since, *device, read_bytes)) {
                     reason = 3;
                 } else {
-                    range_skip |= writer_since;
+                    // Last: the only check that may wait.
+                    bool waited = false;
+                    const DispatchCheck check = split.DispatchesMayWriteSince(
+                        since, page << 12, 0x1000, exp10 != 2, snapshot.dispatch_writes, waited);
+                    dispatch_waits += waited ? 1 : 0;
+                    if (check != DispatchCheck::Miss) {
+                        reason = 1;
+                        ++dispatch_checks[static_cast<size_t>(check)];
+                    } else {
+                        range_skip |= writer_since;
+                    }
                 }
                 if (reason != 4) {
                     hit = false;
@@ -2059,7 +2085,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                         fs.dma_snapshots.clear();
                     }
                     for (u64 page = first_page; page <= last_page; ++page) {
-                        fs.dma_snapshots[page] = split.SentPosition();
+                        fs.dma_snapshots[page] = {split.SentPosition(), split.WriterRangeCount(),
+                                                  split.DispatchWriteCount()};
                     }
                     memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
                 }
@@ -2074,15 +2101,39 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                              hits, misses, differences, report_reads, miss_reasons[0],
                              miss_reasons[1], miss_reasons[2], miss_reasons[3]);
                     if (ranged_writers) {
+                        using Unbounded = VideoCommon::GpuSplit::DispatchUnbounded;
                         const auto& sent = split.UnboundedWriters();
+                        const auto dispatches = split.GetDispatchStats();
+                        const auto checks = [](DispatchCheck check) {
+                            return dispatch_checks[static_cast<size_t>(check)];
+                        };
+                        const auto unbounded = [&dispatches](Unbounded reason) {
+                            return dispatches.unbounded[static_cast<size_t>(reason)];
+                        };
+                        u64 dispatch_drains = 0;
+                        for (const u64 count : dispatch_checks) {
+                            dispatch_drains += count;
+                        }
+                        u64 dispatches_unbounded = 0;
+                        for (const u64 count : dispatches.unbounded) {
+                            dispatches_unbounded += count;
+                        }
                         LOG_INFO(HW_GPU,
-                                 "DMA snapshot EXP10: compute/copy: {} drained ({} unbounded, {} "
-                                 "overlapping ranges), {} skipped by ranges ({} differed); "
-                                 "unbounded writers sent: {} dispatch, {} compute, {} copy, {} "
-                                 "other",
-                                 writer_unbounded + writer_overlaps, writer_unbounded,
-                                 writer_overlaps, range_skips, range_differences, sent[0],
-                                 sent[1], sent[2], sent[3]);
+                                 "DMA snapshot EXP10: compute/copy: {} drained ({} unbounded "
+                                 "writer, {} overlapping range; dispatches: {} queued, {} "
+                                 "overlapping, {} unbounded, {} past the scan), {} skipped by "
+                                 "ranges ({} differed), {} waited for dispatches only; dispatch "
+                                 "launches sent: {}, dispatches run: {} bounded, {} unbounded ({} "
+                                 "unconfirmed, {} replaced, {} image); unbounded writers sent: "
+                                 "{} upload, {} release, {} compute, {} copy, {} other",
+                                 writer_unbounded + writer_overlaps + dispatch_drains,
+                                 writer_unbounded, writer_overlaps, checks(DispatchCheck::Queued),
+                                 checks(DispatchCheck::Overlap), checks(DispatchCheck::Unbounded),
+                                 checks(DispatchCheck::ScanLimit), range_skips, range_differences,
+                                 dispatch_waits, dispatches.sent, dispatches.bounded,
+                                 dispatches_unbounded, unbounded(Unbounded::Unconfirmed),
+                                 unbounded(Unbounded::Replaced), unbounded(Unbounded::Image),
+                                 sent[0], sent[1], sent[2], sent[3], sent[4]);
                     }
                 }
                 for (u32 i = 0; i < words; ++i) {

@@ -88,7 +88,10 @@ inline std::atomic<int> g_host_pace{-1};
 /// workers too (UnswizzleImage), 8 = guest memory of uploaded textures not hinted cold
 /// (TextureCache::TickFrame).
 /// EXP10 = 1: macro DMA read snapshots (EDEN_NX2_DMA_SNAPSHOT) skip the drain for compute and
-/// copies sent since whose noted write ranges miss the bytes read (Maxwell3D::FrontDmaRead).
+/// copies sent since whose write ranges miss the pages read (Maxwell3D::FrontDmaRead): copies,
+/// inline uploads and releases as the front notes them, native dispatches as the back records
+/// them once it ran them (the read waits for that much); 2 = the same, but a dispatch still
+/// queued drains as before.
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 
