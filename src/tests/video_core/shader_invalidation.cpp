@@ -6,6 +6,7 @@
 #include <memory>
 #include <random>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
 #include "core/device_memory.h"
@@ -38,6 +39,16 @@ struct ShaderCacheTestAccess {
     }
     static bool IsRejected(ShaderCache& cache, VAddr address) {
         return cache.IsRejected(address);
+    }
+    static void Rethrow(ShaderCache& cache, VAddr address) {
+        cache.RethrowIfRejected(address);
+    }
+    static void RememberRejection(ShaderCache& cache, VAddr address) {
+        try {
+            throw std::runtime_error{"lowering failed"};
+        } catch (...) {
+            cache.RememberRejection(address);
+        }
     }
 };
 } // namespace VideoCommon
@@ -136,6 +147,51 @@ TEST_CASE("Debug server rejections drop matching native programs", "[shader_inva
     REQUIRE_FALSE(ShaderCacheTestAccess::IsRejected(*cache, earlier));
     REQUIRE(VideoCore::Nx2Debug::RejectedHashes() == std::vector<u64>{0x22});
     VideoCore::Nx2Debug::EndSession();
+}
+
+TEST_CASE("A remembered rejection marks its page so filtered writes still clear it",
+          "[shader_invalidation][page_filter]") {
+    Core::DeviceMemory memory;
+    Tegra::MaxwellDeviceMemoryManager device_memory{memory};
+    auto cache = ShaderCacheTestAccess::Create(device_memory);
+    constexpr VAddr rejected = 0x7'1234'5100;
+    REQUIRE_FALSE(cache->page_filter.Any(rejected, 1));
+
+    ShaderCacheTestAccess::RememberRejection(*cache, rejected);
+    REQUIRE(ShaderCacheTestAccess::IsRejected(*cache, rejected));
+    CHECK(cache->page_filter.Any(rejected, 1));
+    constexpr VAddr page = rejected & ~VAddr{0xfff};
+    CHECK(cache->page_filter.Any(page, 0x1000));
+    CHECK_FALSE(cache->page_filter.Any(page + 0x1000, 0x1000));
+    CHECK_FALSE(cache->page_filter.Any(page - 0x1000, 0x1000));
+
+    // A write elsewhere keeps the rejection.
+    const std::array unrelated{std::pair<DAddr, size_t>{rejected + 0x10000, 4}};
+    cache->InvalidateRegions(unrelated);
+    CHECK(ShaderCacheTestAccess::IsRejected(*cache, rejected));
+
+    // A write over it, admitted by the filter, lets the program be lowered again.
+    const std::array over{std::pair<DAddr, size_t>{rejected, 8}};
+    REQUIRE(cache->page_filter.Any(over[0].first, over[0].second));
+    cache->InvalidateRegions(over);
+    CHECK_FALSE(ShaderCacheTestAccess::IsRejected(*cache, rejected));
+}
+
+TEST_CASE("Remembering a rejection twice keeps the first error",
+          "[shader_invalidation][page_filter]") {
+    Core::DeviceMemory memory;
+    Tegra::MaxwellDeviceMemoryManager device_memory{memory};
+    auto cache = ShaderCacheTestAccess::Create(device_memory);
+    constexpr VAddr rejected = 0x200000;
+    ShaderCacheTestAccess::Reject(*cache, rejected);
+    ShaderCacheTestAccess::RememberRejection(*cache, rejected);
+    CHECK(ShaderCacheTestAccess::IsRejected(*cache, rejected));
+    try {
+        ShaderCacheTestAccess::Rethrow(*cache, rejected);
+        FAIL("Rejection was not rethrown");
+    } catch (const std::runtime_error& error) {
+        CHECK(std::string_view{error.what()} == "rejected");
+    }
 }
 
 TEST_CASE("Shader invalidation CPU benchmark", "[.][cache_bench]") {
