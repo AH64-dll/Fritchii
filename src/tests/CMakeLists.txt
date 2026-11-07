@@ -103,6 +103,7 @@ add_executable(tests
     common/container_hash.cpp
     common/event.cpp
     common/fibers.cpp
+    common/frizti_settings.cpp
     common/game_presets.cpp
     common/host_memory.cpp
     common/page_table.cpp

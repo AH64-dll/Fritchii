@@ -89,10 +89,12 @@ void Config::WriteToIni() const {
 
     CSimpleIniA::FileWriter writer(fp);
     const SI_Error rc = config->Save(writer, false);
+    fclose(fp);
     if (rc < 0) {
         LOG_ERROR(Frontend, "Config file could not be saved!");
+    } else if (on_written) {
+        on_written(*this);
     }
-    fclose(fp);
 }
 
 void Config::SetUpIni() {

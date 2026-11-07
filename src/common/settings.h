@@ -637,8 +637,8 @@ struct Values {
     // first launch (oot_fps_asked).
     SwitchableSetting<bool> oot_30fps{linkage, false, "oot_30fps", Category::RendererAdvanced};
     Setting<bool> oot_fps_asked{linkage, false, "oot_fps_asked", Category::RendererAdvanced};
-    // Which revision of the Frizti tuned settings this config has had applied once
-    // (MainWindow::MigrateFriztiSettings).
+    // Which revision of the Frizti tuned settings (common/frizti_settings.h) this config has had
+    // applied once (MainWindow::MigrateFriztiSettings; config/frizti.ini keeps it too).
     Setting<u32> frizti_settings_revision{linkage, 0, "frizti_settings_revision",
                                           Category::RendererAdvanced};
 

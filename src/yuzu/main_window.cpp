@@ -131,6 +131,8 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #endif
 
 // Common //
+#include "common/frizti_settings.h"
+#include "common/fs/file.h"
 #include "common/fs/fs.h"
 #include "common/logging.h"
 #include "common/memory_detect.h"
@@ -568,27 +570,112 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     }
 }
 
-// Frizti builds change the defaults Ocarina of Time needs, but a default only reaches a config
-// that never saved its own value, and older Lichii builds saved (seeded) theirs. Once per
-// revision, set the tuned values; later changes by the player are kept.
-void MainWindow::MigrateFriztiSettings() {
-    constexpr u32 Revision = 1;
-    const u32 applied = Settings::values.frizti_settings_revision.GetValue();
-    if (applied >= Revision) {
+namespace {
+std::string OcarinaConfigName() {
+    return fmt::format("{:016X}", Settings::Frizti::OcarinaOfTimeProgramId);
+}
+
+std::filesystem::path FriztiRecordPath() {
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "frizti.ini";
+}
+
+Settings::Frizti::Record LoadFriztiRecord() {
+    return Settings::Frizti::ParseRecord(
+        Common::FS::ReadStringFromFile(FriztiRecordPath(), Common::FS::FileType::TextFile));
+}
+
+void SaveFriztiRecord(const Settings::Frizti::Record& record) {
+    const std::string text = Settings::Frizti::SerializeRecord(record);
+    if (Common::FS::WriteStringToFile(FriztiRecordPath(), Common::FS::FileType::TextFile, text) !=
+        text.size()) {
+        LOG_WARNING(Frontend, "Could not write {}",
+                    Common::FS::PathToUTF8String(FriztiRecordPath()));
+    }
+}
+
+// After each config write: what this build wrote for the tuned settings, so a later difference
+// shows that another build (or a hand edit) changed them.
+void RecordFriztiWrite(const Config& written) {
+    namespace Frizti = Settings::Frizti;
+    const auto tuned = Frizti::TunedSettings(Settings::values);
+    auto record = LoadFriztiRecord();
+    if (written.GetType() == Config::ConfigType::GlobalConfig) {
+        auto values = Frizti::GlobalValues(tuned);
+        if (values == record.global) {
+            return;
+        }
+        record.global = std::move(values);
+    } else if (written.GetType() == Config::ConfigType::PerGameConfig &&
+               std::string_view{written.GetConfigFilePath()}.ends_with(OcarinaConfigName() +
+                                                                       ".ini")) {
+        auto values = Frizti::PerGameValues(tuned);
+        if (values == record.per_game) {
+            return;
+        }
+        record.per_game = std::move(values);
+    } else {
         return;
     }
-    LOG_INFO(Frontend, "Frizti settings revision {} -> {}: applying the tuned settings", applied,
-             Revision);
-    Settings::values.gpu_accuracy.SetValue(Settings::GpuAccuracy::Low);
-    Settings::values.dma_accuracy.SetValue(Settings::DmaAccuracy::Default);
-    Settings::values.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Default);
-    Settings::values.vsync_mode.SetValue(Settings::VSyncMode::Mailbox);
-    Settings::values.async_presentation.SetValue(true);
-    Settings::values.use_asynchronous_shaders.SetValue(true);
-    Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Docked);
-    Settings::values.memory_layout_mode.SetValue(Settings::MemoryLayout::Memory_8Gb);
-    Settings::values.frizti_settings_revision.SetValue(Revision);
-    config->SaveAllValues();
+    SaveFriztiRecord(record);
+}
+} // namespace
+
+// Frizti builds change the defaults Ocarina of Time needs, but a default only reaches a config
+// that never saved its own value, and the other Eden/Lichii builds sharing the config save (seed)
+// theirs. Once per revision, set the tuned values and drop Ocarina's per-game overrides of them.
+// Between revisions the player's changes in Frizti are kept, and those another build made are
+// undone: config/frizti.ini, which only Frizti writes, holds what Frizti last wrote.
+void MainWindow::MigrateFriztiSettings() {
+    namespace Frizti = Settings::Frizti;
+    const auto tuned = Frizti::TunedSettings(Settings::values);
+    auto record = LoadFriztiRecord();
+    // Other builds keep qt-config.ini's revision key but never write frizti.ini; either one
+    // missing or older applies the whole set again.
+    const u32 applied =
+        (std::min)(Settings::values.frizti_settings_revision.GetValue(), record.revision);
+    const bool full = applied < Frizti::Revision;
+
+    auto changes = Frizti::ReconcileGlobal(tuned, record, full);
+    for (auto& change : Frizti::FixDockedController(Settings::values)) {
+        changes.push_back(std::move(change));
+    }
+
+    // Ocarina's per-game config, loaded as a game boot does.
+    std::map<std::string, std::string> per_game;
+    if (Common::FS::Exists(Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "custom" /
+                           (OcarinaConfigName() + ".ini"))) {
+        QtConfig game_config(OcarinaConfigName(), Config::ConfigType::PerGameConfig);
+        auto game_changes = Frizti::ReconcilePerGame(tuned, record, full);
+        if (!game_changes.empty()) {
+            game_config.SaveAllValues();
+        }
+        per_game = Frizti::PerGameValues(tuned);
+        Settings::RestoreGlobalState(false);
+        Settings::values.players.SetGlobal(true);
+        for (auto& change : game_changes) {
+            changes.push_back(std::move(change));
+        }
+    }
+
+    // A newer Frizti build's revision is kept.
+    const u32 revision = (std::max)(applied, Frizti::Revision);
+    if (!changes.empty() || Settings::values.frizti_settings_revision.GetValue() != revision) {
+        Settings::values.frizti_settings_revision.SetValue(revision);
+        config->SaveAllValues();
+    }
+    record.revision = revision;
+    record.global = Frizti::GlobalValues(tuned);
+    record.per_game = std::move(per_game);
+    SaveFriztiRecord(record);
+    Config::on_written = RecordFriztiWrite;
+
+    if (full) {
+        LOG_INFO(Frontend, "Frizti settings revision {} -> {}: {}", applied, revision,
+                 changes.empty() ? std::string{"already set"} : Frizti::FormatChanges(changes));
+    } else if (!changes.empty()) {
+        LOG_INFO(Frontend, "Frizti settings changed by another build, restored: {}",
+                 Frizti::FormatChanges(changes));
+    }
 }
 
 void MainWindow::AskOotFrameRate() {

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include "common/settings.h"
@@ -46,6 +47,13 @@ public:
     [[nodiscard]] const std::string& GetConfigFilePath() const;
 
     [[nodiscard]] bool Exists(const std::string& section, const std::string& key) const;
+
+    [[nodiscard]] ConfigType GetType() const {
+        return type;
+    }
+
+    /// Called after each successful write of a config file.
+    static inline std::function<void(const Config&)> on_written;
 
 protected:
     explicit Config(ConfigType config_type = ConfigType::GlobalConfig);
