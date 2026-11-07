@@ -849,6 +849,47 @@ private:
     std::vector<MultiRangeSegment> graphics_segments;
     std::vector<MultiRangeSegment> compute_segments;
     u64 frame_tick = 0;
+
+    /// EDEN_NX2_EXP18 (zortos293/Lichii#641): resolved bindings are kept while the GPU mappings
+    /// and the set of buffers stay the same. Bumped whenever a buffer is created, joined or
+    /// deleted (ChangeRegister) and when the inline index buffer is replaced.
+    u64 binding_epoch = 1;
+
+    /// The last BindGraphicsUniformBuffer of a (stage, slot) and what it translated to, valid
+    /// while that binding is the one it set (EXP18 & 1).
+    struct UniformBindMemo {
+        u64 epoch{}; ///< binding_epoch when stored; 0 never matches
+        u64 map_serial{};
+        size_t as_id{};
+        const void* channel{};
+        GPUVAddr gpu_addr{};
+        DAddr device_addr{};
+        u32 size{};
+    };
+    std::array<std::array<UniformBindMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
+        uniform_bind_memo{};
+
+    /// One storage binding's last lookup when it resolved to a single buffer (no segments)
+    /// (EXP18 & 2). Index NUM_STAGES is compute.
+    struct StorageBindingMemo {
+        u64 epoch{}; ///< binding_epoch when stored; 0 never matches
+        u64 map_serial{};
+        size_t as_id{};
+        const void* channel{};
+        DAddr device_addr{};
+        GPUVAddr gpu_addr{};
+        u32 size{};
+        bool is_written{};
+        BufferId buffer_id{};
+    };
+    std::array<std::array<StorageBindingMemo, NUM_STORAGE_BUFFERS>, NUM_STAGES + 1>
+        storage_binding_memo{};
+
+    /// FindBuffer and ResolveMultiRangeStorage for one storage binding, from its memo when
+    /// nothing they depend on changed.
+    void ResolveStorageBinding(size_t memo_stage, u32 index, Binding& binding, bool is_written,
+                               std::vector<MultiRangeSegment>& pool);
+
     /// EDEN_NX2_TABLE_POINTER_TRACE: last table entry and size bound per table pointer slot.
     std::unordered_map<u64, std::pair<GPUVAddr, u32>> traced_table_pointers;
     u64 total_used_memory = 0;

@@ -107,6 +107,10 @@ inline std::atomic<int> g_host_pace{-1};
 /// EXP17 = 1: a small streamed uniform buffer binds again any stage or slot's copy of the same
 /// guest range made in the current command buffer, when the bytes still match
 /// (BindSmallUniformReusing; zortos293/Lichii#641 EDEN_NX2_UBO_RANGE_REUSE).
+/// EXP18 (buffer binding memos, #641), bits: 1 = a constant buffer bind of the slot's current
+/// GPU range keeps its translation and resolved buffer (UBO_REBIND), 2 = storage bindings reuse
+/// their last FindBuffer result (STORAGE_MEMO), 4 = buffers touch the LRU once per frame. All
+/// while the mappings and the set of buffers are unchanged (BufferCache::binding_epoch).
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 
