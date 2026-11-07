@@ -4,9 +4,11 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
 
 #include "common/common_types.h"
 #include "common/settings.h"
+#include "video_core/engines/maxwell_3d.h"
 
 // The Legend of Zelda: Ocarina of Time's anti-aliasing. After tonemapping, the game runs a
 // single-frame tensor network on the tonemapped image and an output pass that sharpens the result
@@ -40,8 +42,10 @@ constexpr bool IsTonemapShader(u64 hash) {
 /// Owned by the rasterizer: the tonemap pass draws on the 3D engine, and the network's passes do
 /// not all run on the same compute engine.
 struct BypassState {
-    std::atomic<GPUVAddr> tonemapped_image{}; ///< render target 0 of the latest tonemap draw
-    std::atomic<bool> output_replaced{};      ///< the latest output pass was replaced
+    std::mutex mutex;
+    /// Render target 0 of the latest tonemap draw (address 0 until one is seen), under mutex.
+    Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig tonemapped{};
+    std::atomic<bool> output_replaced{}; ///< the latest output pass was replaced
 };
 
 inline bool BypassEnabled(u64 program_id) {

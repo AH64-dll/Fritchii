@@ -36,10 +36,18 @@ The images are learned at run time, not hard-coded: the tonemapped image is rend
 latest draw whose pipeline has a tonemap fragment shader
 (`RasterizerVulkan::TrackOotTonemappedImage`), and the output is whatever the output pass's handle
 selects. Nothing is replaced until the tonemapped image has been seen. The prepass and the network
-are skipped only while the output pass is being replaced: if the output descriptor is not the
-expected B10G11R11 block-linear image or the copy fails, the next frame runs the whole network
-natively again. The state lives in the rasterizer (`OotNetwork::BypassState`) because the tonemap
+are skipped only while the output pass is being replaced: if the tonemapped image or the output
+descriptor is not a B10G11R11 block-linear image, their sizes differ, or the copy fails, the next
+frame runs the whole network natively again. The copy's source takes its block layout from the
+tonemap draw's render target. The state lives in the rasterizer (`OotNetwork::BypassState`) because the tonemap
 pass draws on the 3D engine and the network's passes do not all run on the same compute engine.
+
+NVIDIA DLSS takes precedence: while Ocarina DLSS is enabled ("Use NVIDIA DLSS in place of a
+game's DLSS" on, with DLSS available from Streamline), `RasterizerVulkan::OotNetworkBypass` returns
+null and No sharpening does nothing, because DLSS replaces the same output pass
+(docs/native-dlss-replacement.md). The log says
+`Ocarina of Time: No sharpening is off while NVIDIA DLSS is on` once. Once DLSS turns itself off
+for the session or its evaluation fails, No sharpening takes over from the next frame.
 
 The game's constants (shader hashes, program keys, the cb0 offset) are in
 `src/video_core/oot_network.h`.

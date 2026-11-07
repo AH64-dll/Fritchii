@@ -1040,8 +1040,12 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     // The tonemap pass draws before the network every frame; until it has been seen (menus, the
     // first frame) the network runs as usual. Its first passes are skipped only while the output
     // pass is being replaced, so a failed replacement brings the whole network back next frame.
-    const GPUVAddr tonemapped = state->tonemapped_image.load(std::memory_order_relaxed);
-    if (tonemapped == 0) {
+    Maxwell3D::Regs::RenderTargetConfig tonemapped;
+    {
+        std::scoped_lock lock{state->mutex};
+        tonemapped = state->tonemapped;
+    }
+    if (tonemapped.Address() == 0) {
         return false;
     }
     if (native_key == PrepassProgramKey || native_key == NetworkProgramKey) {
@@ -1050,17 +1054,25 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     if (native_key != OutputProgramKey) {
         return false;
     }
+    // The copy needs the tonemapped image to be a B10G11R11 block-linear image of the output's size.
     const auto output = ConstBuffer0Image(OutputImageHandleOffset);
     if (!output || output->format != Texture::TextureFormat::B10G11R11 || output->Address() == 0 ||
-        output->Address() == tonemapped || !output->IsBlockLinear()) {
+        output->Address() == tonemapped.Address() || !output->IsBlockLinear() ||
+        tonemapped.format != Tegra::RenderTargetFormat::B10G11R11_FLOAT ||
+        tonemapped.tile_mode.is_pitch_linear || tonemapped.width != output->Width() ||
+        tonemapped.height != output->Height()) {
         state->output_replaced.store(false, std::memory_order_relaxed);
         static bool warned = false;
         if (!std::exchange(warned, true)) {
-            LOG_WARNING(HW_GPU, "Ocarina of Time: unexpected network output image; not replaced");
+            LOG_WARNING(HW_GPU,
+                        "Ocarina of Time: unexpected network images; not replaced (tonemapped {}x{}, "
+                        "output {})",
+                        tonemapped.width, tonemapped.height,
+                        output ? fmt::format("{}x{}", output->Width(), output->Height())
+                               : std::string{"unreadable"});
         }
         return false;
     }
-    // The tonemapped image is a render target of the output's size, format and layout.
     Fermi2D::Surface destination{};
     destination.format = Tegra::RenderTargetFormat::B10G11R11_FLOAT;
     destination.linear = Fermi2D::MemoryLayout::BlockLinear;
@@ -1073,8 +1085,11 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     destination.addr_upper = static_cast<u32>(output->Address() >> 32);
     destination.addr_lower = static_cast<u32>(output->Address());
     Fermi2D::Surface source = destination;
-    source.addr_upper = static_cast<u32>(tonemapped >> 32);
-    source.addr_lower = static_cast<u32>(tonemapped);
+    source.block_width.Assign(tonemapped.tile_mode.block_width);
+    source.block_height.Assign(tonemapped.tile_mode.block_height);
+    source.block_depth.Assign(tonemapped.tile_mode.block_depth);
+    source.addr_upper = tonemapped.address_high;
+    source.addr_lower = tonemapped.address_low;
     const s32 width = static_cast<s32>(output->Width());
     const s32 height = static_cast<s32>(output->Height());
     const Fermi2D::Config config{
@@ -1096,7 +1111,7 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     if (!std::exchange(logged, true)) {
         LOG_INFO(HW_GPU,
                  "Ocarina of Time: anti-aliasing network bypassed ({}): {:#x} -> {:#x} {}x{}",
-                 copied ? "copy of the tonemapped image" : "copy failed", tonemapped,
+                 copied ? "copy of the tonemapped image" : "copy failed", tonemapped.Address(),
                  output->Address(), width, height);
     }
     return copied;

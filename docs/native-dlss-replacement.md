@@ -58,8 +58,9 @@ has DLSS for the device. FSR is not used for this game, and no environment overr
 
 Shader hashes, buffer offsets and Link's mesh shape are taken from the game's current build.
 A game update that changes them disables the replacement and leaves the game's pass in place.
-An option that bypasses the same network on other GPUs must not act while this replacement is
-enabled. NVIDIA DLSS takes precedence because it replaces the same output pass.
+The "Ocarina of Time anti-aliasing" option (No sharpening, docs/nx2/oot-network-bypass.md)
+bypasses the same network on other GPUs. It does nothing while this replacement is enabled:
+NVIDIA DLSS takes precedence because it replaces the same output pass.
 
 ## Settings and comparison runs
 

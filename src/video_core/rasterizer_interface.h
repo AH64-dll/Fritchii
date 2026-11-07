@@ -275,7 +275,7 @@ public:
     }
 
     /// State of the Ocarina of Time anti-aliasing network bypass (oot_network.h), or null when
-    /// this backend cannot bypass it.
+    /// this backend cannot bypass it or NVIDIA DLSS replaces the same output pass.
     [[nodiscard]] virtual VideoCommon::OotNetwork::BypassState* OotNetworkBypass() {
         return nullptr;
     }
