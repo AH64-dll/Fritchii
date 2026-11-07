@@ -45,6 +45,10 @@ public:
     /// The frame was presented with `id` (0: not presented); `was_held` if Target made it wait.
     void NoteSubmitted(u64 id, Clock::time_point submitted_at, bool was_held);
 
+    /// Whether the previous frame was reported shown in time. After 8 misses in a row present
+    /// wait is taken as broken on this driver and the pacer turns itself off for the session.
+    void NoteShownWait(bool shown);
+
     /// Target made the present thread wait `hold`.
     void NoteHold(std::chrono::nanoseconds hold);
 
@@ -73,6 +77,8 @@ private:
     void Report(Clock::time_point now);
 
     bool pacing{};
+    bool broken{};           ///< Present wait does not signal here: pacing stays off
+    u32 shown_wait_misses{}; ///< In a row
     double refresh_ns{1e9 / 60.0};
     bool refresh_known{};
     Clock::time_point next_refresh_query{};

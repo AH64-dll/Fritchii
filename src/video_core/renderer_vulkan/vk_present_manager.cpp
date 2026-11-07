@@ -413,12 +413,18 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
     if (const u64 want = pacer.Outstanding(); pacer.Pacing() && want != 0) {
         // The next target counts from the refresh the previous frame was shown at.
         Common::Nx2Timeline::Span span{"present: wait until shown"};
+        // At most a refresh and a half: a driver whose present wait never signals would hold
+        // every frame for the whole wait (the pacer turns itself off after a few of these).
+        const auto limit = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            pacer.RefreshPeriod() * 3 / 2 + std::chrono::milliseconds{2});
         std::unique_lock sl{shown_mutex};
-        shown_cv.wait_for(sl, std::chrono::milliseconds{50}, [&] {
+        const bool shown = shown_cv.wait_for(sl, limit, [&] {
             return token.stop_requested() ||
                    std::any_of(shown_reports.begin(), shown_reports.end(),
                                [want](const ShownReport& r) { return r.id >= want; });
         });
+        sl.unlock();
+        pacer.NoteShownWait(shown);
     }
     DrainShown();
     if (!pacer.Pacing()) {

@@ -78,7 +78,7 @@ void HostPacer::Refresh(Clock::time_point now, bool allowed) {
             refresh_known = true;
         }
     }
-    pacing = allowed && refresh_known &&
+    pacing = allowed && refresh_known && !broken &&
              VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_host_pace,
                                               "EDEN_NX2_HOST_PACE", 1) != 0;
     VideoCommon::Nx2Perf::g_host_refresh_ns.store(
@@ -204,6 +204,20 @@ void HostPacer::NoteShown(u64 id, Clock::time_point shown, bool was_lost) {
     last_shown = shown;
     last_shown_id = id;
     Report(shown);
+}
+
+void HostPacer::NoteShownWait(bool shown) {
+    if (shown) {
+        shown_wait_misses = 0;
+        return;
+    }
+    if (++shown_wait_misses >= 8 && !broken) {
+        broken = true;
+        pacing = false;
+        VideoCommon::Nx2Perf::g_host_refresh_ns.store(0, std::memory_order_relaxed);
+        LOG_WARNING(Render_Vulkan, "Host pacing: frames are not reported shown in time (present "
+                                   "wait does not signal here); pacing is off for this session");
+    }
 }
 
 void HostPacer::NoteHold(Ns hold) {
