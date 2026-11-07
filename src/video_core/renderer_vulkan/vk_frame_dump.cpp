@@ -246,6 +246,7 @@ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
         }
     }
     directory = dir;
+    base_directory = directory;
     start = std::chrono::steady_clock::now();
     const char* const at = std::getenv("EDEN_NX2_FRAME_DUMP_AT");
     const std::string_view value = at ? at : "60";
@@ -893,6 +894,36 @@ void FrameDump::WriteFile(const std::string& name, std::span<const u8> data) {
     written_bytes += data.size();
 }
 
+void FrameDump::Rearm() {
+    // File trigger: each new capture.now takes another capture, into capture-2, capture-3...
+    {
+        std::scoped_lock lock{queue_mutex};
+        stop_writer = true;
+    }
+    queue_ready.notify_one();
+    writer.join();
+    stop_writer = false;
+    std::error_code error;
+    std::filesystem::remove(trigger_file, error);
+    probes.clear();
+    pending_bytes = recorded_bytes = written_bytes = 0;
+    sequence = images = 0;
+    truncated = false;
+    pass_framebuffer = nullptr;
+    pass_targets.clear();
+    pass_hashes.clear();
+    pass_sampled.clear();
+    pass_null_sampled.clear();
+    dispatch_sampled.clear();
+    recorded_blocks.clear();
+    seen_buffers.clear();
+    written_buffers.clear();
+    pass_index = pass_first_draw = draws = dispatches = 0;
+    directory = base_directory / fmt::format("capture-{}", ++captures + 1);
+    LOG_INFO(Render_Vulkan, "Frame dump re-armed: the next capture.now captures into {}",
+             directory.string());
+}
+
 void FrameDump::TickFrame() {
     if (!enabled || done) {
         return;
@@ -928,7 +959,11 @@ void FrameDump::TickFrame() {
                  .summary = true,
                  .truncated = truncated});
         capturing = false;
-        done = true;
+        if (trigger_file.empty()) {
+            done = true;
+        } else {
+            Rearm();
+        }
         return;
     }
     const double elapsed =
@@ -949,7 +984,12 @@ void FrameDump::TickFrame() {
     manifest << fmt::format(R"({{"kind":"frame","frame":{},"seconds":{:.3f}}})", frame, elapsed)
              << '\n';
     writer = std::thread{[this] { WriterLoop(); }};
-    if (sampled && !device.IsPipelineStatisticsQuerySupported()) {
+    if (probe_pool) {
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([pool = *probe_pool](vk::CommandBuffer cmdbuf) {
+            cmdbuf.ResetQueryPool(pool, 0, MAX_PROBES);
+        });
+    } else if (sampled && !device.IsPipelineStatisticsQuerySupported()) {
         LOG_WARNING(Render_Vulkan, "Frame dump: no pipelineStatisticsQuery, draws are not probed");
     } else if (sampled) {
         // Pipeline statistics, not occlusion: games keep their own occlusion queries active.

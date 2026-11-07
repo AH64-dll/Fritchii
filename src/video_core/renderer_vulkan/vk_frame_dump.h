@@ -177,6 +177,7 @@ private:
     void Write(const Job& job);
     void WriteBuffer(const Job& job);
     void WriteFile(const std::string& name, std::span<const u8> data);
+    void Rearm();
 
     const Device& device;
     MemoryAllocator& memory_allocator;
@@ -193,6 +194,8 @@ private:
     bool truncated{};
     std::filesystem::path directory;
     std::filesystem::path trigger_file;
+    std::filesystem::path base_directory;
+    u32 captures{};
     u64 trigger_frame{~0ULL};
     double trigger_seconds{};
     std::chrono::steady_clock::time_point start;
