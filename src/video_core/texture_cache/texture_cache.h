@@ -7,6 +7,8 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <numeric>
 #include <cstdlib>
 #include <limits>
@@ -26,6 +28,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/samples_helper.h"
@@ -1778,10 +1781,30 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     ++images_uploaded;
     uploaded_bytes += image.guest_size_bytes;
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
+    // EDEN_NX2_EXP7: log the uploads that hold a draw back (over 2 ms).
+    const bool upload_trace = VideoCore::Nx2Debug::Experiment(7) != 0;
+    const auto upload_begin = upload_trace ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
     if (!UploadInChunks(image)) {
         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
         UploadImageContents(image, staging);
         runtime.InsertUploadMemoryBarrier();
+    }
+    if (upload_trace) [[unlikely]] {
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - upload_begin)
+                              .count();
+        static std::atomic<u32> logged{};
+        if (ms > 2.0 && logged.fetch_add(1, std::memory_order_relaxed) < 300) {
+            LOG_WARNING(HW_GPU,
+                        "Slow upload {:.2f} ms: format {} type {} {}x{}x{} levels {} layers {}, "
+                        "{} KiB guest, {} KiB host, flags {:#x}",
+                        ms, static_cast<u32>(image.info.format), static_cast<u32>(image.info.type),
+                        image.info.size.width, image.info.size.height, image.info.size.depth,
+                        image.info.resources.levels, image.info.resources.layers,
+                        image.guest_size_bytes >> 10, MapSizeBytes(image) >> 10,
+                        static_cast<u32>(image.flags));
+        }
     }
     // The host GPU has its own copy now and the guest rarely reads this memory again: TickFrame
     // marks it cold, so the OS pages it out before anything else when it needs RAM (title 1

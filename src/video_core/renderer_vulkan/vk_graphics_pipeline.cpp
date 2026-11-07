@@ -5,6 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -35,6 +38,7 @@
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/nx2_debug_control.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "video_core/nx2_profile.h"
@@ -495,10 +499,22 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     samplers.reserve(num_textures);
 
     namespace Profile = VideoCommon::Nx2Profile;
+    // EDEN_NX2_EXP7: time each step of every call and log the calls that take over 4 ms (which
+    // step holds a draw back in the hitches seen while walking).
+    const bool step_trace = VideoCore::Nx2Debug::Experiment(7) != 0;
+    std::array<std::chrono::steady_clock::time_point, 10> marks{};
+    size_t mark_count = 0;
+    const auto mark = [&] {
+        if (step_trace) [[unlikely]] {
+            marks[mark_count++] = std::chrono::steady_clock::now();
+        }
+    };
+    mark();
     {
         Profile::Scope scope{Profile::Zone::SyncDescriptors};
         texture_cache.SynchronizeDescriptors(false);
     }
+    mark();
 
     buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
 
@@ -627,11 +643,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     ASSERT(views.size() == num_image_elements);
     ASSERT(samplers.size() == num_textures);
+    mark();
     {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
     }
+    mark();
     if (DrawReuseProbe::Enabled()) [[unlikely]] {
         u64 textures = 0;
         for (const auto& view : views) {
@@ -763,17 +781,18 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     if (regs.transform_feedback_enabled != 0) {
         scheduler.RequestOutsideRenderPassOperationContext();
     }
-
+    mark();
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
         buffer_cache.BindHostGeometryBuffers(is_indexed);
     }
-
+    mark();
     {
         Profile::Scope scope{Profile::Zone::DescriptorAcquire};
         guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
     }
+    mark();
 
     RescalingPushConstant rescaling;
     RenderAreaPushConstant render_area;
@@ -818,6 +837,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
     }
+    mark();
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
         texture_cache.UpdateRenderTargets(false);
@@ -831,8 +851,31 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     if (IsBuilt() && (!pipeline || build->Failed())) {
         return false;
     }
-    Profile::Scope scope{Profile::Zone::ConfigureDraw};
-    return ConfigureDraw(rescaling, render_area);
+    mark();
+    bool configured;
+    {
+        Profile::Scope scope{Profile::Zone::ConfigureDraw};
+        configured = ConfigureDraw(rescaling, render_area);
+    }
+    if (step_trace) [[unlikely]] {
+        mark();
+        const auto ms = [&](size_t i) {
+            return std::chrono::duration<double, std::milli>(marks[i + 1] - marks[i]).count();
+        };
+        const double total =
+            std::chrono::duration<double, std::milli>(marks[mark_count - 1] - marks[0]).count();
+        static std::atomic<u32> logged{};
+        if (total > 4.0 && logged.fetch_add(1, std::memory_order_relaxed) < 300) {
+            LOG_WARNING(Render_Vulkan,
+                        "Slow configure {:.2f} ms (shaders {:016x}/{:016x}): sync {:.2f}, handles "
+                        "{:.2f}, image views {:.2f}, texture buffers {:.2f}, update buffers {:.2f}, "
+                        "descriptors {:.2f}, stage buffers+push {:.2f}, render targets {:.2f}, "
+                        "configure draw {:.2f}",
+                        total, key.unique_hashes[1], key.unique_hashes[5], ms(0), ms(1), ms(2),
+                        ms(3), ms(4), ms(5), ms(6), ms(7), ms(8));
+        }
+    }
+    return configured;
 }
 
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
