@@ -121,6 +121,24 @@ inline void Nx2ClearGpuWrittenPages() {
     return (g_nx2_gpu_written_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
 }
 
+/// Whether any page of the range may have been written by the GPU (zortos293/Lichii#463).
+[[nodiscard]] inline bool Nx2MayBeGpuWritten(u64 device_address, u64 size) {
+    if (size == 0) {
+        return false;
+    }
+    const u64 first = device_address >> Nx2WrittenPageBits;
+    const u64 last = (device_address + size - 1) >> Nx2WrittenPageBits;
+    if (last < first || last >= g_nx2_gpu_written_pages.size() * 64) {
+        return true;
+    }
+    for (u64 page = first; page <= last; ++page) {
+        if ((g_nx2_gpu_written_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
 inline constexpr size_t Nx2MaxSemaphoreRegions = 32;
 inline std::array<std::atomic<u64>, Nx2MaxSemaphoreRegions> g_nx2_semaphore_regions{}; // starts
 
