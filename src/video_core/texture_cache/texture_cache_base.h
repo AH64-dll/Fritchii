@@ -565,9 +565,11 @@ private:
     void ClearStaleGpu(GPUVAddr gpu_addr, size_t size);
     [[nodiscard]] bool IsAllStale(DAddr addr, size_t size) const;
     void UpdateStaleTracking(u64 run_begin, u64 run_pages, s32 delta);
+    // Off here unless EDEN_NX2_TC_SKIP_STALE=1: no gain at an Ocarina of Time Hyrule Field save
+    // (fresh launches, walking 1% low 40.2 off vs 36.5 on); #463 measured +20% in Castle Town.
     bool tc_skip_stale{[] {
         const char* value = std::getenv("EDEN_NX2_TC_SKIP_STALE");
-        return value == nullptr || value[0] != '0'; // EDEN_NX2_TC_SKIP_STALE=0: off
+        return value != nullptr && value[0] == '1';
     }()};
     /// Device memory pages (Core::Memory::YUZU_PAGEBITS), not this cache's 1 MiB lookup pages.
     static constexpr u64 STALE_PAGE_BITS = 12;
