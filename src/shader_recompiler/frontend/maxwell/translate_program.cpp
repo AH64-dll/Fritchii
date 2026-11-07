@@ -90,7 +90,7 @@ void CollectInterpolationInfo(Environment& env, IR::Program& program) {
     }
 }
 
-void AddNVNStorageBuffers(IR::Program& program) {
+void AddNVNStorageBuffers(IR::Program& program, const HostTranslateInfo& host_info) {
     if (!program.info.uses_global_memory) {
         return;
     }
@@ -133,6 +133,11 @@ void AddNVNStorageBuffers(IR::Program& program) {
                 it->write_extent = {};
             }
             continue;
+        }
+        if (descs.size() >= Optimization::StorageBufferLimit(host_info)) {
+            throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
+                                          descs.size() + 1,
+                                          Optimization::StorageBufferLimit(host_info));
         }
         descs.push_back({
             .cbuf_index = driver_cbuf,
@@ -479,13 +484,13 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     Optimization::VendorWorkaroundPass(program);
 
     CollectInterpolationInfo(env, program);
-    AddNVNStorageBuffers(program);
+    AddNVNStorageBuffers(program, normalized_host_info);
     Optimization::LimitSampledTextureArrays(program, normalized_host_info);
     return program;
 }
 
 IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b,
-                                    Environment& env_vertex_b) {
+                                    Environment& env_vertex_b, const HostTranslateInfo& host_info) {
     IR::Program result{};
     Optimization::VertexATransformPass(vertex_a);
     Optimization::VertexBTransformPass(vertex_b);
@@ -508,7 +513,9 @@ IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b
     result.info.stores.mask |= vertex_b.info.stores.mask;
 
     Optimization::JoinTextureInfo(result.info, vertex_b.info);
-    Optimization::JoinStorageInfo(result.info, vertex_b.info);
+    // The two halves are one stage: their storage buffers share its limit.
+    Optimization::JoinStorageInfo(result.info, vertex_b.info,
+                                  Optimization::StorageBufferLimit(host_info));
     Optimization::DeadCodeEliminationPass(result);
     if (Settings::values.renderer_debug) {
         Optimization::VerificationPass(result);

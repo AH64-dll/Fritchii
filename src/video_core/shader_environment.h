@@ -74,7 +74,11 @@ public:
 
     [[nodiscard]] std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override;
 
-    [[nodiscard]] size_t MappedStoragePointerCount() const override;
+    [[nodiscard]] std::vector<u64> MappedStoragePointerKeys() const override;
+
+    /// Answers the classification of these keys (see MappedStoragePointerKeys) as storage buffer
+    /// pointers, whatever the slots hold now; called before the program is translated
+    void KeepStoragePointers(std::span<const u64> keys);
 
     [[nodiscard]] std::optional<u64> Analyze();
 
@@ -237,7 +241,7 @@ public:
 
     [[nodiscard]] std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override;
 
-    [[nodiscard]] size_t MappedStoragePointerCount() const override;
+    [[nodiscard]] std::vector<u64> MappedStoragePointerKeys() const override;
 
     [[nodiscard]] u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
 

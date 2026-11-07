@@ -594,6 +594,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
         .max_per_stage_descriptor_sampled_images = device.GetMaxPerStageDescriptorSampledImages(),
         .max_per_stage_resources = device.GetMaxPerStageResources(),
+        .max_per_stage_descriptor_storage_buffers = device.GetMaxPerStageDescriptorStorageBuffers(),
         .max_descriptor_set_samplers = device.GetMaxDescriptorSetSamplers(),
         .max_descriptor_set_uniform_buffers = device.GetMaxDescriptorSetUniformBuffers(),
         .max_descriptor_set_uniform_buffers_dynamic = device.GetMaxDescriptorSetUniformBuffersDynamic(),
@@ -1147,6 +1148,42 @@ ComputePipeline* ComputePipelineCacheEntry::Get(bool native, GPUVAddr address,
 
 constexpr u32 MaxComputeRebuilds = 4;
 
+namespace {
+/// Which pointer slots a native program's arguments fill depends on the area (Ocarina of Time's
+/// foliage culling fills different list slots in Hyrule Field and Castle Town), so a translation
+/// rebuilt in one area may lack pointers the first cached one binds. Try first the translations
+/// that bind every pointer the first one binds, those binding the most first, then the others in
+/// cache order.
+void OrderComputeTranslations(std::vector<FileEnvironment>& candidates) {
+    if (candidates.size() < 2) {
+        return;
+    }
+    std::vector<std::vector<u64>> keys;
+    keys.reserve(candidates.size());
+    for (const FileEnvironment& env : candidates) {
+        keys.push_back(env.MappedStoragePointerKeys());
+    }
+    std::vector<size_t> order(candidates.size());
+    std::iota(order.begin(), order.end(), size_t{0});
+    const auto keeps_first = [&](size_t index) {
+        return std::ranges::includes(keys[index], keys.front());
+    };
+    std::ranges::stable_sort(order, [&](size_t lhs, size_t rhs) {
+        const bool lhs_keeps{keeps_first(lhs)};
+        if (lhs_keeps != keeps_first(rhs)) {
+            return lhs_keeps;
+        }
+        return lhs_keeps && keys[lhs].size() > keys[rhs].size();
+    });
+    std::vector<FileEnvironment> ordered;
+    ordered.reserve(candidates.size());
+    for (const size_t index : order) {
+        ordered.push_back(std::move(candidates[index]));
+    }
+    candidates = std::move(ordered);
+}
+} // Anonymous namespace
+
 bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const {
     const auto& qmd{kepler_compute->launch_description};
     for (const auto& [index, offset] : entry.null_pointer_slots) {
@@ -1193,11 +1230,14 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
         entry = CreateComputePipeline(key, shader);
     } else if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
                StaleNullPointerSlot(entry)) {
-        // The translation dropped accesses through a pointer that was null back then.
-        auto rebuilt{CreateComputePipeline(key, shader)};
+        // The translation dropped accesses through a pointer that was null back then. Which slots
+        // the game fills depends on the area, so the new one keeps binding every pointer this one
+        // binds, null now or not: a null pointer binds nothing.
+        auto rebuilt{CreateComputePipeline(key, shader, entry.mapped_pointers)};
         if (rebuilt.pipeline) {
             if (entry.pipeline) {
-                retired_compute_pipelines.push_back(std::move(entry.pipeline));
+                retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                       std::move(entry.pipeline));
             }
             rebuilt.rebuilds = entry.rebuilds + 1;
             entry = std::move(rebuilt);
@@ -1296,8 +1336,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         std::unique_ptr<PipelineStatistics> statistics;
     } state;
     // A rebuilt translation is cached beside the stale one. Choose between them before building, so
-    // loading only ever adds entries: the one that binds more pointers first, on a tie the earlier
-    // one, and the next when a translation fails.
+    // loading only ever adds entries (see OrderComputeTranslations), and take the next when a
+    // translation fails.
     ::Common::unordered_map<ComputePipelineCacheKey, std::vector<FileEnvironment>> compute_envs;
 
     if (device.IsKhrPipelineExecutablePropertiesEnabled()) {
@@ -1306,11 +1346,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
         ComputePipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
-        auto& candidates{compute_envs[key]};
-        const auto position{std::ranges::find_if(candidates, [&](const FileEnvironment& other) {
-            return env.MappedStoragePointerCount() > other.MappedStoragePointerCount();
-        })};
-        candidates.insert(position, std::move(env));
+        compute_envs[key].push_back(std::move(env));
     }};
     const auto queue_compute{[&](const ComputePipelineCacheKey& key,
                                  std::vector<FileEnvironment> candidates) {
@@ -1414,6 +1450,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
                                load_graphics);
     for (auto& [key, candidates] : compute_envs) {
+        OrderComputeTranslations(candidates);
         queue_compute(key, std::move(candidates));
     }
     compute_envs.clear();
@@ -1624,6 +1661,11 @@ void PipelineCache::TickFrame() {
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
         evicted_pipelines.pop_front();
     }
+    while (!retired_compute_pipelines.empty() &&
+           scheduler.IsFree(retired_compute_pipelines.front().first) &&
+           retired_compute_pipelines.front().second->IsBuildTaskDone()) {
+        retired_compute_pipelines.pop_front();
+    }
     constexpr u64 EvictCheckFrames = 600;
     if (frame_count % EvictCheckFrames == 0) {
         EvictUnusedPipelines();
@@ -1812,7 +1854,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             // VertexB path when VertexA is present.
             auto& program_va{programs[0]};
             auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
-            programs[index] = MergeDualVertexPrograms(program_va, program_vb, env);
+            programs[index] = MergeDualVertexPrograms(program_va, program_vb, env, host_info);
         }
 
         if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
@@ -2074,8 +2116,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     return pipeline;
 }
 
-ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
-    const ComputePipelineCacheKey& key, const ShaderInfo* shader) {
+ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipelineCacheKey& key,
+                                                               const ShaderInfo* shader,
+                                                               std::span<const u64> keep_pointers) {
     const auto begin = std::chrono::steady_clock::now();
     SCOPE_EXIT {
         ReportRuntimePipeline("Compute", begin,
@@ -2089,6 +2132,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start,
                            shader->lowered_native};
     env.SetCachedSize(shader->size_bytes);
+    env.KeepStoragePointers(keep_pointers);
 
     main_pools.ReleaseContents();
     auto entry{CreateComputePipeline(main_pools, key, env, nullptr, true)};
@@ -2183,7 +2227,9 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                 descriptor_buffer_ring, thread_worker, statistics, &shader_notify, program.info,
                 std::move(spv_module), key.unique_hash),
             .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
-                                                        : std::vector<std::pair<u32, u32>>{}};
+                                                        : std::vector<std::pair<u32, u32>>{},
+            .mapped_pointers =
+                env.IsNativeProgram() ? env.MappedStoragePointerKeys() : std::vector<u64>{}};
 
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "Compute pipeline compilation failed shader={:#016x} pipeline={:#016x}: {}",

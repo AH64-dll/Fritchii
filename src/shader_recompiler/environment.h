@@ -98,9 +98,10 @@ public:
         return {};
     }
 
-    /// Native programs: how many classified slots were bound as storage buffer pointers.
-    [[nodiscard]] virtual size_t MappedStoragePointerCount() const {
-        return 0;
+    /// Native programs: the classified slots bound as storage buffer pointers, as the sorted keys
+    /// of their classification (direct and pointer-table slots).
+    [[nodiscard]] virtual std::vector<u64> MappedStoragePointerKeys() const {
+        return {};
     }
 
     [[nodiscard]] virtual u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) = 0;
