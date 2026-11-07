@@ -142,6 +142,10 @@ public:
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
+    /// FixedPipelineState::Refresh of graphics_key, keeping only the vertex attribute types the
+    /// bound programs read (see VideoCommon::KeyedAttributeTypes).
+    void RefreshGraphicsKey();
+
     /// EDEN_NX2_PIPELINE_CLEAN: CurrentGraphicsPipeline without FixedPipelineState::Refresh nor
     /// the key comparison while nothing Refresh reads changed since the last lookup.
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineClean();
@@ -227,6 +231,7 @@ private:
     EmissionBudget emission_budget;
 
     GraphicsPipelineCacheKey graphics_key{};
+    u64 vertex_attribute_types{}; ///< graphics_key's attribute types before the programs' mask
     GraphicsPipeline* current_pipeline{};
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.

@@ -40,7 +40,15 @@ struct ShaderInfo {
     size_t size_bytes{};
     /// Lowered code of a native program, reused when its pipelines are built.
     std::shared_ptr<const LoweredNativeCode> lowered_native;
+    /// Generic inputs a native vertex program reads (its header's input map), two bits per
+    /// attribute as in FixedPipelineState::attribute_types. None for task and mesh programs, all
+    /// set for any other program.
+    u64 vertex_attribute_mask{~u64{0}};
 };
+
+/// ShaderInfo::vertex_attribute_mask of the program in `env` (a runtime or a disk environment).
+/// EDEN_NX2_KEY_ALL_ATTRIBUTES=1 keeps every attribute type in the keys, as before.
+[[nodiscard]] u64 VertexAttributeMaskOf(const Shader::Environment& env);
 
 class ShaderCache : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
     static constexpr u64 YUZU_PAGEBITS = 14;
@@ -108,6 +116,9 @@ protected:
                                  const std::array<u64, NUM_PROGRAMS>& unique_hashes);
 
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
+    /// vertex_attribute_mask of shader_infos, copied so the lookup of every draw doesn't read a
+    /// ShaderInfo that an invalidation may have removed since.
+    std::array<u64, NUM_PROGRAMS> vertex_attribute_masks{};
     bool last_shaders_valid = false;
 
 private:
