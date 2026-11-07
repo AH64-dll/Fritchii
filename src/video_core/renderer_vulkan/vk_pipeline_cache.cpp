@@ -1662,7 +1662,8 @@ void PipelineCache::TickFrame() {
         evicted_pipelines.pop_front();
     }
     while (!retired_compute_pipelines.empty() &&
-           scheduler.IsFree(retired_compute_pipelines.front().first)) {
+           scheduler.IsFree(retired_compute_pipelines.front().first) &&
+           retired_compute_pipelines.front().second->IsBuildTaskDone()) {
         retired_compute_pipelines.pop_front();
     }
     constexpr u64 EvictCheckFrames = 600;
