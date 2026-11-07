@@ -428,6 +428,32 @@ u64 AllocatedUsage(VkDeviceSize driver_usage, const VmaBudget& vma_budget) {
     return driver_usage - (std::min)(driver_usage, unused);
 }
 
+/// AMD GPUs before RDNA3 have no matrix units. AMD's driver still lists 16x16x16 float16
+/// cooperative matrix shapes on RDNA2 and then crashes building the HMMA compute pipelines
+/// (RX 6700 XT, driver 2.0.353, amdvlk64.dll+0x2f1c963 during the boot pipeline build).
+[[nodiscard]] bool IsAmdWithoutMatrixUnits(u32 vendor_id, u32 device_id) {
+    if (vendor_id != 0x1002) {
+        return false;
+    }
+    // GCN discrete, Navi 1x to Navi 23, then Navi 24 (0x7400-0x741F is CDNA2, which has matrix
+    // units). RDNA3 starts at 0x7440 (Navi 31).
+    if ((device_id >= 0x6600 && device_id <= 0x6FFF) ||
+        (device_id >= 0x7310 && device_id <= 0x73FF) ||
+        (device_id >= 0x7420 && device_id <= 0x743F)) {
+        return true;
+    }
+    switch (device_id) {
+    case 0x163F: // Van Gogh (Steam Deck)
+    case 0x1435: // Sephiroth (Steam Deck OLED)
+    case 0x1681: // Rembrandt
+    case 0x164E: // Raphael and Granite Ridge graphics
+    case 0x1506: // Mendocino
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // Anonymous namespace
 
 void Device::RemoveExtension(bool& extension, const std::string& extension_name) {
@@ -1678,7 +1704,13 @@ void Device::RemoveUnsuitableExtensions() {
                      "VK_KHR_cooperative_matrix is emulated on this AMD GPU: guest tensor "
                      "operations stay in shader emulation");
         }
+        const bool no_matrix_units = IsAmdWithoutMatrixUnits(properties.properties.vendorID,
+                                                             properties.properties.deviceID);
+        if (no_matrix_units && extensions.cooperative_matrix) {
+            LOG_INFO(Render_Vulkan, "Cooperative matrices off: AMD GPU without matrix units");
+        }
         const bool usable = extensions.cooperative_matrix && !emulated_amd_matrices &&
+                            !no_matrix_units &&
                             features.cooperative_matrix.cooperativeMatrix &&
                             (properties.cooperative_matrix.cooperativeMatrixSupportedStages &
                              VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
