@@ -291,6 +291,9 @@ private:
     /// After sending it: what it may write as compute work, for the front's macro memory reads
     /// (GpuSplit::NoteWriterRange, NoteUnboundedWriter, NoteDispatchWriter).
     void FrontNoteWriter(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument);
+    /// EXP13: predicts the releases of the QMD a launch just sent signals (nx2_qmd_prediction.h).
+    void FrontPredictQmd(VideoCommon::GpuSplit& split, const FrontState& state, u32 method,
+                         u32 argument) const;
     /// An exec_upload with `exec` was sent: the range its data writes.
     void FrontNoteUpload(FrontState& state, u32 exec);
     std::unique_ptr<FrontState> front;

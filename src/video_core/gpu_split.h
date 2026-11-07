@@ -131,6 +131,10 @@ public:
     [[nodiscard]] static bool OnBackThread() {
         return on_back_thread;
     }
+    /// Back: the ring position of the entry being run.
+    [[nodiscard]] u64 BackEntryPosition() const {
+        return back_entry_position;
+    }
     /// Called on the back before it sleeps waiting for work (the rasterizer submits deferred work).
     void SetIdleHook(void (*hook)(void*), void* argument) {
         idle_hook = hook;

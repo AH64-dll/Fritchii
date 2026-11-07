@@ -17,6 +17,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_qmd_prediction.h"
 #include "video_core/renderer_base.h"
 #include "video_core/textures/decoders.h"
 
@@ -102,7 +103,18 @@ void MaxwellDMA::FrontNoteLaunch(VideoCommon::GpuSplit& split, u32 launch) {
     const bool remap = ((launch >> 10) & 1) != 0;
     const bool physical = ((launch >> 12) & 3) != 0;
     if (semaphore_type != 0) {
-        split.NoteWriterRange(memory_manager, address(offsetof(Regs, semaphore)), 16, Kind::Copy);
+        const GPUVAddr semaphore = address(offsetof(Regs, semaphore));
+        split.NoteWriterRange(memory_manager, semaphore, 16, Kind::Copy);
+        // EXP13: a one- or four-word release writes the payload (ReleaseSemaphore).
+        if ((semaphore_type == 1 || semaphore_type == 2) &&
+            VideoCommon::QmdPrediction::Enabled()) {
+            if (const auto device = memory_manager.GpuToCpuAddress(semaphore)) {
+                VideoCommon::QmdPrediction::Predict(
+                    VideoCommon::QmdPrediction::Writer::Dma, *device,
+                    reg(offsetof(Regs, semaphore) + 2 * sizeof(u32)), split.SentPosition(), 0,
+                    false);
+            }
+        }
     }
     if (physical) {
         split.NoteUnboundedWriter(Kind::Copy);
@@ -467,6 +479,16 @@ void MaxwellDMA::ReleaseSemaphore() {
     const GPUVAddr address = regs.semaphore.address;
     const u32 payload = regs.semaphore.payload;
     VideoCommon::QueryPropertiesFlags flags{VideoCommon::QueryPropertiesFlags::IsAFence};
+    if ((type == LaunchDMA::SemaphoreType::RELEASE_ONE_WORD_SEMAPHORE ||
+         type == LaunchDMA::SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE) &&
+        VideoCommon::QmdPrediction::Enabled() && VideoCommon::GpuSplit::OnBackThread()) {
+        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+            VideoCommon::QmdPrediction::Verify(VideoCommon::QmdPrediction::Writer::Dma, *device,
+                                               payload, 0,
+                                               VideoCommon::GpuSplit::Get().BackEntryPosition(),
+                                               false);
+        }
+    }
     switch (type) {
     case LaunchDMA::SemaphoreType::NONE:
         break;

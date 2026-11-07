@@ -33,6 +33,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_qmd_prediction.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra::Engines {
@@ -444,6 +445,56 @@ struct FenceWriterStats {
     }
 };
 
+// EXP13 (nx2_qmd_prediction.h): whether a QMD or copy release the front predicted, still queued,
+// would meet an unmet readable acquire. Returns its device and the back's release count, for
+// QmdPredictionMetBy once the fences ran.
+struct QmdPredictionCheck {
+    u64 device;
+    u64 sequence;
+};
+std::optional<QmdPredictionCheck> CheckQmdPrediction(DmaPusher& dma_pusher,
+                                                     const Puller::PendingAcquire& acquire) {
+    namespace Prediction = VideoCommon::QmdPrediction;
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!Prediction::Enabled() || !split.Active()) {
+        return std::nullopt;
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+    if (!device) {
+        return std::nullopt;
+    }
+    const auto queued = Prediction::QueuedPayloads(*device, split.ConsumedNow());
+    const bool meets = std::any_of(queued.payloads.begin(),
+                                   queued.payloads.begin() + queued.count,
+                                   [&](u32 payload) { return acquire.Matches(payload); });
+    Prediction::NoteAcquire(meets              ? Prediction::Coverage::WouldMeet
+                            : queued.count != 0 ? Prediction::Coverage::WrongValue
+                            : queued.any        ? Prediction::Coverage::AlreadyRan
+                                                : Prediction::Coverage::None);
+    return QmdPredictionCheck{*device, Prediction::BackSequence()};
+}
+
+void QmdPredictionMetBy(const QmdPredictionCheck& check, const Puller::PendingAcquire& acquire,
+                        bool met) {
+    namespace Prediction = VideoCommon::QmdPrediction;
+    using MetBy = Prediction::MetBy;
+    if (!met) {
+        Prediction::NoteMetBy(MetBy::Unmet);
+        return;
+    }
+    const auto release = Prediction::BackReleaseSince(check.device, check.sequence);
+    if (!release) {
+        Prediction::NoteMetBy(MetBy::Other);
+    } else if (release->reduction) {
+        Prediction::NoteMetBy(MetBy::QmdReduction);
+    } else if (!acquire.Matches(release->payload)) {
+        Prediction::NoteMetBy(MetBy::Other);
+    } else {
+        Prediction::NoteMetBy(release->writer == Prediction::Writer::Qmd ? MetBy::QmdRelease
+                                                                         : MetBy::DmaRelease);
+    }
+}
+
 } // Anonymous namespace
 
 static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& word);
@@ -849,7 +900,11 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }
         bool met_now;
         if (readable) {
+            const auto qmd_check = CheckQmdPrediction(dma_pusher, acquire);
             met_now = ReleaseFencesForReadable(dma_pusher, this, acquire);
+            if (qmd_check) {
+                QmdPredictionMetBy(*qmd_check, acquire, met_now || waiters.Latched(this));
+            }
         } else {
             ReleaseFences(dma_pusher);
             met_now = acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address));

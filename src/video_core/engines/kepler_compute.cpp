@@ -27,6 +27,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/fire_emblem_upscale.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_qmd_prediction.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/engines/fermi_2d.h"
@@ -381,8 +382,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         SCOPE_EXIT {
             split.EndDispatchRecord();
         };
+        u64 running_qmd = 0; // The QMD the releases below belong to (read last), for EXP13
         const auto error = native_qmd.Signal(qmd_address, argument,
             [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
+                running_qmd = address;
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;
                 memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
                 if (static u32 logged{}; (descriptor[53] & (1U << 23)) && logged < 8) {
@@ -404,6 +407,14 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             },
             [&](u64 address, u32 payload, u32 flags) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(payload))) return false;
+                if (VideoCommon::QmdPrediction::Enabled() &&
+                    VideoCommon::GpuSplit::OnBackThread()) {
+                    if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                        VideoCommon::QmdPrediction::Verify(
+                            VideoCommon::QmdPrediction::Writer::Qmd, *device, payload, running_qmd,
+                            split.BackEntryPosition(), (flags & (1U << 26)) != 0);
+                    }
+                }
                 if (VideoCommon::GpuSplit::RecordingDispatch()) {
                     // A payload release writes up to a report's 16 bytes, at a later fence.
                     if (const auto device = memory_manager.GpuToCpuAddress(address)) {
@@ -1518,15 +1529,24 @@ void KeplerCompute::FrontNoteWriter(VideoCommon::GpuSplit& split, FrontState& fs
     case 0xaf:
         if ((argument & 2) != 0) {
             split.NoteDispatchWriter();
+            if (VideoCommon::QmdPrediction::Enabled()) {
+                FrontPredictQmd(split, fs, method, argument);
+            }
         }
         return;
     case 0xb0:
         if ((argument & 15) > 1) {
             split.NoteDispatchWriter();
+            if (VideoCommon::QmdPrediction::Enabled()) {
+                FrontPredictQmd(split, fs, method, argument);
+            }
         }
         return;
     case 0x107:
         split.NoteDispatchWriter();
+        if (VideoCommon::QmdPrediction::Enabled()) {
+            FrontPredictQmd(split, fs, method, argument);
+        }
         return;
     case 0x6c3: {
         const GPUVAddr address =
@@ -1565,6 +1585,78 @@ void KeplerCompute::FrontNoteWriter(VideoCommon::GpuSplit& split, FrontState& fs
             split.NoteUnboundedWriter(Kind::Compute);
         }
         return;
+    }
+}
+
+void KeplerCompute::FrontPredictQmd(VideoCommon::GpuSplit& split, const FrontState& fs,
+                                    u32 method, u32 argument) const {
+    // The QMD Signal reads on the back (native_qmd.h): the one the action names, then its
+    // dependent QMD (one level). Schedules (2, 3) run it once its dependency count is 0, a
+    // decrement (7) when it reaches 0; increments and the rest run nothing.
+    namespace Prediction = VideoCommon::QmdPrediction;
+    using Descriptor = NativeQmdScheduler::Descriptor;
+    const u64 position = split.SentPosition();
+    const auto predict = [&](GPUVAddr qmd_address, const Descriptor& qmd, bool stale) {
+        for (const u32 base : {24U, 28U, 52U}) {
+            const u32 flags = qmd[base + 1];
+            if (!(flags & (1U << 23))) {
+                continue;
+            }
+            if (flags & (1U << 26)) {
+                Prediction::NoteReduction();
+                continue;
+            }
+            const GPUVAddr destination = (GPUVAddr{flags & 0xff} << 32) | qmd[base];
+            if (const auto device = memory_manager.GpuToCpuAddress(destination)) {
+                Prediction::Predict(Prediction::Writer::Qmd, *device, qmd[base + 2], position,
+                                    qmd_address, stale);
+            } else {
+                Prediction::NoteUnmappedRelease();
+            }
+        }
+    };
+    const auto read = [&](GPUVAddr qmd_address, Descriptor& qmd, bool& stale) {
+        if (!memory_manager.IsFullyMappedRange(qmd_address, sizeof(qmd))) {
+            Prediction::NoteSignal(Prediction::Signal::Unmapped);
+            return false;
+        }
+        memory_manager.ReadBlockUnsafe(qmd_address, qmd.data(), sizeof(qmd));
+        stale = split.HasQueuedMemoryWriters(qmd_address, qmd_address + sizeof(qmd));
+        return true;
+    };
+    Descriptor qmd{};
+    GPUVAddr qmd_address{};
+    u32 action = argument & 15;
+    bool stale = false;
+    if (method == 0x107) {
+        // An inline QMD: the back writes the registers' copy to memory, then schedules it.
+        qmd_address = ((GPUVAddr{fs.registers[0xc6]} << 32) | fs.registers[0xc7]) << 8;
+        if (!memory_manager.IsFullyMappedRange(qmd_address, sizeof(qmd)) ||
+            !((fs.registers[0xa7] & (1U << 24)) || !(fs.registers[0xcc] & (1U << 12)))) {
+            return;
+        }
+        std::copy_n(fs.registers.begin() + 0xc8, qmd.size(), qmd.begin());
+        action = 3;
+    } else {
+        qmd_address = GPUVAddr{fs.registers[0xad]} << 8;
+        if ((action != 2 && action != 3 && action != 7) || !read(qmd_address, qmd, stale)) {
+            return;
+        }
+    }
+    Prediction::NoteSignal(Prediction::Signal::Read);
+    if (action != 7 && ((qmd[4] >> 14) & 0xffff) != 0) {
+        Prediction::NoteSignal(Prediction::Signal::Waiting);
+    }
+    predict(qmd_address, qmd, stale);
+    if (!(qmd[16] & 1)) {
+        return;
+    }
+    const u32 dependent_action = (qmd[16] >> 1) & 7;
+    const GPUVAddr dependent = GPUVAddr{qmd[15]} << 8;
+    if ((dependent_action == 4 || dependent_action == 3 || dependent_action == 1) &&
+        read(dependent, qmd, stale)) {
+        Prediction::NoteSignal(Prediction::Signal::Chained);
+        predict(dependent, qmd, stale);
     }
 }
 
