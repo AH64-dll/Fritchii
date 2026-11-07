@@ -1810,12 +1810,23 @@ void PipelineCache::EvictUnusedPipelines() {
         return;
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
+    // A pipeline built from the disk cache at boot that no draw has used yet stays, up to a budget
+    // (from zortos293/Lichii#550): evicting it throws the prebuild away, and the game translates it
+    // again on the GPU thread when it reaches that content. Past the budget (~0.9 GB of driver
+    // memory) they go like the rest, so a large cache can't hold their memory all session.
+    constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
+    size_t kept_prebuilt = 0;
     std::vector<std::pair<u64, GraphicsPipelineCacheKey>> candidates;
     for (const auto& [key, pipeline] : graphics_cache) {
-        if (pipeline != nullptr && pipeline.get() != current_pipeline && pipeline->IsBuilt() &&
-            pipeline->LastUse() < cutoff) {
-            candidates.emplace_back(pipeline->LastUse(), key);
+        if (pipeline == nullptr || pipeline.get() == current_pipeline || !pipeline->IsBuilt() ||
+            pipeline->LastUse() >= cutoff) {
+            continue;
         }
+        if (!pipeline->WasUsed() && kept_prebuilt < MaxUnusedPrebuiltPipelines) {
+            ++kept_prebuilt;
+            continue;
+        }
+        candidates.emplace_back(pipeline->LastUse(), key);
     }
     const size_t evicted = VideoCommon::GraphicsPipelinesToEvict(graphics_cache.size(),
                                                                  candidates.size(), evict_above);
