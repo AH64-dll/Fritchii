@@ -215,9 +215,27 @@ private:
 std::optional<u32> ReadNativeGuardConstant(Tegra::Engines::KeplerCompute& compute,
                                          Tegra::MemoryManager& memory, u32 bank, u32 offset);
 
+/// Answers for reads a FileEnvironment has no record of (EDEN_NX2_COMPUTE_WARM: programs from the
+/// game files, never run, converted only to fill the driver's cache). Without it a missing read
+/// is an error.
+struct GuessMissing {
+    u32 cbuf_bank0{0x10000000};  ///< Constant buffer 0 (driver constants, descriptor handles)
+    u32 cbuf_other{0};           ///< Other constant buffers (game constants)
+    Shader::TextureType texture_type{Shader::TextureType::ColorArray2D};
+    Shader::TexturePixelFormat pixel_format{static_cast<Shader::TexturePixelFormat>(16)};
+    bool storage_pointer_bank0{true};  ///< Bank 0 always held storage pointers in the test title's records
+    bool storage_pointer_other{false}; ///< Banks 1-4 never did (95% identical SPIR-V offline)
+};
+
 class FileEnvironment final : public Shader::Environment {
 public:
     FileEnvironment() = default;
+
+    /// Missing reads get these answers instead of an error; the guess must outlive the
+    /// environment.
+    void SetGuessMissing(const GuessMissing* guess_) noexcept {
+        guess = guess_;
+    }
     ~FileEnvironment() override = default;
 
     FileEnvironment& operator=(FileEnvironment&&) noexcept = default;
@@ -286,6 +304,7 @@ private:
     u32 read_highest{};
     u32 initial_offset{};
     u32 viewport_transform_state = 1;
+    const GuessMissing* guess{};
 };
 
 void SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,

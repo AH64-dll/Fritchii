@@ -26,6 +26,7 @@
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/thread.h"
 #include "common/thread_worker.h"
 #include "core/core.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -80,6 +81,7 @@ using Shader::Maxwell::TranslateProgram;
 using VideoCommon::ComputeEnvironment;
 using VideoCommon::FileEnvironment;
 using VideoCommon::GenericEnvironment;
+using VideoCommon::GuessMissing;
 using VideoCommon::GraphicsEnvironment;
 
 constexpr u32 CACHE_VERSION = VideoCommon::VulkanPipelineCacheVersion;
@@ -835,6 +837,8 @@ bool PreloadAllPipelines() {
 } // Anonymous namespace
 
 PipelineCache::~PipelineCache() {
+    // Stop the warm-up first: its builds use the members below.
+    compute_warm_threads.clear();
     StopBackgroundPipelines();
     workers.WaitForRequests();
     serialization_thread.WaitForRequests();
@@ -1676,6 +1680,121 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     if (state.statistics) {
         state.statistics->Report();
+    }
+    if (!stop_loading.stop_requested()) {
+        StartComputeWarm();
+    }
+}
+
+void PipelineCache::StartComputeWarm() {
+    const char* const path = std::getenv("EDEN_NX2_COMPUTE_WARM");
+    if (path == nullptr || *path == '\0' || !compute_warm_threads.empty()) {
+        return;
+    }
+    // Read the whole file here (its own reader: the disk cache loader deletes files it rejects).
+    struct Entry {
+        ComputePipelineCacheKey key;
+        FileEnvironment env;
+    };
+    auto entries = std::make_shared<std::vector<Entry>>();
+    try {
+        std::ifstream file(std::filesystem::path{path}, std::ios::binary | std::ios::ate);
+        if (!file.is_open()) {
+            LOG_WARNING(Render_Vulkan, "Nx2Perf compute_warm: cannot open {}", path);
+            return;
+        }
+        file.exceptions(std::ifstream::failbit);
+        const auto end{file.tellg()};
+        file.seekg(0, std::ios::beg);
+        std::array<char, 8> magic{};
+        u32 version{};
+        file.read(magic.data(), magic.size())
+            .read(reinterpret_cast<char*>(&version), sizeof(version));
+        constexpr std::array<char, 8> expected_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
+        if (magic != expected_magic || version != CACHE_VERSION) {
+            LOG_WARNING(Render_Vulkan, "Nx2Perf compute_warm: {} is not a version {} file", path,
+                        CACHE_VERSION);
+            return;
+        }
+        while (file.tellg() != end) {
+            u32 num_envs{};
+            file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+            if (num_envs != 1) {
+                LOG_WARNING(Render_Vulkan, "Nx2Perf compute_warm: unexpected entry in {}", path);
+                break;
+            }
+            Entry entry;
+            entry.env.Deserialize(file);
+            if (entry.env.ShaderStage() != Shader::Stage::Compute) {
+                LOG_WARNING(Render_Vulkan, "Nx2Perf compute_warm: non-compute entry in {}", path);
+                break;
+            }
+            file.read(reinterpret_cast<char*>(&entry.key), sizeof(entry.key));
+            // Programs already in the disk cache were built at boot; leave them out.
+            if (!compute_cache.contains(entry.key)) {
+                entries->push_back(std::move(entry));
+            }
+        }
+    } catch (const std::exception& e) {
+        LOG_WARNING(Render_Vulkan, "Nx2Perf compute_warm: reading {} failed: {}", path, e.what());
+    }
+    if (entries->empty()) {
+        return;
+    }
+    struct Progress {
+        std::atomic<size_t> next{};
+        std::atomic<size_t> built{};
+        std::atomic<size_t> failed{};
+        std::atomic<size_t> running{};
+        std::chrono::steady_clock::time_point begin{std::chrono::steady_clock::now()};
+    };
+    auto progress = std::make_shared<Progress>();
+    static const GuessMissing guess{};
+    constexpr size_t NumThreads = 4;
+    progress->running = NumThreads;
+    LOG_INFO(Render_Vulkan, "Nx2Perf compute_warm: {} programs to build on {} low priority threads",
+             entries->size(), NumThreads);
+    for (size_t thread = 0; thread < NumThreads; ++thread) {
+        compute_warm_threads.emplace_back([this, entries, progress](std::stop_token stop) {
+            Common::SetCurrentThreadName("VkComputeWarm");
+            Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+            while (!stop.stop_requested()) {
+                const size_t index = progress->next.fetch_add(1);
+                if (index >= entries->size()) {
+                    break;
+                }
+                Entry& entry = (*entries)[index];
+                entry.env.SetGuessMissing(&guess);
+                bool ok = false;
+                try {
+                    ShaderPools pools;
+                    // Built and destroyed here: only the driver's cache keeps it.
+                    ok = CreateComputePipeline(pools, entry.key, entry.env, nullptr, false)
+                             .pipeline != nullptr;
+                } catch (const std::exception& e) {
+                    LOG_DEBUG(Render_Vulkan, "compute_warm {:016x}: {}", entry.key.unique_hash,
+                              e.what());
+                }
+                (ok ? progress->built : progress->failed).fetch_add(1);
+                entry.env = FileEnvironment{};
+                const size_t done = progress->built + progress->failed;
+                if (done % 500 == 0) {
+                    LOG_INFO(Render_Vulkan, "Nx2Perf compute_warm: {} of {} done", done,
+                             entries->size());
+                }
+            }
+            if (progress->running.fetch_sub(1) == 1) {
+                LOG_INFO(Render_Vulkan,
+                         "Nx2Perf compute_warm: finished, {} built, {} failed, {} not reached, "
+                         "{:.0f} s",
+                         progress->built.load(), progress->failed.load(),
+                         entries->size() - std::min(entries->size(),
+                                                    progress->built + progress->failed),
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                       progress->begin)
+                             .count());
+            }
+        });
     }
 }
 

@@ -230,6 +230,13 @@ private:
 
     void QueueVulkanPipelineCacheFlush();
 
+    /// EDEN_NX2_COMPUTE_WARM=<file>: compute programs prepared from the game files are converted
+    /// (missing reads guessed) and built in the background, then thrown away. Nothing uses them;
+    /// they only fill the driver's shader cache, so a dispatch that later converts to the same
+    /// SPIR-V finds the driver build ready instead of waiting seconds for it.
+    void StartComputeWarm();
+    std::vector<std::jthread> compute_warm_threads;
+
     const Device& device;
     Scheduler& scheduler;
     DescriptorPool& descriptor_pool;
