@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstddef>
+#include <memory>
 #include <vector>
 
 #include "common/bit_field.h"
@@ -26,6 +27,10 @@ class MemoryManager;
 
 namespace VideoCore {
 class RasterizerInterface;
+}
+
+namespace VideoCommon {
+class GpuSplit;
 }
 
 namespace Tegra {
@@ -250,7 +255,13 @@ public:
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
 
+    /// GPU thread split (gpu_split.h): the front calls this with the methods it just sent here.
+    /// It keeps a copy of the registers a launch reads and notes what each launch writes
+    /// (GpuSplit::NoteWriterRange, or NoteUnboundedWriter where the front can't bound it).
+    void FrontMethod(VideoCommon::GpuSplit& split, u32 method, const u32* arguments, u32 amount);
+
 private:
+    void FrontNoteLaunch(VideoCommon::GpuSplit& split, u32 launch);
     /// Performs the copy from the source buffer to the destination buffer as configured in the
     /// registers.
     void Launch();
@@ -271,6 +282,9 @@ private:
     Common::ScratchBuffer<u8> read_buffer;
     Common::ScratchBuffer<u8> write_buffer;
     Common::ScratchBuffer<u8> intermediate_buffer;
+
+    /// The front's copy of the registers below src_params (FrontMethod), made on first use.
+    std::unique_ptr<std::array<u32, 0x200>> front_regs;
 
     static constexpr std::size_t NUM_REGS = 0x800;
     struct Regs {

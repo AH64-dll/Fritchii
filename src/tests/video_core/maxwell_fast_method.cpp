@@ -42,6 +42,11 @@ struct GpuSplitTestAccess {
         return split.write_position;
     }
 
+    /// As if `words` more were sent.
+    static void Advance(GpuSplit& split, u64 words) {
+        split.write_position += words;
+    }
+
     static u64 NearWrap() {
         return GpuSplit::RingWords - 1;
     }
@@ -371,6 +376,39 @@ TEST_CASE("GpuSplit CB batching respects device remaps within GPU big pages",
         REQUIRE(engine->regs.const_buffer.offset == 8);
     }
     f.Compare();
+}
+
+TEST_CASE("GpuSplit compute and copy write ranges count only for reads they overlap",
+          "[video_core][maxwell_fast_method][gpu_split_writer_ranges]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using Kind = VideoCommon::GpuSplit::WriterKind;
+    Fixture f;
+    f.memory.BindRasterizer(&f.rasterizer);
+    // Two GPU pages on device pages that are not adjacent.
+    f.memory.Map(0x100000, 0x40000, 0x1000, Tegra::PTEKind::PITCH, false);
+    f.memory.Map(0x101000, 0x80000, 0x1000, Tegra::PTEKind::PITCH, false);
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system, 100);
+
+    split.NoteWriterRange(f.memory, 0x100100, 0x100, Kind::Copy);
+    REQUIRE(split.WritersMayWriteSince(50, 0x401fc, 8));
+    REQUIRE_FALSE(split.WritersMayWriteSince(50, 0x40200, 4));
+    REQUIRE_FALSE(split.WritersMayWriteSince(50, 0x80100, 4));
+    REQUIRE_FALSE(split.WritersMayWriteSince(100, 0x40180, 4));
+
+    // Across both device pages: not one device range, so it may write anything.
+    Access::Advance(split, 10);
+    split.NoteWriterRange(f.memory, 0x100f00, 0x200, Kind::Copy);
+    REQUIRE(split.WritersMayWriteSince(105, 0x40200, 4));
+    REQUIRE_FALSE(split.WritersMayWriteSince(110, 0x40200, 4));
+
+    // A writer no engine front classified.
+    Access::Advance(split, 10);
+    split.NoteWriter();
+    REQUIRE(split.WritersMayWriteSince(115, 0x12345000, 4));
+    REQUIRE_FALSE(split.WritersMayWriteSince(120, 0x40180, 4));
+    REQUIRE(split.UnboundedWriters()[static_cast<size_t>(Kind::Copy)] == 1);
+    REQUIRE(split.UnboundedWriters()[static_cast<size_t>(Kind::Other)] == 1);
 }
 
 TEST_CASE("GpuSplit dispatch preserves mapped uploads and macro boundaries",
