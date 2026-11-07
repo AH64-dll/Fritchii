@@ -17,6 +17,7 @@ class PageFilter {
 public:
     PageFilter() : words{std::make_unique<std::atomic<u64>[]>(NumWords)} {}
 
+    /// Records that the cache holds objects on [address, address + size).
     void Mark(u64 address, u64 size) {
         if (size == 0) {
             return;
