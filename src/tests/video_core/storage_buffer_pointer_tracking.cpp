@@ -53,6 +53,7 @@ struct KernelProgram {
     IR::Program program;
     TestEnvironment env;
     bool int64{true};
+    u32 storage_buffer_limit{}; ///< The stage's storage buffer limit, none when 0
 
     KernelProgram() {
         program.stage = Shader::Stage::Compute;
@@ -64,6 +65,7 @@ struct KernelProgram {
         Shader::HostTranslateInfo host{};
         host.min_ssbo_alignment = 16;
         host.support_int64 = int64;
+        host.max_per_stage_descriptor_storage_buffers = storage_buffer_limit;
         Shader::Optimization::GlobalMemoryToStorageBufferPass(env, program, host);
         std::vector<u32> offsets;
         for (const auto& descriptor : program.info.storage_buffers_descriptors) {
@@ -475,14 +477,9 @@ TEST_CASE("Loaded pointers that compete with a pair do not take the last storage
     CHECK(program.Count(IR::Opcode::LoadGlobal128) == 0);
 }
 
-TEST_CASE("Pointer table entries are charged only for bindings the first pass left free",
-          "[shader][storage_buffer]") {
-    // The loop reads its records through the table entry at *c0[0x30] or *c0[0x38], loaded before
-    // it. That load binds c0[0x30] and c0[0x38] in the first pass, and with 28 more pointers they
-    // leave a binding for each entry. The loop is collected first: charged for its holder as well,
-    // the first entry shut out the second, as Ocarina of Time's foliage culling compute
-    // 331e607152ce78d5 bound 4 of its 8 per-type instance tables.
-    KernelProgram fixture;
+// The loop reads its records through the table entry at *c0[0x30] or *c0[0x38], loaded before
+// it. That load binds c0[0x30] and c0[0x38] in the first pass, with `pointers` more pointers.
+void EmitTableLoop(KernelProgram& fixture, u32 pointers) {
     fixture.env.native = true;
     fixture.entry.AddBranch(&fixture.loop);
     fixture.loop.AddBranch(&fixture.loop);
@@ -494,7 +491,7 @@ TEST_CASE("Pointer table entries are charged only for bindings the first pass le
     const IR::U32 holder_low{entry.Select(first, Word(entry, 0x30), Word(entry, 0x38))};
     const IR::U32 holder_high{entry.Select(first, Word(entry, 0x34), Word(entry, 0x3c))};
     const IR::Value table{entry.LoadGlobal64(Address(entry, holder_low, holder_high))};
-    for (u32 slot = 0; slot < Shader::Info::MAX_SSBOS - 4; ++slot) {
+    for (u32 slot = 0; slot < pointers; ++slot) {
         const u32 offset{0x100 + slot * 8};
         static_cast<void>(
             entry.LoadGlobal32(Address(entry, Word(entry, offset), Word(entry, offset + 4))));
@@ -504,10 +501,31 @@ TEST_CASE("Pointer table entries are charged only for bindings the first pass le
                                    body.ShiftLeftLogical(lane, body.Imm32(4)))};
     static_cast<void>(
         body.LoadGlobal128(Address(body, record, IR::U32{body.CompositeExtract(table, 1)})));
+}
+
+TEST_CASE("Pointer table entries are charged only for bindings the first pass left free",
+          "[shader][storage_buffer]") {
+    // The first pass leaves a binding for each entry. The loop is collected first: charged for its
+    // holder as well, the first entry shut out the second, as Ocarina of Time's foliage culling
+    // compute 331e607152ce78d5 bound 4 of its 8 per-type instance tables.
+    KernelProgram fixture;
+    EmitTableLoop(fixture, Shader::Info::MAX_SSBOS - 4);
 
     CHECK(fixture.TrackedOffsets().size() == Shader::Info::MAX_SSBOS);
     CHECK(std::ranges::count_if(fixture.program.info.storage_buffers_descriptors,
                                 [](const auto& desc) { return desc.indirect_offset != ~0U; }) == 2);
+}
+
+TEST_CASE("Pointer table entries stay within the stage's storage buffer limit",
+          "[shader][storage_buffer]") {
+    // The stage binds 31 storage buffers: the first pass leaves one binding, for one entry.
+    KernelProgram fixture;
+    fixture.storage_buffer_limit = 31;
+    EmitTableLoop(fixture, 28);
+
+    CHECK(fixture.TrackedOffsets().size() == 31);
+    CHECK(std::ranges::count_if(fixture.program.info.storage_buffers_descriptors,
+                                [](const auto& desc) { return desc.indirect_offset != ~0U; }) == 1);
 }
 
 TEST_CASE("Pointer table entries that would overflow the storage buffers are left out",
