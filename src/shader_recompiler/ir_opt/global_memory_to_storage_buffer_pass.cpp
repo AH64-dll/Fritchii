@@ -2055,10 +2055,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     if (!has_global_memory) {
         return;
     }
-    // The program takes as many storage buffers as the stage binds, at most MAX_SSBOS.
-    const u32 stage_limit{host_info.max_per_stage_descriptor_storage_buffers};
-    const size_t max_ssbos{stage_limit != 0 ? (std::min)(Info::MAX_SSBOS, size_t{stage_limit})
-                                            : Info::MAX_SSBOS};
+    const size_t max_ssbos{StorageBufferLimit(host_info)};
     TrackingConditions conditions{program};
     StorageInfo info;
     // Without 64-bit integers the backend cannot route global accesses among bound buffers.
@@ -2155,6 +2152,17 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
             StorageOffset(*block, *inst, storage_buffer, u32(host_info.min_ssbo_alignment))};
         Replace(*block, *inst, index, offset);
     }
+}
+
+size_t StorageBufferLimit(const HostTranslateInfo& host_info) {
+    size_t limit{Info::MAX_SSBOS};
+    for (const u32 device_limit : {host_info.max_per_stage_descriptor_storage_buffers,
+                                   host_info.max_descriptor_set_storage_buffers}) {
+        if (device_limit != 0) {
+            limit = (std::min)(limit, size_t{device_limit});
+        }
+    }
+    return limit;
 }
 
 void JoinStorageInfo(Info& base, Info& source) {

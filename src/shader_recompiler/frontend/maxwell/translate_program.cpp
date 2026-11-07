@@ -90,7 +90,7 @@ void CollectInterpolationInfo(Environment& env, IR::Program& program) {
     }
 }
 
-void AddNVNStorageBuffers(IR::Program& program) {
+void AddNVNStorageBuffers(IR::Program& program, const HostTranslateInfo& host_info) {
     if (!program.info.uses_global_memory) {
         return;
     }
@@ -133,6 +133,11 @@ void AddNVNStorageBuffers(IR::Program& program) {
                 it->write_extent = {};
             }
             continue;
+        }
+        if (descs.size() >= Optimization::StorageBufferLimit(host_info)) {
+            throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
+                                          descs.size() + 1,
+                                          Optimization::StorageBufferLimit(host_info));
         }
         descs.push_back({
             .cbuf_index = driver_cbuf,
@@ -479,7 +484,7 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     Optimization::VendorWorkaroundPass(program);
 
     CollectInterpolationInfo(env, program);
-    AddNVNStorageBuffers(program);
+    AddNVNStorageBuffers(program, normalized_host_info);
     Optimization::LimitSampledTextureArrays(program, normalized_host_info);
     return program;
 }
