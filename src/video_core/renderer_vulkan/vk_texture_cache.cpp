@@ -33,6 +33,7 @@
 
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/renderer_vulkan/blit_image.h"
+#include "video_core/renderer_vulkan/framebuffer_limits.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
@@ -4812,6 +4813,12 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
     runtime_ptr = &runtime;
     render_area.width = (std::min)(render_area.width, width);
     render_area.height = (std::min)(render_area.height, height);
+    const FramebufferSize size = ClampFramebufferSize(
+        {render_area.width, render_area.height, layers},
+        {runtime.device.GetMaxFramebufferWidth(), runtime.device.GetMaxFramebufferHeight(),
+         runtime.device.GetMaxFramebufferLayers()});
+    render_area = VkExtent2D{.width = size.width, .height = size.height};
+    layers = size.layers;
 
     if (do_resolve_color) {
         for (size_t index = 0; index < NUM_RT; ++index) {
