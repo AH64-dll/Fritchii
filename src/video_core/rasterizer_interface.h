@@ -91,6 +91,17 @@ public:
     /// Release all pending fences.
     virtual void ReleaseFences(bool force = true) = 0;
 
+    /// GPU thread, between commands: whether ReleaseFences() would only invalidate the GPU cache
+    /// (FenceManager::FencesQuiet). `epoch` gets FenceWorkEpoch() as of the check.
+    virtual bool FencesQuiet([[maybe_unused]] bool strict, [[maybe_unused]] u64& epoch) {
+        return false;
+    }
+
+    /// Any thread: changes whenever a fence or a fence operation is added.
+    [[nodiscard]] virtual u64 FenceWorkEpoch() const {
+        return 0;
+    }
+
     /// Writes the region's query reports to guest memory, waiting for pending host results.
     virtual void FlushQueryResults(DAddr addr, u64 size) {
         FlushRegion(addr, size, VideoCommon::CacheType::QueryCache);

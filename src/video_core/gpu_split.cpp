@@ -27,6 +27,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 
@@ -151,6 +152,7 @@ void GpuSplit::Stop() {
     // never ran, it waited on its syncpoint forever), and the engines it held were freed.
     ring.reset();
     write_position = 0;
+    ForgetFencesQuiet();
     last_writer_position = 0;
     last_memory_writer_position = 0;
     pending_write_count = 0;
@@ -808,6 +810,21 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
     return 1;
 }
 
+void GpuSplit::CheckFencesQuiet(u64 position) {
+    const int mode = VideoCore::Nx2Debug::Experiment(3);
+    if (mode == 0 || fence_quiet_check == nullptr) {
+        return;
+    }
+    u64 epoch{};
+    if (fence_quiet_check(fence_quiet_argument, mode == 1, &epoch)) {
+        fence_quiet_epoch.store(epoch, std::memory_order_relaxed);
+        fence_quiet_position.store(position, std::memory_order_release);
+    } else {
+        fence_quiet_position.store(~u64{0}, std::memory_order_relaxed);
+        fence_busy_position.store(position, std::memory_order_relaxed);
+    }
+}
+
 void GpuSplit::BackLoop(std::stop_token stop_token) {
     const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuBack};
     Common::SetCurrentThreadName("GPUBack");
@@ -835,8 +852,12 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
             if (available == read_position && idle_hook != nullptr) {
                 hook_requested.store(false, std::memory_order_seq_cst);
+                ForgetFencesQuiet();
                 idle_hook(idle_argument);
                 available = published.load(std::memory_order_acquire);
+                if (available == read_position) {
+                    CheckFencesQuiet(read_position);
+                }
             }
             if (available == read_position) {
                 // Publish bumps `wake` when it sees back_waiting: read it before the last look
@@ -862,6 +883,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {
                 hook_requested.store(false, std::memory_order_seq_cst);
+                ForgetFencesQuiet();
                 idle_hook(idle_argument);
             }
             // Hand ring space back now and then while working through a long batch, and at once
@@ -874,6 +896,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 NotifyFront();
             }
         }
+        CheckFencesQuiet(read_position);
         consumed.store(read_position, std::memory_order_seq_cst);
         NotifyFront();
     }

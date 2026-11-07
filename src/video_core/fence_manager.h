@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -77,16 +78,18 @@ public:
         // Not only the GPU thread queues these (query cache work runs elsewhere too), while
         // SignalFence moves the list into pending_operations: unguarded, the list was corrupted
         // and the fencing thread crashed walking it. Its own lock, held for no callbacks.
-        std::scoped_lock lock{uncommitted_guard};
-        uncommitted_operations.emplace_back(std::move(func));
+        {
+            std::scoped_lock lock{uncommitted_guard};
+            uncommitted_operations.emplace_back(std::move(func));
+        }
+        work_epoch.fetch_add(1, std::memory_order_release);
     }
 
     void SignalFence(std::function<void()>&& func) {
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
         // The accuracy can change while the game runs (settings dialog, Settings::UpdateGPUAccuracy
         // at each command list end): read once, every decision of this fence uses one value.
-        const bool level_high = VideoCore::Nx2Debug::AccuratePart(16);
-        const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? level_high : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
+        const bool delay_fence = DelayFences();
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
@@ -118,6 +121,8 @@ public:
             func();
         }
         fences.push(std::move(new_fence));
+        fences_in_flight.fetch_add(1, std::memory_order_relaxed);
+        work_epoch.fetch_add(1, std::memory_order_release);
         if (should_flush) {
             rasterizer.FlushCommands();
         }
@@ -173,6 +178,49 @@ public:
             wait_cv.wait(
                 lk, [&wait_finished] { return wait_finished.load(std::memory_order_relaxed); });
         }
+    }
+
+    /// GPU thread (the split's back between entries): whether WaitPendingFences(true) would only
+    /// invalidate the GPU cache, as no download, query, fence operation or (`strict`, or with
+    /// delayed fences) pending fence is left for it. A lock held elsewhere counts as work.
+    /// `epoch`: FenceWorkEpoch() as of the check.
+    bool FencesQuiet(bool strict, u64& epoch) {
+        epoch = work_epoch.load(std::memory_order_acquire);
+        if ((strict || DelayFences()) && fences_in_flight.load(std::memory_order_acquire) != 0) {
+            return false;
+        }
+        {
+            std::unique_lock lock{uncommitted_guard, std::try_to_lock};
+            if (!lock || !uncommitted_operations.empty()) {
+                return false;
+            }
+        }
+        {
+            std::unique_lock lock{texture_cache.mutex, std::try_to_lock};
+            if (!lock || texture_cache.HasAsyncFlushWork()) {
+                return false;
+            }
+        }
+        {
+            std::unique_lock lock{buffer_cache.mutex, std::try_to_lock};
+            if (!lock || buffer_cache.HasUncommittedFlushes()) {
+                return false;
+            }
+        }
+        if (query_cache.HasUncommittedFlushes()) {
+            return false;
+        }
+        if constexpr (requires { query_cache.HasPendingFenceWork(); }) {
+            if (query_cache.HasPendingFenceWork()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Any thread: changes whenever a fence or a fence operation is added.
+    u64 FenceWorkEpoch() const {
+        return work_epoch.load(std::memory_order_acquire);
     }
 
 protected:
@@ -238,6 +286,7 @@ private:
                 delayed_destruction_ring.Push(std::move(current_fence));
             }
             fences.pop();
+            fences_in_flight.fetch_sub(1, std::memory_order_release);
         }
     }
 
@@ -319,8 +368,19 @@ private:
                     delayed_destruction_ring.Push(std::move(released.fence));
                 }
             }
+            // Only once their operations ran: FencesQuiet must not see a fence as gone before.
+            fences_in_flight.fetch_sub(static_cast<u32>(batch.size()), std::memory_order_release);
             batch.clear();
         }
+    }
+
+    /// The accuracy can change while the game runs (settings dialog, Settings::UpdateGPUAccuracy
+    /// at each command list end): callers read it once per decision.
+    static bool DelayFences() {
+        const bool level_high = VideoCore::Nx2Debug::AccuratePart(16);
+        return Settings::IsGPUFenceBehaviorDefault()
+                   ? level_high
+                   : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
     }
 
     bool ShouldWait() const {
@@ -405,6 +465,8 @@ private:
     std::deque<std::deque<std::function<void()>>> pending_operations;
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
     u32 skipped_fences{}; ///< Empty fences skipped since the last one made (GPU thread only)
+    std::atomic<u32> fences_in_flight{}; ///< Fences made whose operations have not run yet
+    std::atomic<u64> work_epoch{};       ///< Bumped by every fence and fence operation added
 
     std::mutex guard;
     std::mutex ring_guard;

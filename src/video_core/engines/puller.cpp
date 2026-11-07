@@ -325,12 +325,66 @@ void ReportLearning(double window) {
     last_early = early;
 }
 
+// EDEN_NX2_EXP3: FenceRelease drains skipped and taken, logged every 5 s.
+struct FenceReleaseSkips {
+    using FenceQuiet = VideoCommon::GpuSplit::FenceQuiet;
+    std::array<u64, 4> taken{}; ///< By GpuSplit::FenceQuiet; Quiet = fence work added since
+    u64 skipped{};
+    std::chrono::steady_clock::time_point since{};
+
+    void Count(FenceQuiet state, bool skip) {
+        if (skip) {
+            ++skipped;
+        } else {
+            ++taken[static_cast<size_t>(state)];
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (since == std::chrono::steady_clock::time_point{}) {
+            since = now;
+            return;
+        }
+        const double window = std::chrono::duration<double>(now - since).count();
+        if (window < 5.0) {
+            return;
+        }
+        const auto rate = [window](u64 count) { return static_cast<double>(count) / window; };
+        LOG_INFO(HW_GPU,
+                 "Fence release skip (EXP3={}): {:.0f} drains skipped/s, {:.0f} taken/s: {:.0f} "
+                 "back behind, {:.0f} fence work pending, {:.0f} fence work added since, {:.0f} "
+                 "unchecked",
+                 VideoCore::Nx2Debug::Experiment(3), rate(skipped),
+                 rate(taken[0] + taken[1] + taken[2] + taken[3]),
+                 rate(taken[static_cast<size_t>(FenceQuiet::Behind)]),
+                 rate(taken[static_cast<size_t>(FenceQuiet::Busy)]),
+                 rate(taken[static_cast<size_t>(FenceQuiet::Quiet)]),
+                 rate(taken[static_cast<size_t>(FenceQuiet::Unchecked)]));
+        *this = {};
+        since = now;
+    }
+};
+
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
 // the back's state, which a drained back still uses from its idle hook (it submits).
+// EDEN_NX2_EXP3 (1, or 2 to allow pending fences without delayed fences): no drain when the
+// back, having run everything sent, found the release would only invalidate the GPU cache
+// (FenceManager::FencesQuiet) and no fence work was added since; the invalidation still runs
+// on the back, in order. Fences already made complete without a release.
 void ReleaseFences(DmaPusher& dma_pusher) {
-    VideoCommon::GpuSplit::Get().Run(
-        [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
-        VideoCommon::DrainSite::FenceRelease);
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (VideoCore::Nx2Debug::Experiment(3) != 0 && split.Active()) {
+        static FenceReleaseSkips skips;
+        u64 epoch{};
+        const auto state = split.FencesQuietNow(epoch);
+        const bool skip = state == VideoCommon::GpuSplit::FenceQuiet::Quiet &&
+                          dma_pusher.rasterizer->FenceWorkEpoch() == epoch;
+        skips.Count(state, skip);
+        if (skip) {
+            OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->InvalidateGPUCache(); });
+            return;
+        }
+    }
+    split.Run([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
+              VideoCommon::DrainSite::FenceRelease);
 }
 
 } // Anonymous namespace

@@ -133,6 +133,34 @@ public:
         idle_hook = hook;
         idle_argument = argument;
     }
+    /// Experiment(3): asked on the back whenever it has run everything published, whether a
+    /// ReleaseFences there would only invalidate the GPU cache (RasterizerInterface::FencesQuiet).
+    using FenceQuietCheck = bool (*)(void* argument, bool strict, u64* epoch);
+    void SetFenceQuietCheck(FenceQuietCheck check, void* argument) {
+        fence_quiet_check = check;
+        fence_quiet_argument = argument;
+    }
+    enum class FenceQuiet : u32 {
+        Quiet,     ///< The back found nothing to release with everything sent executed
+        Behind,    ///< Work sent is still queued (or unpublished)
+        Busy,      ///< The back found fence work with everything sent executed
+        Unchecked, ///< The back has not checked at this position (or its idle hook ran since)
+    };
+    /// Front: what the back's last check found, if it was made with everything sent executed.
+    /// `epoch`: the fence work epoch the back saw (compare with FenceWorkEpoch()).
+    [[nodiscard]] FenceQuiet FencesQuietNow(u64& epoch) const {
+        if (consumed.load(std::memory_order_acquire) != write_position) {
+            return FenceQuiet::Behind;
+        }
+        if (fence_quiet_position.load(std::memory_order_acquire) == write_position) {
+            epoch = fence_quiet_epoch.load(std::memory_order_relaxed);
+            return FenceQuiet::Quiet;
+        }
+        return fence_busy_position.load(std::memory_order_relaxed) == write_position
+                   ? FenceQuiet::Busy
+                   : FenceQuiet::Unchecked;
+    }
+
     /// Any thread: whether the back thread runs (false before it starts and once it stopped).
     [[nodiscard]] bool BackRunning() const {
         return back_running.load(std::memory_order_acquire);
@@ -603,6 +631,20 @@ private:
     static inline thread_local bool on_back_thread{};
     void (*idle_hook)(void*){};
     void* idle_argument{};
+    FenceQuietCheck fence_quiet_check{};
+    void* fence_quiet_argument{};
+    /// Back: runs fence_quiet_check at `position` (everything published executed).
+    void CheckFencesQuiet(u64 position);
+    /// Back: forgets the last check (the idle hook submits, which may change the caches).
+    void ForgetFencesQuiet() {
+        fence_quiet_position.store(~u64{0}, std::memory_order_relaxed);
+        fence_busy_position.store(~u64{0}, std::memory_order_relaxed);
+    }
+    /// Written by the back before `consumed`: the position of its last check that found nothing
+    /// to release (with the epoch it saw), or that found work; ~0 for none.
+    alignas(128) std::atomic<u64> fence_quiet_position{~u64{0}};
+    std::atomic<u64> fence_busy_position{~u64{0}};
+    std::atomic<u64> fence_quiet_epoch{};
     alignas(64) std::atomic<bool> hook_requested{};
     std::atomic<bool> back_running{};
 

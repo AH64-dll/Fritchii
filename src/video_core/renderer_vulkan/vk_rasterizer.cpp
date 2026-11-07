@@ -303,10 +303,16 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
         &scheduler);
+    VideoCommon::GpuSplit::Get().SetFenceQuietCheck(
+        [](void* argument, bool strict, u64* epoch) {
+            return static_cast<RasterizerVulkan*>(argument)->FencesQuiet(strict, *epoch);
+        },
+        this);
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
+    VideoCommon::GpuSplit::Get().SetFenceQuietCheck(nullptr, nullptr);
     scheduler.WaitWorker();
     scheduler.Finish();
 }
@@ -1987,6 +1993,14 @@ void RasterizerVulkan::SignalReference() {
 
 void RasterizerVulkan::ReleaseFences(bool force) {
     fence_manager.WaitPendingFences(force);
+}
+
+bool RasterizerVulkan::FencesQuiet(bool strict, u64& epoch) {
+    return fence_manager.FencesQuiet(strict, epoch);
+}
+
+u64 RasterizerVulkan::FenceWorkEpoch() const {
+    return fence_manager.FenceWorkEpoch();
 }
 
 void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
