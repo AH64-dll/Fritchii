@@ -288,6 +288,10 @@ private:
     VideoCommon::SplitWriteTracker::Effect FrontEffect(u32 method) const;
     /// After sending it: the memory it writes, for the front's reads.
     void FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
+    /// After sending it: what it may write as compute work, for the front's macro memory reads
+    /// (GpuSplit::NoteWriterRange, NoteUnboundedWriter).
+    void FrontNoteWriter(VideoCommon::GpuSplit& split, const FrontState& state, u32 method,
+                         u32 argument);
     std::unique_ptr<FrontState> front;
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
 
