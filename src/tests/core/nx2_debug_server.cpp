@@ -412,3 +412,68 @@ TEST_CASE("Injected input merges buttons and replaces sticks while installed", "
     REQUIRE(controller.GetNpadButtons().raw == None);
     REQUIRE(controller.GetSticks().left.x == 0);
 }
+
+TEST_CASE("Debug input step ends find the same step as InputAt", "[core][nx2_debug_server]") {
+    std::vector<Core::Nx2Debug::InputStep> steps(3);
+    steps[0] = {.input = {.buttons = Core::HID::NpadButton::A, .left = {}, .right = {}}, .frames = 2};
+    steps[1] = {.input = {}, .frames = 1};
+    steps[2] = {.input = {.buttons = Core::HID::NpadButton::B, .left = {}, .right = {}}, .frames = 3};
+    const auto ends = Core::Nx2Debug::InputStepEnds(steps, 10);
+    REQUIRE(ends == std::vector<u64>{12, 13, 16});
+    for (u64 now = 0; now < 20; ++now) {
+        CAPTURE(now);
+        const auto linear = Core::Nx2Debug::InputAt(steps, 10, now);
+        const auto searched = Core::Nx2Debug::InputAt(steps, ends, now);
+        REQUIRE(linear.has_value() == searched.has_value());
+        if (linear) {
+            REQUIRE(linear->buttons == searched->buttons);
+        }
+    }
+}
+
+TEST_CASE("Recorded input keeps injectable buttons and quantizes sticks", "[core][nx2_debug_server]") {
+    using enum Core::HID::NpadButton;
+    const auto input = Core::Nx2Debug::RecordedInput(
+        A | ZR | StickLLeft | StickRUp,
+        {.left = {.x = 300, .y = -Core::HID::HID_JOYSTICK_MAX}, .right = {.x = 16380, .y = -600}});
+    REQUIRE(input.buttons == (A | ZR));
+    REQUIRE(input.left->x == 0);
+    REQUIRE(input.left->y == -Core::HID::HID_JOYSTICK_MAX);
+    REQUIRE(input.right->x == 16384);
+    REQUIRE(input.right->y == 0);
+    // Jitter below 1/1024 of full scale records as the same input.
+    const auto jittered = Core::Nx2Debug::RecordedInput(
+        A | ZR, {.left = {.x = 0, .y = -32760}, .right = {.x = 16390, .y = 0}});
+    REQUIRE(jittered.left->y == input.left->y);
+    REQUIRE(jittered.right->x == input.right->x);
+}
+
+TEST_CASE("Recorded input merges equal presents and splits long runs", "[core][nx2_debug_server]") {
+    using enum Core::HID::NpadButton;
+    const auto a = Core::Nx2Debug::RecordedInput(A, {});
+    const auto b = Core::Nx2Debug::RecordedInput(None, {.left = {.x = 20000, .y = 0}, .right = {}});
+    std::vector<Core::Nx2Debug::InputStep> steps;
+    Core::Nx2Debug::AppendRecordedInput(steps, a, 1);
+    Core::Nx2Debug::AppendRecordedInput(steps, a, 2);
+    REQUIRE(steps.size() == 1);
+    REQUIRE(steps[0].frames == 3);
+    Core::Nx2Debug::AppendRecordedInput(steps, b, 1);
+    Core::Nx2Debug::AppendRecordedInput(steps, a, 36005);
+    REQUIRE(steps.size() == 4);
+    REQUIRE(steps[1].frames == 1);
+    REQUIRE(steps[2].frames == 36000);
+    REQUIRE(steps[3].frames == 5);
+    for (const auto& step : steps) {
+        const json written = Core::Nx2Debug::InputStepJson(step);
+        CAPTURE(written.dump());
+        const auto read = Core::Nx2Debug::ParseInputStep(written);
+        REQUIRE(read.frames == step.frames);
+        REQUIRE(read.input.buttons == step.input.buttons);
+        REQUIRE(read.input.left->x == step.input.left->x);
+        REQUIRE(read.input.left->y == step.input.left->y);
+        REQUIRE(read.input.right->x == step.input.right->x);
+        REQUIRE(read.input.right->y == step.input.right->y);
+    }
+    REQUIRE(Core::Nx2Debug::InputStepJson(steps[1]) ==
+            json{{"frames", 1}, {"left_stick", {0.6103515625, 0.0}}, {"right_stick", {0.0, 0.0}}});
+}

@@ -360,6 +360,9 @@ public:
     /// Installs the debug server's injector, or removes it when empty. Never changes mappings.
     void SetInputInjector(InputInjector injector);
 
+    /// Whether the debug server's injector is installed.
+    bool HasInputInjector() const;
+
     /// Returns the latest status of motion input from the mouse
     MotionState GetMotions() const;
 

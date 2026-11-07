@@ -93,6 +93,28 @@ struct InputStep {
 [[nodiscard]] std::optional<HID::InjectedInput> InputAt(std::span<const InputStep> steps, u64 start,
                                                        u64 now);
 
+/// Where each step ends: start plus the frames of the steps up to and including it.
+[[nodiscard]] std::vector<u64> InputStepEnds(std::span<const InputStep> steps, u64 start);
+
+/// InputAt with the ends precomputed by InputStepEnds: a binary search, so a long replay costs
+/// little on every npad read.
+[[nodiscard]] std::optional<HID::InjectedInput> InputAt(std::span<const InputStep> steps,
+                                                       std::span<const u64> ends, u64 now);
+
+/// What input_record keeps of one present: the buttons ParseInputStep accepts and both sticks,
+/// always set, quantized to 1/1024 of full scale with |v| < 0.02 as 0.
+[[nodiscard]] HID::InjectedInput RecordedInput(HID::NpadButton buttons,
+                                               const HID::AnalogSticks& sticks);
+
+/// Appends frames presents of input, extending the last step when it holds the same input, and
+/// starting a new step whenever one would exceed the frames ParseInputStep accepts.
+void AppendRecordedInput(std::vector<InputStep>& steps, const HID::InjectedInput& input,
+                         u64 frames);
+
+/// The step as ParseInputStep reads it, sticks quantized as RecordedInput does; buttons are left
+/// out when none are held.
+[[nodiscard]] nlohmann::json InputStepJson(const InputStep& step);
+
 /// The service when EDEN_NX2_DEBUG_SERVER is set and it can listen, otherwise null.
 [[nodiscard]] std::unique_ptr<Service> MaybeStartService(System& system, std::string title,
                                                          u64 program_id);
