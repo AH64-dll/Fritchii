@@ -1709,8 +1709,16 @@ void Device::RemoveUnsuitableExtensions() {
         if (no_matrix_units && extensions.cooperative_matrix) {
             LOG_INFO(Render_Vulkan, "Cooperative matrices off: AMD GPU without matrix units");
         }
+        // EDEN_NX2_NO_COOP_MATRIX=1 keeps HMMA on the software path, for A/B runs and for drivers
+        // the checks above miss (#634: amdvlk64.dll crash on an RX 6900 XT).
+        const char* const no_coop_matrix = std::getenv("EDEN_NX2_NO_COOP_MATRIX");
+        const bool forced_off = no_coop_matrix != nullptr && *no_coop_matrix != '\0' &&
+                                std::string_view{no_coop_matrix} != "0";
+        if (forced_off && extensions.cooperative_matrix) {
+            LOG_INFO(Render_Vulkan, "Cooperative matrices off: EDEN_NX2_NO_COOP_MATRIX is set");
+        }
         const bool usable = extensions.cooperative_matrix && !emulated_amd_matrices &&
-                            !no_matrix_units &&
+                            !no_matrix_units && !forced_off &&
                             features.cooperative_matrix.cooperativeMatrix &&
                             (properties.cooperative_matrix.cooperativeMatrixSupportedStages &
                              VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
