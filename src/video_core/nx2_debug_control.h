@@ -162,6 +162,15 @@ inline std::atomic<int> g_idle_pause{-1};
 /// waits for them, when the back goes idle or with the next submission, instead of at once
 /// (DISPATCH_BATCH, RasterizerVulkan::SubmitNx2ListCopies). Off by default; 1, 2 and 4 change
 /// only when work becomes visible, 8 changes submission timing (the #161 family: flash watch).
+/// EXP28 (fewer fences, zortos293/Lichii#717; FenceManager::SignalFence), bits: 1 = a fence whose
+/// only work is syncing payload releases into host buffers is skipped like an empty one (the
+/// guest word was written at once; the copy goes with the next fence made or wait for idle,
+/// values kept per release since the query slot may be reused: GuestStreamer::
+/// SyncDeferredWrites) (FENCE_TRIM), 2 = a made fence with nothing to wait for on the host GPU
+/// joins the newest queued fence, or with none queued and the fencing thread idle runs its work
+/// on the split's back at once (FENCE_FOLD, FoldStubbedFence). Off by default; timing family
+/// (#161, boulder flashes): flash watch after each. "Fence decisions/s" (GPU profile) counts
+/// both.
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <deque>
@@ -13,6 +14,7 @@
 #include <mutex>
 #include "common/container/unordered_map.h"
 #include <utility>
+#include <vector>
 
 #include "common/assert.h"
 #include "common/common_types.h"
@@ -57,7 +59,14 @@ public:
     size_t WriteCounter(VAddr address, bool has_timestamp, u32 value,
                         std::optional<u32> subreport = std::nullopt) override {
         auto new_id = BuildQuery(has_timestamp, address, static_cast<u64>(value));
-        pending_sync.push_back(new_id);
+        // The value is kept here too: with EXP28 & 1 the sync can come after fences that freed
+        // the slot, which may hold another release by then (zortos293/Lichii#717).
+        pending_sync.push_back(PendingSync{
+            .id = new_id,
+            .address = address,
+            .value = static_cast<u64>(value),
+            .has_timestamp = has_timestamp,
+        });
         return new_id;
     }
 
@@ -65,23 +74,35 @@ public:
         return !pending_sync.empty();
     }
 
+    void NoteSyncDeferred() override {
+        if (!pending_sync.empty()) {
+            sync_deferred = true;
+        }
+    }
+
     void SyncWrites() override {
         if (pending_sync.empty()) {
+            sync_deferred = false;
             return;
         }
         std::vector<SyncValuesStruct> sync_values;
         sync_values.reserve(pending_sync.size());
-        for (size_t pending_id : pending_sync) {
-            auto& query = slot_queries[pending_id];
-            if (True(query.flags & QueryFlagBits::IsRewritten) ||
-                True(query.flags & QueryFlagBits::IsInvalidated)) {
-                continue;
+        if (std::exchange(sync_deferred, false)) {
+            SyncDeferredWrites(sync_values);
+        } else {
+            for (const PendingSync& pending : pending_sync) {
+                auto& query = slot_queries[pending.id];
+                if (True(query.flags & QueryFlagBits::IsRewritten) ||
+                    True(query.flags & QueryFlagBits::IsInvalidated)) {
+                    continue;
+                }
+                query.flags |= QueryFlagBits::IsHostSynced;
+                sync_values.emplace_back(SyncValuesStruct{
+                    .address = query.guest_address,
+                    .value = query.value,
+                    .size = static_cast<u64>(
+                        True(query.flags & QueryFlagBits::HasTimestamp) ? 8 : 4)});
             }
-            query.flags |= QueryFlagBits::IsHostSynced;
-            sync_values.emplace_back(SyncValuesStruct{
-                .address = query.guest_address,
-                .value = query.value,
-                .size = static_cast<u64>(True(query.flags & QueryFlagBits::HasTimestamp) ? 8 : 4)});
         }
         pending_sync.clear();
         if (sync_values.size() > 0) {
@@ -90,8 +111,44 @@ public:
     }
 
 private:
+    struct PendingSync {
+        size_t id;
+        VAddr address;
+        u64 value;
+        bool has_timestamp;
+    };
+
+    /// Syncs that waited past a fence (EXP28 & 1, zortos293/Lichii#717 SyncWrites): the values
+    /// as reported, newest first, one per address (one copy command must not write a range
+    /// twice); a slot's flags count only while it still holds that release.
+    void SyncDeferredWrites(std::vector<SyncValuesStruct>& sync_values) {
+        std::vector<VAddr> seen;
+        seen.reserve(pending_sync.size());
+        for (auto it = pending_sync.rbegin(); it != pending_sync.rend(); ++it) {
+            if (std::find(seen.begin(), seen.end(), it->address) != seen.end()) {
+                continue;
+            }
+            seen.push_back(it->address);
+            auto& query = slot_queries[it->id];
+            const bool same = query.guest_address == it->address && query.value == it->value;
+            if (same && (True(query.flags & QueryFlagBits::IsRewritten) ||
+                         True(query.flags & QueryFlagBits::IsInvalidated))) {
+                continue;
+            }
+            if (same) {
+                query.flags |= QueryFlagBits::IsHostSynced;
+            }
+            sync_values.emplace_back(SyncValuesStruct{
+                .address = it->address,
+                .value = it->value,
+                .size = static_cast<u64>(it->has_timestamp ? 8 : 4)});
+        }
+    }
+
     RuntimeType& runtime;
-    std::deque<size_t> pending_sync;
+    std::deque<PendingSync> pending_sync;
+    /// EXP28 & 1: pending_sync waited past a fence (NoteSyncDeferred).
+    bool sync_deferred{};
 };
 
 template <typename Traits>
@@ -575,13 +632,25 @@ bool QueryCacheBase<Traits>::HasUncommittedFlushes() const {
 }
 
 template <typename Traits>
-bool QueryCacheBase<Traits>::HasPendingFenceWork() const {
+bool QueryCacheBase<Traits>::HasPendingFenceWork(bool ignore_payload_sync) const {
     bool result = false;
-    impl->ForEachStreamer([&result](StreamerInterface* streamer) {
-        result |= streamer->HasUnsyncedQueries() || streamer->HasPendingSync();
+    StreamerInterface* const payload =
+        ignore_payload_sync ? impl->streamers[static_cast<size_t>(QueryType::Payload)] : nullptr;
+    impl->ForEachStreamer([&result, payload](StreamerInterface* streamer) {
+        result |= streamer->HasUnsyncedQueries() ||
+                  (streamer != payload && streamer->HasPendingSync());
         return result;
     });
     return result;
+}
+
+template <typename Traits>
+void QueryCacheBase<Traits>::NotePayloadSyncDeferred() {
+    if (StreamerInterface* const payload =
+            impl->streamers[static_cast<size_t>(QueryType::Payload)];
+        payload != nullptr) {
+        payload->NoteSyncDeferred();
+    }
 }
 
 template <typename Traits>

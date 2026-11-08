@@ -52,6 +52,12 @@ public:
         /* Do Nothing */
     }
 
+    /// EDEN_NX2_EXP28 & 1: a fence went without this streamer's pending syncs; they wait for a
+    /// later fence or wait for idle while their query slots may be reused.
+    virtual void NoteSyncDeferred() {
+        /* Do Nothing */
+    }
+
     virtual size_t WriteCounter(VAddr address, bool has_timestamp, u32 value,
                                 std::optional<u32> subreport = std::nullopt) = 0;
 
