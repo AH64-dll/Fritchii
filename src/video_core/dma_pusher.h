@@ -231,6 +231,9 @@ public:
     /// since. False when not all are current (or the list isn't GPU-written): the caller drains,
     /// flushes and reads guest memory.
     bool ReadGpuWrittenCommands(GPUVAddr address, u32 count);
+    /// EDEN_NX2_LIST_VERIFY: reads the list ReadGpuWrittenCommands just read again as before
+    /// EXP40 (Nx2ListVerify) and leaves the words read last in command_headers.
+    void VerifyGpuWrittenCommands(GPUVAddr address, u32 count);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
 

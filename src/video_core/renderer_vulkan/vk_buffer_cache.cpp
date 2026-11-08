@@ -543,6 +543,13 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick, u64 writer) {
     if (master.IsFree(tick)) {
         return;
     }
+    // The split's front waits for the GPU: the back runs meanwhile what the front sent, also the
+    // entries since the front's last publish, which it does not see yet (fewer than 256 words;
+    // zortos293/Lichii#805 34656e8225).
+    if (auto& split = VideoCommon::GpuSplit::Get();
+        split.Active() && !VideoCommon::GpuSplit::OnBackThread()) {
+        split.Publish();
+    }
     if (ListWaitTrace* const trace = ListWaitTrace::Get()) [[unlikely]] {
         master.Refresh();
         const u64 known = master.KnownGpuTick();
