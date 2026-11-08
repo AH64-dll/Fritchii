@@ -81,6 +81,17 @@ struct AsyncDecodeContext {
 
 using TextureCacheGPUMap = ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>;
 
+/// The current draw's render targets as the asynchronous shaders' skip rule sees them
+/// (TextureCache::ClassifyDrawTargets): the class of the draw, and the target that gave it (the
+/// first of the draw's least safe class; address 0 for a draw without targets).
+struct DrawTargets {
+    DrawTargetClass kind{DrawTargetClass::Recurring};
+    GPUVAddr gpu_addr{};
+    u32 width{};
+    u32 height{};
+    VideoCore::Surface::PixelFormat format{};
+};
+
 class TextureCacheChannelInfo : public ChannelInfo {
 public:
     TextureCacheChannelInfo() = delete;
@@ -280,6 +291,12 @@ public:
     [[nodiscard]] const RenderTargets& GetRenderTargets() const noexcept {
         return render_targets;
     }
+
+    /// EDEN_NX2_ASYNC_DISCARD: classifies the render targets the current registers bind (the
+    /// bound ones when they are current, otherwise the registered images at the registers'
+    /// addresses; nothing is created). Takes the cache's lock. Meant for a draw whose pipeline is
+    /// missing, so it runs per miss, not per draw.
+    [[nodiscard]] DrawTargets ClassifyDrawTargets();
 
     /// Mark images in a range as modified from the CPU
     void WriteMemory(DAddr cpu_addr, size_t size);
@@ -755,6 +772,10 @@ private:
 
     /// Returns true if the current clear parameters clear the whole image of a given image view
     [[nodiscard]] bool IsFullClear(ImageViewId id);
+
+    /// UpdateRenderTargets(true): records a full clear on the targets the clear writes (the
+    /// colour target it names, the depth target when depth is cleared), for ClassifyDrawTargets.
+    void NoteFullClears();
 
     [[nodiscard]] std::pair<u32, u32> PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                       bool mark_as_modified);

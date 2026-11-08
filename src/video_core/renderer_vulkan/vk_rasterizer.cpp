@@ -479,6 +479,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         if (frame_dump.Capturing()) {
             frame_dump.NoteSkipped(false, ps != 0 ? ps : vs, regs.rt[0].Address(), reason);
         }
+        // A missing pipeline is counted by class of target in the "Async discard" 10 s line
+        // instead; this capped list is kept for EDEN_NX2_ASYNC_DISCARD=1 (the default) only.
+        if (reason == "no pipeline" && pipeline_cache.LastLookupSkipped() &&
+            AsyncDiscardMode() != 1) {
+            return;
+        }
         if (seen.size() < 64 && seen.emplace(vs, ps, reason).second) {
             LOG_WARNING(HW_GPU, "Draw skipped ({}): vs={:#x} ps={:#x} rt0={:#x} {}x{}", reason, vs, ps,
                         regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);

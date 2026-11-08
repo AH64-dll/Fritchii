@@ -64,6 +64,7 @@
 #include "video_core/renderer_vulkan/vk_cooperative_hmma_test.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/texture_cache/formatter.h"
 #include "video_core/renderer_vulkan/vk_pipeline_translate_queue.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -807,7 +808,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             const size_t threads = TranslateThreads();
             translate_queue = std::make_unique<TranslateQueue>(
                 threads, MaxTranslationsInFlight,
-                [this](TranslationJob& job) { TranslateOnWorker(job); });
+                [this](TranslationJob& job) { TranslateOnWorker(job); },
+                [this](std::unique_ptr<GraphicsPipeline> pipeline) {
+                    RetireTranslatedPipeline(std::move(pipeline));
+                });
             LOG_INFO(Render_Vulkan,
                      "EDEN_NX2_ASYNC_TRANSLATE={}: new pipelines of draws that may be skipped are "
                      "translated on {} threads{}",
@@ -1675,6 +1679,7 @@ PipelineCache::~PipelineCache() {
     DestroyPipelinesWithProgress(background_ready);
     DestroyPipelinesWithProgress(graphics_cache);
     DestroyPipelinesWithProgress(evicted_pipelines);
+    DestroyPipelinesWithProgress(retired_translations);
 }
 
 void PipelineCache::NoteDiskRecordFailure(std::string_view kind, u64 hash, const char* reason) {
@@ -2058,6 +2063,7 @@ void PipelineCache::RefreshGraphicsKey() {
 }
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
+    ++lookup_serial;
     if (const int clean_mode = PipelineCleanMode(); clean_mode != 0) {
         return CurrentGraphicsPipelineClean(clean_mode == 2);
     }
@@ -3616,6 +3622,7 @@ void ReportWorstFrame() {
 void PipelineCache::TickFrame() {
     ++frame_count;
     ReportWorstFrame();
+    ReportAsyncDiscard();
     if (translate_queue) {
         TickTranslations();
     }
@@ -3633,6 +3640,11 @@ void PipelineCache::TickFrame() {
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
         evicted_pipelines.pop_front();
     }
+    // A retired translation's build may still be queued on the pipeline workers: destroying it
+    // now would wait for that build, or run it here on the GPU thread.
+    std::erase_if(retired_translations, [this](const auto& entry) {
+        return scheduler.IsFree(entry.first) && entry.second->IsBuilt();
+    });
     while (!retired_compute_pipelines.empty() &&
            scheduler.IsFree(retired_compute_pipelines.front().first) &&
            retired_compute_pipelines.front().second->IsBuildTaskDone()) {
@@ -3648,6 +3660,12 @@ void PipelineCache::TickFrame() {
             constexpr size_t MaxLibraries = 4096;
             graphics_libraries.TrimUnused(MaxLibraries);
         }
+    }
+}
+
+void PipelineCache::RetireTranslatedPipeline(std::unique_ptr<GraphicsPipeline> pipeline) {
+    if (pipeline) {
+        retired_translations.emplace_back(scheduler.CurrentTick(), std::move(pipeline));
     }
 }
 
@@ -3773,22 +3791,116 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     return discard ? nullptr : pipeline;
 }
 
+int AsyncDiscardMode() {
+    // Read on first use (the first missing pipeline), after nx2_switches.txt was applied.
+    static const int mode = [] {
+        const char* value = std::getenv("EDEN_NX2_ASYNC_DISCARD");
+        const int parsed = value == nullptr ? 1 : value[0] == '0' ? 0 : value[0] == '2' ? 2 : 1;
+        static constexpr std::array<const char*, 3> what{
+            "wait for every unbuilt pipeline",
+            "skip unbuilt pipelines by the legacy heuristic",
+            "skip unbuilt pipelines only into render targets cleared every frame",
+        };
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_ASYNC_DISCARD={}: native draws {}", parsed,
+                 what[parsed]);
+        return parsed;
+    }();
+    return mode;
+}
+
 bool PipelineCache::DrawMayBeSkipped() const {
     // Native draws whose pipeline is still building are skipped instead of waited for (the
     // object is missing for a frame or more rather than the game freezing while the driver
     // compiles). Full-screen passes (no depth, few vertices) still wait, so a lighting or post
     // pass is never dropped. EDEN_NX2_ASYNC_DISCARD=0 waits for every pipeline.
-    static const bool discard_native = [] {
-        const char* value = std::getenv("EDEN_NX2_ASYNC_DISCARD");
-        const bool enabled = value == nullptr || value[0] != '0';
-        LOG_INFO(Render_Vulkan, "EDEN_NX2_ASYNC_DISCARD: native draws {} unbuilt pipelines",
-                 enabled ? "skip" : "wait for");
-        return enabled;
-    }();
+    //
+    // The legacy heuristic ignores the target, so a draw into a layer the game renders once
+    // (title screen text, a chat bubble, a probe) loses its only draw for good when its
+    // pipeline is missing (fable_answer_18 1a). EDEN_NX2_ASYNC_DISCARD=2 skips only into
+    // targets fully cleared in this render frame and in a recent earlier one; first-time and
+    // persistent targets wait by the paths that wait today (Configure's build wait, the
+    // translate queue's capped Wait and synchronous fallback). The frame is the texture cache's
+    // render frame, the one last_write_frame uses (the render-frame clock when live, frame_tick
+    // otherwise); a tick that lands mid-frame can only make a target look first-time, so it
+    // costs a wait and never a skip (ClassifyClearedTarget).
+    if (discard_decision.serial == lookup_serial) {
+        return discard_decision.skip;
+    }
+    const int mode = AsyncDiscardMode();
+    const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
-    return CanDiscardPendingDraw(maxwell3d->GetNativeMacroEngine().native_turing,
-                                 maxwell3d->regs.zeta_enable != 0, draw_state.draw_element_count,
-                                 draw_state.draw_element_count, discard_native);
+    // Classified in every mode, for the counts (with 1, the persistent column is what today's
+    // rule drops for good); it runs per missing pipeline, not per draw.
+    const VideoCommon::DrawTargets targets = texture_cache.ClassifyDrawTargets();
+    const bool recurring =
+        mode != 2 || !native || targets.kind == VideoCommon::DrawTargetClass::Recurring;
+    const bool skip = CanDiscardPendingDraw(native, maxwell3d->regs.zeta_enable != 0,
+                                            draw_state.draw_element_count,
+                                            draw_state.draw_element_count, mode != 0, recurring);
+    discard_decision = DiscardDecision{.serial = lookup_serial, .skip = skip};
+    NoteDiscardDecision(skip, targets);
+    return skip;
+}
+
+void PipelineCache::NoteDiscardDecision(bool skip, const VideoCommon::DrawTargets& targets) const {
+    auto& stats = discard_stats;
+    const bool repeat = stats.last_frame == frame_count && stats.last_skip == skip &&
+                        stats.last_kind == targets.kind && stats.last_target == targets.gpu_addr &&
+                        stats.last_key == graphics_key;
+    if (repeat) {
+        return;
+    }
+    stats.last_frame = frame_count;
+    stats.last_skip = skip;
+    stats.last_kind = targets.kind;
+    stats.last_target = targets.gpu_addr;
+    stats.last_key = graphics_key;
+    const size_t index = static_cast<size_t>(targets.kind);
+    ++(skip ? stats.skipped : stats.waited)[index];
+    constexpr size_t MaxListedTargets = 32;
+    if (targets.kind != VideoCommon::DrawTargetClass::Persistent || targets.gpu_addr == 0 ||
+        listed_persistent_targets.size() >= MaxListedTargets ||
+        !listed_persistent_targets.insert(targets.gpu_addr).second) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Async discard: draw into persistent target {:#x} {}x{} {} {} for its pipeline "
+             "{:016x} (EDEN_NX2_ASYNC_DISCARD={}; each target listed once, {} of {})",
+             targets.gpu_addr, targets.width, targets.height, targets.format,
+             skip ? "skipped" : "waits", graphics_key.Hash(), AsyncDiscardMode(),
+             listed_persistent_targets.size(), MaxListedTargets);
+}
+
+void PipelineCache::ReportAsyncDiscard() {
+    auto& stats = discard_stats;
+    const auto now = std::chrono::steady_clock::now();
+    if (stats.window == std::chrono::steady_clock::time_point{}) {
+        stats.window = now;
+        stats.held_at_window = GraphicsPipeline::HoldTimeTotal();
+        return;
+    }
+    if (now - stats.window < std::chrono::seconds{10}) {
+        return;
+    }
+    const auto held_total = GraphicsPipeline::HoldTimeTotal();
+    const auto held = held_total - stats.held_at_window;
+    const auto& skipped = stats.skipped;
+    const auto& waited = stats.waited;
+    if (skipped[0] + skipped[1] + skipped[2] + waited[0] + waited[1] + waited[2] != 0) {
+        const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+        LOG_INFO(Render_Vulkan,
+                 "Async discard in the last 10 s (EDEN_NX2_ASYNC_DISCARD={}): lookups of "
+                 "unbuilt pipelines skipped {} recurring, {} first-time, {} persistent; waited "
+                 "{} recurring, {} first-time, {} persistent; {:.1f} ms of draws held for "
+                 "unbuilt pipelines, {:.1f} ms of GPU thread waiting for translations",
+                 AsyncDiscardMode(), skipped[0], skipped[1], skipped[2], waited[0], waited[1],
+                 waited[2], ms(held), ms(stats.queue_wait));
+    }
+    stats.skipped = {};
+    stats.waited = {};
+    stats.queue_wait = {};
+    stats.held_at_window = held_total;
+    stats.window = now;
 }
 
 namespace {
@@ -4413,10 +4525,14 @@ bool PipelineCache::EnqueueTranslation() {
         GetGraphicsEnvironments(live, graphics_key.unique_hashes);
         job->reference = std::make_unique<TranslationRecord>();
         job->reference->translate_only = true;
-        main_pools.ReleaseContents();
+        // Pools of its own: nothing else on the GPU thread holds IR in them.
+        if (!verify_pools) {
+            verify_pools = std::make_unique<ShaderPools>();
+        }
+        verify_pools->ReleaseContents();
         [[maybe_unused]] const auto none =
-            CreateGraphicsPipeline(main_pools, graphics_key, live.Span(), nullptr, true, nullptr,
-                                   nullptr, false, job->reference.get());
+            CreateGraphicsPipeline(*verify_pools, graphics_key, live.Span(), nullptr, true,
+                                   nullptr, nullptr, false, job->reference.get());
         job->reference_envs = live.envs;
         job->record = std::make_unique<TranslationRecord>();
     }
@@ -4451,7 +4567,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::AdoptTranslation(bool& pending)
         const auto begin = std::chrono::steady_clock::now();
         job = translate_queue->Wait(graphics_key, TranslateWaitCap);
         ++translate_stats.waits;
-        translate_stats.wait_time += std::chrono::steady_clock::now() - begin;
+        const auto waited = std::chrono::steady_clock::now() - begin;
+        translate_stats.wait_time += waited;
+        discard_stats.queue_wait += waited;
         if (!job) {
             translate_queue->Abandon(graphics_key);
             ++translate_stats.fallbacks;
@@ -4510,6 +4628,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::AdoptJob(std::unique_ptr<Transl
     case TranslationJob::Outcome::NoPipeline:
     case TranslationJob::Outcome::Pending:
         ++translate_stats.no_pipeline;
+        // A pipeline made before a failure on its thread is retired, not destroyed here.
+        translate_queue->Discard(std::move(job));
         return nullptr;
     }
     retry = true;
@@ -4559,9 +4679,9 @@ void PipelineCache::TranslateOnWorker(TranslationJob& job) {
     if (std::ranges::any_of(job.envs, [](const GraphicsEnvironment& env) {
             return env.GuardedReadFailed();
         })) {
-        // Translated with zeros where a read gave up: dropped here (its destructor may wait for
-        // the driver compile), translated again from a fresh snapshot.
-        job.pipeline.reset();
+        // Translated with zeros where a read gave up: never used, translated again from a fresh
+        // snapshot. The pipeline stays in the job: the GPU thread retires it (AdoptJob, Discard)
+        // rather than destroying it on this thread.
         job.outcome = TranslationJob::Outcome::Retry;
     } else if (job.reference && job.record) {
         verify_compared.fetch_add(1, std::memory_order_relaxed);
@@ -4571,8 +4691,8 @@ void PipelineCache::TranslateOnWorker(TranslationJob& job) {
                 LOG_WARNING(Render_Vulkan, "Async translate verify: {} differs: {}",
                             PipelineShaders(job.key), difference);
             }
-            // Never used: dropped here, built on the GPU thread from the live state.
-            job.pipeline.reset();
+            // Never used: retired by the GPU thread (AdoptJob, Discard), which builds the key
+            // itself from the live state.
             job.outcome = TranslationJob::Outcome::Differs;
         }
     }
@@ -4588,6 +4708,7 @@ void PipelineCache::TranslateOnWorker(TranslationJob& job) {
 }
 
 void PipelineCache::TickTranslations() {
+    translate_queue->RetireAbandoned();
     // Translations whose draws did not come back yet: adopted now, so the next draw finds them.
     for (auto& job : translate_queue->TakeFinished()) {
         const auto it = graphics_cache.find(job->key);

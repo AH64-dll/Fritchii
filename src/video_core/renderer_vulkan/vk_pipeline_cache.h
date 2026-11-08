@@ -126,6 +126,12 @@ struct ComputePipelineCacheEntry {
                                        const ComputePipelineCacheKey& key) const;
 };
 
+/// EDEN_NX2_ASYNC_DISCARD, read on first use: what a native draw does while its pipeline is
+/// missing. 0 waits for every pipeline, 1 (the default) skips by the legacy heuristic alone, 2
+/// skips only draws into render targets the frame clears and redraws (fable_answer_18 1b).
+/// Non-native draws keep the legacy heuristic in every mode.
+[[nodiscard]] int AsyncDiscardMode();
+
 class PipelineCache : public VideoCommon::ShaderCache {
 public:
     explicit PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, const Device& device,
@@ -137,6 +143,12 @@ public:
     ~PipelineCache();
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
+
+    /// Whether the last CurrentGraphicsPipeline returned null because its draw was skipped for an
+    /// unbuilt pipeline (asynchronous shaders), not because there is no pipeline to build.
+    [[nodiscard]] bool LastLookupSkipped() const noexcept {
+        return discard_decision.serial == lookup_serial && discard_decision.skip;
+    }
 
     void TickFrame();
 
@@ -204,8 +216,43 @@ private:
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
 
     /// Whether the current draw may be skipped while its pipeline is not ready (native draws
-    /// unless EDEN_NX2_ASYNC_DISCARD=0, and the legacy heuristic; full-screen passes never).
+    /// unless EDEN_NX2_ASYNC_DISCARD=0, and the legacy heuristic; full-screen passes never; with
+    /// EDEN_NX2_ASYNC_DISCARD=2 only into recurring render targets). The one test BuiltPipeline
+    /// and the translate queue both ask, answered once per lookup.
     [[nodiscard]] bool DrawMayBeSkipped() const;
+    /// Counts CurrentGraphicsPipeline calls, so DrawMayBeSkipped classifies the targets once per
+    /// lookup however often a lookup asks.
+    u64 lookup_serial{};
+    struct DiscardDecision {
+        u64 serial{~u64{0}};
+        bool skip{};
+    };
+    mutable DiscardDecision discard_decision;
+    /// Counts one decision for the 10 s line, and lists a persistent target the first time a
+    /// draw into it misses its pipeline. GPU thread.
+    void NoteDiscardDecision(bool skip, const VideoCommon::DrawTargets& targets) const;
+    /// TickFrame: the EDEN_NX2_ASYNC_DISCARD counts of the last 10 s.
+    void ReportAsyncDiscard();
+    /// EDEN_NX2_ASYNC_DISCARD counts (fable_answer_18 1c), GPU thread only. Lookups by class of
+    /// their targets (index: VideoCommon::DrawTargetClass), a lookup that repeats the one before
+    /// (same pipeline key and target, same frame: the rasterizer's second lookups) counted once.
+    struct DiscardStats {
+        std::array<u32, 3> skipped{};
+        std::array<u32, 3> waited{};
+        /// GPU thread time in the translate queue's capped Wait for a draw that waits
+        std::chrono::steady_clock::duration queue_wait{};
+        std::chrono::nanoseconds held_at_window{}; ///< GraphicsPipeline::HoldTimeTotal then
+        std::chrono::steady_clock::time_point window{};
+        // The last lookup counted.
+        GraphicsPipelineCacheKey last_key{};
+        u64 last_frame{~u64{0}};
+        GPUVAddr last_target{};
+        VideoCommon::DrawTargetClass last_kind{};
+        bool last_skip{};
+    };
+    mutable DiscardStats discard_stats;
+    /// Persistent targets listed so far (32 at most per session).
+    mutable std::unordered_set<GPUVAddr> listed_persistent_targets;
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
 
@@ -335,6 +382,13 @@ private:
     void EvictUnusedPipelines();
     u64 frame_count{};
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
+    /// Pipelines the translate queue did not use (discarded, stale, abandoned, rejected by the
+    /// verify mode), handed over on the GPU thread: destroyed by TickFrame once the GPU and
+    /// their queued build are done with them, never on a translation thread (fable_answer_18
+    /// 2b). Beside evicted_pipelines rather than in it: one whose build waits behind the boot
+    /// prebuild would hold the evictions behind it there, as that deque is freed from the front.
+    std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> retired_translations; ///< (tick, pipeline)
+    void RetireTranslatedPipeline(std::unique_ptr<GraphicsPipeline> pipeline);
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
 
     ::Common::unordered_map<ComputePipelineCacheKey, ComputePipelineCacheEntry> compute_cache;
@@ -344,6 +398,10 @@ private:
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
 
     ShaderPools main_pools;
+    /// EDEN_NX2_ASYNC_TRANSLATE=2: the GPU thread's reference translation at enqueue uses these
+    /// rather than releasing main_pools under whatever the GPU thread's own builds hold
+    /// (fable_answer_18 2c, the fallback). Made on first use, only in that mode.
+    std::unique_ptr<ShaderPools> verify_pools;
     std::mutex spare_pools_mutex;
     std::vector<std::shared_ptr<ShaderPools>> spare_pools;
 

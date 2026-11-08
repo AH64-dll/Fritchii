@@ -8,14 +8,18 @@
 
 namespace Vulkan {
 
-TranslateQueue::TranslateQueue(size_t thread_count, size_t max_in_flight_, Translate translate_)
-    : max_in_flight{max_in_flight_}, translate{std::move(translate_)},
+TranslateQueue::TranslateQueue(size_t thread_count, size_t max_in_flight_, Translate translate_,
+                               Retire retire_)
+    : max_in_flight{max_in_flight_}, translate{std::move(translate_)}, retire{std::move(retire_)},
       threads{std::make_unique<Common::ThreadWorker>(thread_count, "VkTranslate")} {}
 
 TranslateQueue::~TranslateQueue() {
-    // A translation in progress finishes and stores its job; the queued ones are dropped.
+    // A translation in progress finishes and stores its job; the queued ones are dropped. At
+    // shutdown, on the GPU thread: the pipeline workers still run, so a pipeline here waits for
+    // its build (or runs it) as any other pipeline the cache destroys then.
     threads.reset();
     entries.clear();
+    abandoned.clear();
 }
 
 bool TranslateQueue::Enqueue(std::unique_ptr<TranslationJob> job) {
@@ -54,12 +58,11 @@ void TranslateQueue::Run(GraphicsPipelineCacheKey key, u64 id) {
         // (out of memory, a driver error building the pipeline object).
         LOG_ERROR(Render_Vulkan, "Async translate: pipeline {:016x} failed on its thread: {}",
                   job->key.Hash(), exception.what());
-        job->pipeline.reset();
+        // A pipeline made before the failure stays in the job, for the GPU thread to retire.
         job->outcome = TranslationJob::Outcome::NoPipeline;
     } catch (...) {
         LOG_ERROR(Render_Vulkan, "Async translate: pipeline {:016x} failed on its thread",
                   job->key.Hash());
-        job->pipeline.reset();
         job->outcome = TranslationJob::Outcome::NoPipeline;
     }
     if (job->outcome == TranslationJob::Outcome::Pending) {
@@ -67,19 +70,17 @@ void TranslateQueue::Run(GraphicsPipelineCacheKey key, u64 id) {
                                      : TranslationJob::Outcome::NoPipeline;
     }
     job->translation = std::chrono::steady_clock::now() - begin;
-    {
-        std::scoped_lock lock{mutex};
-        const auto it = entries.find(key);
-        if (it != entries.end() && it->second.id == id) {
-            it->second.job = std::move(job);
-            it->second.done = true;
-            done_condition.notify_all();
-            return;
-        }
+    std::scoped_lock lock{mutex};
+    const auto it = entries.find(key);
+    if (it != entries.end() && it->second.id == id) {
+        it->second.job = std::move(job);
+        it->second.done = true;
+        done_condition.notify_all();
+        return;
     }
-    // Abandoned while it ran (swept, or the GPU thread built it itself): never bound, so it is
-    // destroyed here, off the GPU thread.
-    job.reset();
+    // Abandoned while it ran (swept, or the GPU thread built it itself): never bound, kept for
+    // the GPU thread to retire (RetireAbandoned) instead of destroyed here.
+    abandoned.push_back(std::move(job));
 }
 
 bool TranslateQueue::Contains(const GraphicsPipelineCacheKey& key) const {
@@ -166,11 +167,21 @@ std::vector<std::unique_ptr<TranslationJob>> TranslateQueue::TakeFinished() {
     return jobs;
 }
 
-void TranslateQueue::Discard(std::unique_ptr<TranslationJob> job) {
-    if (!job->pipeline) {
-        return;
+void TranslateQueue::RetireAbandoned() {
+    std::vector<std::unique_ptr<TranslationJob>> jobs;
+    {
+        std::scoped_lock lock{mutex};
+        jobs.swap(abandoned);
     }
-    threads->QueueWork([job = std::move(job)]() mutable { job.reset(); });
+    for (auto& job : jobs) {
+        Discard(std::move(job));
+    }
+}
+
+void TranslateQueue::Discard(std::unique_ptr<TranslationJob> job) {
+    if (job && job->pipeline) {
+        retire(std::move(job->pipeline));
+    }
 }
 
 size_t TranslateQueue::InFlight() const {
