@@ -897,8 +897,8 @@ void TextureCache<P>::TickRenderClock() {
                      "Render frame clock (EDEN_NX2_RENDER_CLOCK): live at host frame {} ({}); "
                      "last_write_frame, cross-frame reads and the same-frame rule follow it",
                      frame_tick,
-                     Tegra::g_nx2_render_clock_syncpt >= 0
-                         ? fmt::format("syncpoint {}", Tegra::g_nx2_render_clock_syncpt)
+                     Tegra::Nx2RenderClockSyncpt() >= 0
+                         ? fmt::format("syncpoint {}", Tegra::Nx2RenderClockSyncpt())
                          : std::string{"the present poll's learned word"});
         }
     }

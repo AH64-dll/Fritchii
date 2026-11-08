@@ -578,10 +578,15 @@ private:
 // while the texture cache does not want the clock.
 inline std::atomic<bool> g_nx2_render_clock_wanted{false};
 inline std::atomic<u64> g_nx2_render_frame{};
-inline const int g_nx2_render_clock_syncpt = [] {
-    const char* value = std::getenv("EDEN_NX2_RENDER_CLOCK_SYNCPT");
-    return value != nullptr && value[0] != '\0' ? std::atoi(value) : -1;
-}();
+// Read on first use, not at static initialization: that runs before main() applies
+// nx2_switches.txt, so the file's value would be lost.
+inline int Nx2RenderClockSyncpt() {
+    static const int syncpt = [] {
+        const char* value = std::getenv("EDEN_NX2_RENDER_CLOCK_SYNCPT");
+        return value != nullptr && value[0] != '\0' ? std::atoi(value) : -1;
+    }();
+    return syncpt;
+}
 // Syncpoint signals by id while the clock is wanted (logged with the clock, to find the one
 // signalled once a frame).
 inline constexpr size_t Nx2SyncpointSignalSlots = 192;
@@ -593,7 +598,7 @@ inline void Nx2NoteSyncpointSignal(u32 id) {
         return;
     }
     g_nx2_syncpoint_signals[id].fetch_add(1, std::memory_order_relaxed);
-    if (static_cast<int>(id) == g_nx2_render_clock_syncpt) {
+    if (static_cast<int>(id) == Nx2RenderClockSyncpt()) {
         g_nx2_render_frame.fetch_add(1, std::memory_order_relaxed);
     }
 }

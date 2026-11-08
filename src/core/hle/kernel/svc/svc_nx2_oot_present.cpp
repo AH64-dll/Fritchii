@@ -307,7 +307,7 @@ void OnGpuWrite(Path path, u64 device_address, u64 gpu_address, const void* host
     PresentPollState& state = PollState();
     // The render-frame clock (Tegra::g_nx2_render_frame, EDEN_NX2_RENDER_CLOCK=1): a write to a
     // learned word is the frame's last GPU write, whether or not a poll waits for it.
-    if (host_pointer != nullptr && Tegra::g_nx2_render_clock_syncpt < 0 &&
+    if (host_pointer != nullptr && Tegra::Nx2RenderClockSyncpt() < 0 &&
         Tegra::g_nx2_render_clock_wanted.load(std::memory_order_relaxed)) {
         for (const auto& learned : state.learned_mirror) {
             if (learned.load(std::memory_order_relaxed) == host_pointer) {
