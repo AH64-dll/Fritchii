@@ -595,8 +595,10 @@ inline int Nx2RenderClockSyncpt() {
 /// EDEN_NX2_RENDER_CLOCK: 0 unset, 1 the clock, 2 the clock on the poll-word source.
 inline int Nx2RenderClockEnv() {
     static const int env = [] {
+        // On (1) by default since 2026-11-08: flip-fence clock at 1.00 per host frame, 0 tombstone
+        // hits under EXP43=4, 11 loads 0 washed out. EDEN_NX2_RENDER_CLOCK=0 turns it off.
         const char* value = std::getenv("EDEN_NX2_RENDER_CLOCK");
-        return value == nullptr ? 0 : value[0] == '1' ? 1 : value[0] == '2' ? 2 : 0;
+        return value == nullptr ? 1 : value[0] == '1' ? 1 : value[0] == '2' ? 2 : 0;
     }();
     return env;
 }

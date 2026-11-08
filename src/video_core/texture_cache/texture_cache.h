@@ -742,8 +742,10 @@ void TextureCache<P>::TickFrame() {
 /// EDEN_NX2_TC_COLD_FRAMES (the cold sweep's K, 0 = off).
 inline u64 TcColdFrames() {
     static const u64 frames = [] {
+        // 4 by default since 2026-11-08 (device memory 8.8 -> ~6.4 GB at 2 min in Castle Town,
+        // 11 loads 0 washed out); EDEN_NX2_TC_COLD_FRAMES=0 turns it off.
         const char* value = std::getenv("EDEN_NX2_TC_COLD_FRAMES");
-        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 4ULL;
     }();
     return frames;
 }
