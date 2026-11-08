@@ -11,9 +11,26 @@ not stall while the driver compiles them.
 > idle-priority threads while the game runs (`EDEN_NX2_PRECOMPILE_THREADS`). Emulation > Prepare
 > Shaders Now prepares them again. `EDEN_NX2_PRECOMPILED=0/1` below is upstream's switch and is
 > not read by Fritchii. Recipes must be made against a Fritchii build: check
-> `nx2-precompile cache-version` (Fritchii is at 52, upstream at 54), record the caches with that
-> build (`vulkan-frizti.fork-v52.bin`), and note that Fritchii's v52 records carry the task/mesh
+> `nx2-precompile cache-version` (Fritchii uses upstream's numbering since cache version 54; its
+> records equal upstream's 53/54 ones), record the caches with that build
+> (`vulkan-frizti.fork-v<N>.bin`), and note that Fritchii's older v52 records carry the task/mesh
 > fields that upstream added in v53 (`lichii_cache.parse_cache` assumes them from v52 on).
+>
+> **Fritchii, zortos293/Lichii#896.** With `EDEN_NX2_PRECOMPILED_FAST=1` too (off by default) the
+> preparation also keeps each pipeline's shader infos and SPIR-V in
+> `precompiled_infos.fork-v<N>.bin` (written as it goes, as `.part`, and resumed with the
+> checkpoint; layout in `src/video_core/renderer_vulkan/vk_precompiled_kept.h`), stamped with the
+> prepared stamp, the exe's size and time, the SPIR-V settings, the graphics pipeline library split,
+> the OoT workaround, `EDEN_NX2_CANONICAL_KEYS` and a hash of the other `EDEN_NX2_` switches: any
+> change prepares again. A draw whose pipeline the file holds is checked against the recorded
+> environments (`FileEnvironment::AnswersHoldFor`), created from the kept infos and built from the
+> kept SPIR-V on a worker; anything else takes the normal path (async translate, async discard).
+> Only the index stays in memory; infos, SPIR-V and recorded environments are read per pipeline.
+> `EDEN_NX2_PRECOMPILED_FAST=2` also translates each such pipeline from the game's state and
+> compares (the audit): one that differs is never used. #896's `EDEN_NX2_PRECOMPILED_AUDIT` and
+> `EDEN_NX2_PRECOMPILED_VERIFY` are not read. `EDEN_NX2_CANONICAL_KEYS=1` (off by default) keys
+> draws, the disk cache and the preparation canonically (`FixedPipelineState::CanonicalizeNative`,
+> attribute types left to the keys' existing masking).
 
 ## How it works
 

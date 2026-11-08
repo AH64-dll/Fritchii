@@ -44,6 +44,8 @@
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
+#include "shader_recompiler/info_serialize.h"
+#include "shader_recompiler/translate_profile.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/ir_opt/oot_visual_workaround.h"
 #include "shader_recompiler/program_header.h"
@@ -69,6 +71,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/texture_cache/formatter.h"
 #include "video_core/renderer_vulkan/vk_pipeline_translate_queue.h"
+#include "video_core/renderer_vulkan/vk_precompiled_kept.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -917,6 +920,63 @@ void MaskKeyedAttributeTypes(GraphicsPipelineCacheKey& key, std::span<const File
     }
     key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
         key.state.attribute_types, key.unique_hashes, attribute_masks);
+}
+
+/// EDEN_NX2_CANONICAL_KEYS=1 (off by default; read on first use, after nx2_switches.txt): native
+/// graphics keys without the state that cannot change the pipeline (zortos293/Lichii#895's
+/// FixedPipelineState::CanonicalizeNative), at the draw, at disk cache load and in the
+/// precompiled preparation, so a precompiled pipeline is created with the draw's create info.
+bool CanonicalKeys() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_CANONICAL_KEYS");
+        const bool on = value != nullptr && value[0] == '1';
+        if (on) {
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_CANONICAL_KEYS=1: native pipeline keys are canonical "
+                                    "(blend state of attachments without blending, attachments "
+                                    "past the last colour target, depth bounds)");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+/// EDEN_NX2_PRECOMPILED_FAST (zortos293/Lichii#896; off by default, read on first use): 0 off; 1
+/// the precompiled preparation (EDEN_NX2_PRECOMPILE) keeps each pipeline's shader infos and
+/// SPIR-V, and a draw of a precompiled pipeline whose recorded answers hold is created from them
+/// instead of translated; 2 the same, and each such pipeline is translated from the game's state
+/// too and compared (the audit): one that differs is never used, the normal path builds it.
+int PrecompiledFastMode() {
+    static const int mode = [] {
+        const char* value = std::getenv("EDEN_NX2_PRECOMPILED_FAST");
+        const int parsed = value == nullptr ? 0 : value[0] == '1' ? 1 : value[0] == '2' ? 2 : 0;
+        if (parsed != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "EDEN_NX2_PRECOMPILED_FAST={}: precompiled pipelines are drawn from the "
+                     "infos and SPIR-V their preparation keeps{}",
+                     parsed,
+                     parsed == 2 ? ", each translated from the game's state too and compared "
+                                   "(audit, slow, not for play)"
+                                 : "");
+        }
+        return parsed;
+    }();
+    return mode;
+}
+
+/// The canonical form of a native key's state (EDEN_NX2_CANONICAL_KEYS=1). The attribute types
+/// are left as they are: draws and the loader already keep only those the programs read
+/// (VideoCommon::KeyedAttributeTypes, the rule #895's mask follows). Idempotent.
+void CanonicalizeKeyState(FixedPipelineState& state, const DynamicFeatures& features) noexcept {
+    // With a dynamic stipple enable the key never says whether lines are stippled (Refresh3
+    // leaves line_stipple_enable 0), while the factor and pattern stay static in the pipeline:
+    // clearing them would give a game that enables stippling a factor of 0. Kept then.
+    const u32 stipple_factor = state.line_stipple_factor;
+    const u32 stipple_pattern = state.line_stipple_pattern;
+    state.CanonicalizeNative(~0U);
+    if (features.has_dynamic_state3_line_stipple_enable) {
+        state.line_stipple_factor = stipple_factor;
+        state.line_stipple_pattern = stipple_pattern;
+    }
 }
 
 // EDEN_NX2_REKEY_FOREIGN_PIPELINES=0: cached graphics pipelines another GPU driver (or driver
@@ -2073,6 +2133,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
         }
         if (patch_blending) {
             graphics_key.state.RefreshBlending(*maxwell3d);
+            if (canonical_keys && maxwell3d->GetNativeMacroEngine().native_turing) {
+                CanonicalizeKeyState(graphics_key.state, dynamic_features);
+            }
         }
     } else {
         TakeCleanSnapshot();
@@ -2099,17 +2162,23 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
 void PipelineCache::RefreshGraphicsKey() {
     if (!dynamic_features.has_dynamic_vertex_input) {
         graphics_key.state.Refresh(*maxwell3d, dynamic_features);
-        return;
+    } else {
+        // Refresh only rewrites the types when the vertex input changes, so the masked copy in
+        // the key must not carry over to the next programs. Types of attributes the programs
+        // don't read would split their pipelines by whatever the game left in those registers
+        // (Ocarina of Time: up to 20 keys for the same shaders, each built again on the GPU
+        // thread).
+        graphics_key.state.attribute_types = vertex_attribute_types;
+        graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+        vertex_attribute_types = graphics_key.state.attribute_types;
+        graphics_key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
+            vertex_attribute_types, graphics_key.unique_hashes, vertex_attribute_masks);
     }
-    // Refresh only rewrites the types when the vertex input changes, so the masked copy in the
-    // key must not carry over to the next programs. Types of attributes the programs don't read
-    // would split their pipelines by whatever the game left in those registers (Ocarina of Time:
-    // up to 20 keys for the same shaders, each built again on the GPU thread).
-    graphics_key.state.attribute_types = vertex_attribute_types;
-    graphics_key.state.Refresh(*maxwell3d, dynamic_features);
-    vertex_attribute_types = graphics_key.state.attribute_types;
-    graphics_key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
-        vertex_attribute_types, graphics_key.unique_hashes, vertex_attribute_masks);
+    // Everything CanonicalizeNative clears is rewritten by every Refresh (the attachments too:
+    // without dynamic blend state Refresh always rebuilds them), so it can be cleared in place.
+    if (canonical_keys && maxwell3d->GetNativeMacroEngine().native_turing) {
+        CanonicalizeKeyState(graphics_key.state, dynamic_features);
+    }
 }
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
@@ -2240,6 +2309,15 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     auto& entry{pair->second};
     if (is_new) {
         entry = CreateComputePipeline(key, shader);
+    } else if (entry.pipeline && entry.pipeline->IsPrecompiled() && entry.pipeline->BuildFailed()) {
+        // EDEN_NX2_PRECOMPILED_FAST: its kept SPIR-V did not build. Translated from the game's
+        // state instead, from now on.
+        precompiled_rejected.insert(key.Hash());
+        ++precompiled_stats.failed;
+        const u32 rebuilds = entry.rebuilds;
+        retired_compute_pipelines.emplace_back(scheduler.CurrentTick(), std::move(entry.pipeline));
+        entry = CreateComputePipeline(key, shader, entry.mapped_pointers);
+        entry.rebuilds = rebuilds;
     } else if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
                StaleNullPointerSlot(entry)) {
         // The translation dropped accesses through a pointer that was null back then. Which slots
@@ -2267,6 +2345,8 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
 
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                       const VideoCore::DiskResourceLoadCallback& callback) {
+    // Read here, after nx2_switches.txt, and kept for the draws' lookups.
+    canonical_keys = CanonicalKeys();
     visual_workaround_title = title_id;
     if (title_id == 0) {
         return;
@@ -2379,6 +2459,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     std::unordered_set<u64> rekeyed_pipelines;
     std::unordered_set<u64> native_pipelines;
     size_t foreign_records = 0;
+    size_t canonical_rekeyed = 0; ///< EDEN_NX2_CANONICAL_KEYS=1: records whose key hash changed
 
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename =
@@ -2565,6 +2646,26 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             }
         }
 
+        // EDEN_NX2_CANONICAL_KEYS=1: native records are looked up as draws key them now. Records
+        // stored before (or while the switch was off) are rekeyed here and their used-list age
+        // moves to the canonical key, as for the masking above; records stored with it on are
+        // canonical already (it is idempotent).
+        if (CanonicalKeys() && std::ranges::all_of(envs, [](const FileEnvironment& env) {
+                return env.IsNativeProgram();
+            })) {
+            const u64 stored_hash = key.Hash();
+            CanonicalizeKeyState(key.state, dynamic_features);
+            if (const u64 hash = key.Hash(); hash != stored_hash) {
+                ++canonical_rekeyed;
+                if (const auto used = used_pipelines.find(stored_hash);
+                    used != used_pipelines.end()) {
+                    const u8 age = used->second;
+                    const auto [entry, inserted] = used_pipelines.try_emplace(hash, age);
+                    entry->second = (std::min)(entry->second, age);
+                }
+            }
+        }
+
         const bool key_requests_provoking_last = key.state.provoking_vertex_last != 0;
         if (key_requests_provoking_last && !dynamic_features.has_provoking_vertex_last_mode) {
             return;
@@ -2676,6 +2777,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                  "{} cached graphics pipeline records were stored by another GPU driver{}",
                  foreign_records,
                  RekeyForeignPipelines() ? ", loaded under this one" : " and are skipped");
+    }
+    if (CanonicalKeys()) {
+        LOG_INFO(Render_Vulkan,
+                 "EDEN_NX2_CANONICAL_KEYS: {} cached graphics pipeline records loaded under a new "
+                 "(canonical) key",
+                 canonical_rekeyed);
     }
     if (PreloadAllPipelines() && queued_graphics > 10000) {
         LOG_WARNING(Render_Vulkan,
@@ -3570,13 +3677,33 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     const std::string stamp = fmt::format("{} {} {:#x} {} {}\n", file_size, modified,
                                           device.GetDriverVersion(), Common::g_build_version,
                                           device.GetModelName());
+    // EDEN_NX2_PRECOMPILED_FAST: the preparation keeps each pipeline's infos and SPIR-V too
+    // (vk_precompiled_kept.h), written for this exe, its settings and switches as well.
+    const bool keep = PrecompiledFastMode() != 0;
+    const auto kept_path =
+        base_dir / fmt::format("precompiled_infos.fork-v{}.bin", CACHE_VERSION);
+    auto kept_part = kept_path;
+    kept_part += ".part";
+    const std::string kept_stamp = keep ? KeptStamp(stamp) : std::string{};
     if (!force && !VideoCommon::Nx2Precompile::Forced()) {
         std::ifstream stamp_file(stamp_path, std::ios::binary);
         const std::string previous{std::istreambuf_iterator<char>(stamp_file), {}};
         if (previous == stamp) {
-            LOG_INFO(Render_Vulkan, "Precompiled pipelines already prepared for this driver");
-            return;
+            if (!keep || LoadKept(kept_path, kept_part, path, kept_stamp)) {
+                LOG_INFO(Render_Vulkan, "Precompiled pipelines already prepared for this driver");
+                return;
+            }
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled pipelines were prepared without keeping their infos and SPIR-V "
+                     "for this build, its settings and switches (EDEN_NX2_PRECOMPILED_FAST): "
+                     "preparing them again");
         }
+    }
+    // Published again once this preparation has written its file.
+    {
+        std::scoped_lock lock{kept_mutex};
+        kept_index.reset();
+        kept_available = false;
     }
 
     // The environment index and where each record starts; records are read again when built.
@@ -3666,7 +3793,46 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         start_index += jump;
         restarts = 0;
     }
+    // The kept file is written as the records are built. A preparation resumed from a
+    // checkpoint continues the one it left; without one (it was made without keeping, or for
+    // another build) the preparation starts from the first record, so every record is kept.
+    PrecompiledKept::Writer writer;
+    bool keeping = false;
+    if (keep) {
+        constexpr u64 KeptSpaceNeeded = u64{1536} << 20; // Ocarina of Time: 758 MiB
+        const auto space = std::filesystem::space(base_dir, error);
+        if (!error && space.available < KeptSpaceNeeded) {
+            LOG_WARNING(Render_Vulkan,
+                        "Precompiled pipelines: {} MiB free in {}, the kept infos and SPIR-V "
+                        "need about {} MiB: not kept (EDEN_NX2_PRECOMPILED_FAST has nothing to "
+                        "draw from)",
+                        space.available >> 20, Common::FS::PathToUTF8String(base_dir),
+                        KeptSpaceNeeded >> 20);
+        } else if (!writer.Open(kept_part, kept_stamp, start_index > 0, total)) {
+            LOG_WARNING(Render_Vulkan, "Precompiled pipelines: cannot write {}",
+                        Common::FS::PathToUTF8String(kept_part));
+        } else {
+            keeping = true;
+            if (start_index > 0 && writer.Resumed() == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "Precompiled pipelines: the checkpoint at record {} has no kept infos "
+                         "with it, starting from the first record",
+                         start_index);
+                start_index = 0;
+                restarts = 0;
+                keeping = writer.Open(kept_part, kept_stamp, false, total);
+            } else if (writer.Resumed() != 0) {
+                LOG_INFO(Render_Vulkan,
+                         "Precompiled pipelines: {} kept pipelines resumed from an earlier run",
+                         writer.Resumed());
+            }
+        }
+    }
     const auto write_progress = [&](size_t next, u32 count) {
+        if (keeping) {
+            // The kept entries of every record before the checkpoint are on disk first.
+            writer.Flush();
+        }
         std::ofstream progress_file(progress_path, std::ios::binary | std::ios::trunc);
         progress_file << stamp << next << ' ' << count << '\n';
     };
@@ -3778,6 +3944,12 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                     // as draws will key them.
                     key_state.driver_id = dynamic_features.driver_id;
                     key_state.driver_version = dynamic_features.driver_version;
+                    // Canonical as draws key them (EDEN_NX2_CANONICAL_KEYS=1), so the pipeline is
+                    // created with the create info a draw gives it (depth bounds included, which
+                    // the tool's keys keep as recorded) and the driver finds it compiled.
+                    if (CanonicalKeys()) {
+                        CanonicalizeKeyState(key_state, dynamic_features);
+                    }
                     const bool other_device =
                         (key_state.extended_dynamic_state != 0) !=
                             dynamic_features.has_extended_dynamic_state ||
@@ -3797,10 +3969,12 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                          !dynamic_features.has_provoking_vertex_last_mode);
                     // Made for a device with other dynamic state, or in the disk cache, which
                     // builds it at boot or when a draw needs it (from the driver's cache then).
+                    // Kept like the others when keeping: a draw of one the boot and background
+                    // builds have not reached would translate it on the GPU thread.
                     if (other_device) {
                         ++state.other_device;
                         skipped = true;
-                    } else if (disk_keys && disk_keys->contains(graphics_key.Hash())) {
+                    } else if (!keeping && disk_keys && disk_keys->contains(graphics_key.Hash())) {
                         ++state.known;
                         skipped = true;
                     }
@@ -3819,10 +3993,19 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                         envs[i].Deserialize(in);
                     }
                     ShaderPools pools;
+                    const std::span<const u32> env_ids{ids.data(), count};
                     if (compute) {
+                        ComputeKeep kept;
                         ok = CreateComputePipeline(pools, compute_key, envs.front(), nullptr,
-                                                   false, true)
+                                                   false, true, keeping ? &kept : nullptr)
                                  .pipeline != nullptr;
+                        if (ok && keeping && !kept.spirv.empty()) {
+                            std::array<std::vector<u8>, 5> infos;
+                            std::array<std::vector<u32>, 5> spirv;
+                            infos[0] = std::move(kept.info);
+                            spirv[0] = std::move(kept.spirv);
+                            writer.Keep(index, 1, 0, compute_key.Hash(), env_ids, infos, spirv);
+                        }
                     } else {
                         boost::container::static_vector<Shader::Environment*,
                                                         Maxwell::MaxShaderProgram>
@@ -3830,10 +4013,19 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                         for (auto& env : envs) {
                             env_ptrs.push_back(&env);
                         }
-                        const auto pipeline{CreateGraphicsPipeline(pools, graphics_key,
-                                                                   MakeSpan(env_ptrs), nullptr,
-                                                                   false)};
+                        // Keeping: each stage emitted once, its words both the record and the
+                        // module (EmitSPIRV changes the IR it emits), its info serialized then.
+                        TranslationRecord kept;
+                        kept.keep_infos = true;
+                        const auto pipeline{CreateGraphicsPipeline(
+                            pools, graphics_key, MakeSpan(env_ptrs), nullptr, false, nullptr,
+                            nullptr, false, keeping ? &kept : nullptr)};
                         ok = pipeline && !pipeline->Failed();
+                        if (ok && keeping && kept.complete) {
+                            writer.Keep(index, 0,
+                                        kept.libraries ? PrecompiledKept::FlagLibraries : u8{0},
+                                        graphics_key.Hash(), env_ids, kept.infos, kept.spirv);
+                        }
                     }
                 }
             } catch (const std::exception& e) {
@@ -3877,12 +4069,553 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
              state.built.load(), state.fast.load(), FastBuild.count(), state.failed.load(),
              state.known.load() + state.other_device.load(), state.known.load(),
              state.other_device.load(), total - reached, seconds);
-    if (!stop_loading.stop_requested() && !warm_cancel && reached >= total) {
+    const bool finished = !stop_loading.stop_requested() && !warm_cancel && reached >= total;
+    if (keeping && !finished) {
+        // Resumed with the checkpoint next time.
+        writer.Close();
+    } else if (keeping) {
+        const auto totals = writer.GetTotals();
+        if (writer.Finish()) {
+            std::filesystem::rename(kept_part, kept_path, error);
+            if (error) {
+                // A pipeline built from the previous file can still hold it open: this one is
+                // read where it is, and moved over it at the next boot (LoadKept).
+                LOG_INFO(Render_Vulkan, "Precompiled pipelines: {} stays {} until the next boot",
+                         kept_path.filename().string(), kept_part.filename().string());
+            }
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled shader infos and SPIR-V kept for {} pipelines: {} distinct "
+                     "infos, {} distinct stages of SPIR-V ({} MiB compressed), {} MiB in all",
+                     totals.records, totals.infos, totals.spirv, totals.spirv_bytes >> 20,
+                     totals.file_bytes >> 20);
+        } else {
+            LOG_WARNING(Render_Vulkan, "Precompiled pipelines: writing {} failed",
+                        kept_part.filename().string());
+        }
+    }
+    if (finished) {
         std::ofstream stamp_file(stamp_path, std::ios::binary | std::ios::trunc);
         stamp_file << stamp;
         stamp_file.close();
         std::filesystem::remove(progress_path, error);
+        if (keeping) {
+            LoadKept(kept_path, kept_part, path, kept_stamp);
+        }
     }
+}
+
+std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
+    // Everything a translation of the same environments reads besides them: the build (the
+    // exe itself, for local builds that keep their scm_rev), the settings SPIR-V depends on, the
+    // graphics pipeline library split (stages are emitted with other bindings), the OoT visual
+    // workaround, canonical keys (the key hashes records are found by) and the switches.
+    return fmt::format("{}kept NX2KEPT1 settings {:#x} gpl {} oot {} {:016x} canonical {} exe {}\n",
+                       prepared_stamp, SpirvSettingsStamp(),
+                       device.IsExtGraphicsPipelineLibrarySupported() ? 1 : 0,
+                       oot_visual_workaround ? 1 : 0, visual_workaround_title,
+                       CanonicalKeys() ? 1 : 0, PrecompiledKept::ExeAndSwitchesStamp());
+}
+
+std::shared_ptr<const PrecompiledKept::Index> PipelineCache::KeptIndex() const {
+    std::scoped_lock lock{kept_mutex};
+    return kept_index;
+}
+
+bool PipelineCache::LoadKept(const std::filesystem::path& kept, const std::filesystem::path& part,
+                             const std::filesystem::path& precompiled, const std::string& stamp) {
+    std::string why;
+    std::shared_ptr<const PrecompiledKept::Index> index;
+    std::error_code error;
+    std::filesystem::path used = kept;
+    if (std::filesystem::exists(part, error)) {
+        // A finished file the preparation could not move over the previous one (still open
+        // then): moved now. An unfinished one is left for the preparation to resume.
+        if (PrecompiledKept::Index::Load(part, precompiled, stamp, CACHE_VERSION, why)) {
+            std::filesystem::rename(part, kept, error);
+            if (error) {
+                used = part;
+            }
+        }
+    }
+    index = PrecompiledKept::Index::Load(used, precompiled, stamp, CACHE_VERSION, why);
+    if (!index) {
+        LOG_INFO(Render_Vulkan, "Precompiled fast path: no kept infos and SPIR-V to draw from ({})",
+                 why);
+        return false;
+    }
+    const u64 file_bytes = std::filesystem::file_size(used, error);
+    LOG_INFO(Render_Vulkan,
+             "Precompiled fast path: kept infos and SPIR-V of {} graphics and {} compute "
+             "pipelines; index {:.1f} MB in RAM, {} ({} MiB) read per pipeline",
+             index->GraphicsCount(), index->ComputeCount(),
+             static_cast<double>(index->MemoryBytes()) / (1024.0 * 1024.0),
+             used.filename().string(), file_bytes >> 20);
+    {
+        std::scoped_lock lock{kept_mutex};
+        kept_index = std::move(index);
+        kept_available = true;
+    }
+    return true;
+}
+
+void PipelineCache::NotePrecompiledMiss(const char* reason) {
+    auto& misses = precompiled_stats.misses;
+    const auto it = std::ranges::find_if(misses, [reason](const auto& entry) {
+        return std::string_view{entry.first} == reason;
+    });
+    if (it != misses.end()) {
+        ++it->second;
+    } else {
+        misses.emplace_back(reason, 1);
+    }
+}
+
+namespace {
+/// The pixel format traits a translation used: integer formats always (sampled textures), the
+/// others only with descriptors that use them (#896).
+u32 UsedFormatTraits(std::span<const Shader::Info* const> infos) {
+    u32 traits = FileEnvironment::FormatTraitInteger;
+    for (const Shader::Info* const info : infos) {
+        if (!info) {
+            continue;
+        }
+        if (std::ranges::any_of(info->image_descriptors,
+                                [](const auto& desc) { return desc.is_byte_addressed; })) {
+            traits |= FileEnvironment::FormatTraitByteAddressed;
+        }
+        if (!info->texture_buffer_descriptors.empty()) {
+            traits |= FileEnvironment::FormatTraitSnorm;
+        }
+    }
+    return traits;
+}
+
+std::atomic<u32> precompiled_worker_builds{};
+std::atomic<u32> precompiled_audit_logged{};
+} // Anonymous namespace
+
+bool PipelineCache::AuditPrecompiled(const PrecompiledKept::Index& index,
+                                     const PrecompiledKept::Record& record,
+                                     std::span<Shader::Environment* const> envs, bool compute,
+                                     const ComputePipelineCacheKey* compute_key) {
+    const u64 key_hash = compute ? compute_key->Hash() : graphics_key.Hash();
+    const auto differ = [&](size_t stage, std::string_view what) {
+        if (precompiled_audit_logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_ERROR(Render_Vulkan,
+                      "Precompiled audit: {} pipeline {:016x} stage {}: {} differ from its "
+                      "translation of the game's state; not used, the normal path builds it",
+                      compute ? "compute" : "graphics", key_hash, stage, what);
+        }
+        return false;
+    };
+    // Pools of its own: nothing else on the GPU thread holds IR in them. The live programs are
+    // translated and emitted once here (EmitSPIRV changes the IR it emits); the normal path,
+    // when it runs after a difference, translates them again from scratch.
+    if (!audit_pools) {
+        audit_pools = std::make_unique<ShaderPools>();
+    }
+    audit_pools->ReleaseContents();
+    std::array<std::vector<u32>, Maxwell::MaxShaderStage> spirv;
+    std::array<std::vector<u8>, Maxwell::MaxShaderStage> infos;
+    try {
+        if (compute) {
+            ComputeKeep keep;
+            keep.translate_only = true;
+            [[maybe_unused]] const auto none =
+                CreateComputePipeline(*audit_pools, *compute_key, *envs[0], nullptr, false, true,
+                                      &keep);
+            spirv[0] = std::move(keep.spirv);
+            infos[0] = std::move(keep.info);
+        } else {
+            TranslationRecord translated;
+            translated.translate_only = true;
+            translated.keep_infos = true;
+            [[maybe_unused]] const auto none =
+                CreateGraphicsPipeline(*audit_pools, graphics_key, envs, nullptr, false, nullptr,
+                                       nullptr, false, &translated);
+            if (!translated.complete) {
+                return differ(0, "the pipeline (its translation failed)");
+            }
+            if (translated.libraries != ((record.flags & PrecompiledKept::FlagLibraries) != 0)) {
+                return differ(0, "the library split");
+            }
+            spirv = std::move(translated.spirv);
+            infos = std::move(translated.infos);
+        }
+    } catch (const std::exception& exception) {
+        return differ(0, exception.what());
+    }
+    std::vector<u8> kept_info;
+    std::vector<u32> kept_spirv;
+    for (size_t stage = 0; stage < spirv.size(); ++stage) {
+        const bool kept = record.spirv[stage] != PrecompiledKept::NoBlob;
+        if (kept != !spirv[stage].empty()) {
+            return differ(stage, "the stages");
+        }
+        if (!kept) {
+            continue;
+        }
+        if (!index.ReadInfoBytes(record.infos[stage], kept_info) ||
+            !index.ReadSpirv(record.spirv[stage], kept_spirv)) {
+            return differ(stage, "the kept files (unreadable)");
+        }
+        if (kept_info != infos[stage]) {
+            return differ(stage, "the infos");
+        }
+        if (kept_spirv != spirv[stage]) {
+            const auto [mismatch, unused] = std::ranges::mismatch(kept_spirv, spirv[stage]);
+            return differ(stage, fmt::format("the SPIR-V words ({} kept, {} translated, first at "
+                                             "word {})",
+                                             kept_spirv.size(), spirv[stage].size(),
+                                             std::distance(kept_spirv.begin(), mismatch)));
+        }
+    }
+    return true;
+}
+
+std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeline() {
+    const int mode = PrecompiledFastMode();
+    if (mode == 0 || !kept_available.load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+    const auto index = KeptIndex();
+    if (!index) {
+        return nullptr;
+    }
+    const u64 hash = graphics_key.Hash();
+    const auto records = index->Graphics(hash);
+    if (records.empty()) {
+        ++precompiled_stats.not_precompiled;
+        return nullptr;
+    }
+    if (precompiled_rejected.contains(hash)) {
+        NotePrecompiledMiss("rejected earlier (failed build or audit)");
+        return nullptr;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    // A vertex A program is merged into vertex B: never one of these.
+    if (graphics_key.unique_hashes[0] != 0) {
+        NotePrecompiledMiss("vertex A");
+        return nullptr;
+    }
+    GraphicsEnvironments environments;
+    GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
+    const auto live = environments.Span();
+    const auto stages_match = [&](const PrecompiledKept::Record& record) {
+        size_t programs = 0;
+        for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+            const bool has = graphics_key.unique_hashes[stage + 1] != 0;
+            programs += has ? 1 : 0;
+            if (has != (record.infos[stage] != PrecompiledKept::NoBlob) ||
+                has != (record.spirv[stage] != PrecompiledKept::NoBlob)) {
+                return false;
+            }
+        }
+        return programs == record.env_count && live.size() == record.env_count;
+    };
+    auto infos = std::make_unique<std::array<Shader::Info, Maxwell::MaxShaderStage>>();
+    std::array<const Shader::Info*, Maxwell::MaxShaderStage> info_ptrs{};
+    const PrecompiledKept::Record* matched = nullptr;
+    const char* reason = "stages";
+    for (const PrecompiledKept::Record& record : records) {
+        if (!stages_match(record)) {
+            reason = "stages";
+            continue;
+        }
+        info_ptrs = {};
+        bool readable = true;
+        for (size_t stage = 0; stage < Maxwell::MaxShaderStage && readable; ++stage) {
+            if (record.infos[stage] == PrecompiledKept::NoBlob) {
+                continue;
+            }
+            (*infos)[stage] = Shader::Info{};
+            readable = index->ReadInfo(record.infos[stage], (*infos)[stage]);
+            info_ptrs[stage] = &(*infos)[stage];
+        }
+        if (!readable) {
+            reason = "infos unreadable";
+            continue;
+        }
+        if (std::ranges::any_of(info_ptrs, [](const Shader::Info* info) {
+                return info && info->requires_layer_emulation;
+            })) {
+            reason = "layer emulation";
+            continue;
+        }
+        const u32 traits = UsedFormatTraits(info_ptrs);
+        bool holds = true;
+        for (size_t i = 0; i < live.size() && holds; ++i) {
+            FileEnvironment recorded;
+            if (!index->ReadEnvironment(record.envs[i], recorded)) {
+                reason = "environments unreadable";
+                holds = false;
+                break;
+            }
+            const char* why = "";
+            try {
+                holds = recorded.AnswersHoldFor(*live[i], &why, traits);
+            } catch (const std::exception&) {
+                why = "the game's state unreadable";
+                holds = false;
+            }
+            if (!holds) {
+                reason = why;
+            }
+        }
+        if (holds) {
+            matched = &record;
+            break;
+        }
+    }
+    if (!matched) {
+        NotePrecompiledMiss(reason);
+        return nullptr;
+    }
+    const bool libraries = (matched->flags & PrecompiledKept::FlagLibraries) != 0;
+    if (libraries && !device.IsExtGraphicsPipelineLibrarySupported()) {
+        NotePrecompiledMiss("graphics pipeline libraries");
+        return nullptr;
+    }
+    const auto checked = std::chrono::steady_clock::now();
+    if (mode == 2) {
+        ++precompiled_stats.audited;
+        if (!AuditPrecompiled(*index, *matched, live, false, nullptr)) {
+            ++precompiled_stats.audit_differ;
+            precompiled_rejected.insert(hash);
+            NotePrecompiledMiss("audit differed");
+            return nullptr;
+        }
+    }
+    const auto audit_end = std::chrono::steady_clock::now();
+    // The worker builds the SPIR-V the preparation kept: this build's translation of the
+    // recorded environments, which the check found to give the game state's.
+    GraphicsPipeline::EmitStagesFunc emit_stages =
+        [this, index, blobs = matched->spirv, hashes = graphics_key.unique_hashes,
+         libraries](std::array<u128, Maxwell::MaxShaderStage>& stage_hashes) {
+            std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
+            std::vector<u32> words;
+            for (size_t stage = 0; stage < modules.size(); ++stage) {
+                if (blobs[stage] == PrecompiledKept::NoBlob) {
+                    continue;
+                }
+                if (!index->ReadSpirv(blobs[stage], words)) {
+                    throw Shader::LogicError("Precompiled pipeline: kept SPIR-V of stage {} "
+                                             "unreadable",
+                                             stage);
+                }
+                modules[stage] = BuildStageModule(device, words, hashes[stage + 1], stage,
+                                                  libraries ? &stage_hashes[stage] : nullptr);
+            }
+            precompiled_worker_builds.fetch_add(1, std::memory_order_relaxed);
+            return modules;
+        };
+    GraphicsPipeline::LibraryParams library_params{
+        .library_cache = libraries ? &graphics_libraries : nullptr,
+    };
+    auto pipeline = std::make_unique<GraphicsPipeline>(
+        scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
+        descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, &workers, nullptr,
+        render_pass_cache, graphics_key, std::array<vk::ShaderModule, Maxwell::MaxShaderStage>{},
+        info_ptrs, std::move(emit_stages), library_params);
+    precompiled_pending.push_back(graphics_key);
+    ++precompiled_stats.graphics;
+    // The GPU thread's own time: the check and the creation, not the audit.
+    const auto elapsed = (checked - begin) + (std::chrono::steady_clock::now() - audit_end);
+    precompiled_stats.gpu_time += elapsed;
+    precompiled_stats.gpu_worst = (std::max)(precompiled_stats.gpu_worst, elapsed);
+    // The live environments answered every recorded question (AnswersHoldFor), as a
+    // translation of them would have: stored like a translated pipeline's.
+    if (!pipeline_cache_filename.empty()) {
+        StoreRuntimeGraphicsPipeline(graphics_key, environments.envs);
+    }
+    return pipeline;
+}
+
+ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
+    const ComputePipelineCacheKey& key, Shader::Environment& env) {
+    const int mode = PrecompiledFastMode();
+    if (mode == 0 || !kept_available.load(std::memory_order_acquire)) {
+        return {};
+    }
+    const auto index = KeptIndex();
+    if (!index) {
+        return {};
+    }
+    const u64 hash = key.Hash();
+    const auto records = index->Compute(hash);
+    if (records.empty()) {
+        ++precompiled_stats.not_precompiled;
+        return {};
+    }
+    if (precompiled_rejected.contains(hash)) {
+        NotePrecompiledMiss("rejected earlier (failed build or audit)");
+        return {};
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    auto info = std::make_unique<Shader::Info>();
+    const PrecompiledKept::Record* matched = nullptr;
+    const char* reason = "stages";
+    // One record for each storage pointer state the program was prepared in.
+    for (const PrecompiledKept::Record& record : records) {
+        if (record.env_count != 1 || record.infos[0] == PrecompiledKept::NoBlob ||
+            record.spirv[0] == PrecompiledKept::NoBlob) {
+            reason = "stages";
+            continue;
+        }
+        *info = Shader::Info{};
+        if (!index->ReadInfo(record.infos[0], *info)) {
+            reason = "infos unreadable";
+            continue;
+        }
+        FileEnvironment recorded;
+        if (!index->ReadEnvironment(record.envs[0], recorded)) {
+            reason = "environments unreadable";
+            continue;
+        }
+        const std::array<const Shader::Info*, 1> info_ptrs{info.get()};
+        const char* why = "";
+        bool holds = false;
+        try {
+            holds = recorded.AnswersHoldFor(env, &why, UsedFormatTraits(info_ptrs));
+        } catch (const std::exception&) {
+            why = "the game's state unreadable";
+        }
+        if (holds) {
+            matched = &record;
+            break;
+        }
+        reason = why;
+    }
+    if (!matched) {
+        NotePrecompiledMiss(reason);
+        return {};
+    }
+    const auto checked = std::chrono::steady_clock::now();
+    if (mode == 2) {
+        ++precompiled_stats.audited;
+        Shader::Environment* const env_ptr = &env;
+        if (!AuditPrecompiled(*index, *matched, std::span(&env_ptr, 1), true, &key)) {
+            ++precompiled_stats.audit_differ;
+            precompiled_rejected.insert(hash);
+            NotePrecompiledMiss("audit differed");
+            return {};
+        }
+    }
+    const auto audit_end = std::chrono::steady_clock::now();
+    auto make_module = [this, index, blob = matched->spirv[0], shader = key.unique_hash] {
+        std::vector<u32> words;
+        if (!index->ReadSpirv(blob, words)) {
+            throw Shader::LogicError("Precompiled compute shader {:016x}: kept SPIR-V unreadable",
+                                     shader);
+        }
+        SelfCheckSpirv(words, shader, "compute");
+        device.SaveShader(words);
+        precompiled_worker_builds.fetch_add(1, std::memory_order_relaxed);
+        return BuildShader(device, words);
+    };
+    ComputePipelineCacheEntry entry{
+        .pipeline = std::make_unique<ComputePipeline>(
+            device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
+            descriptor_buffer_ring, &workers, nullptr, &shader_notify, *info, vk::ShaderModule{},
+            key.unique_hash, std::move(make_module)),
+        // The live environment answered the same questions, as the translation would have.
+        .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
+                                                    : std::vector<std::pair<u32, u32>>{},
+        .mapped_pointers =
+            env.IsNativeProgram() ? env.MappedStoragePointerKeys() : std::vector<u64>{},
+    };
+    entry.pipeline->MarkPrecompiled();
+    ++precompiled_stats.compute;
+    const auto elapsed = (checked - begin) + (std::chrono::steady_clock::now() - audit_end);
+    precompiled_stats.gpu_time += elapsed;
+    precompiled_stats.gpu_worst = (std::max)(precompiled_stats.gpu_worst, elapsed);
+    return entry;
+}
+
+void PipelineCache::CheckPrecompiledBuilds() {
+    if (precompiled_pending.empty()) {
+        return;
+    }
+    bool dropped = false;
+    std::erase_if(precompiled_pending, [&](const GraphicsPipelineCacheKey& key) {
+        const auto it = graphics_cache.find(key);
+        if (it == graphics_cache.end() || !it->second) {
+            return true;
+        }
+        GraphicsPipeline* const pipeline = it->second.get();
+        if (pipeline->Failed()) {
+            // Its kept SPIR-V did not build (logged by the worker): the next draw of the key
+            // translates it from the game's state.
+            precompiled_rejected.insert(key.Hash());
+            ++precompiled_stats.failed;
+            used_this_session.erase(pipeline);
+            evicted_pipelines.emplace_back(scheduler.CurrentTick(), std::move(it->second));
+            graphics_cache.erase(it);
+            dropped = true;
+            return true;
+        }
+        return pipeline->IsBuilt();
+    });
+    if (dropped) {
+        for (auto& [key, pipeline] : graphics_cache) {
+            if (pipeline) {
+                pipeline->ClearTransitions();
+            }
+        }
+        current_pipeline = nullptr;
+        clean.pipeline = nullptr;
+    }
+}
+
+void PipelineCache::ReportPrecompiled() {
+    if (PrecompiledFastMode() == 0) {
+        return;
+    }
+    auto& stats = precompiled_stats;
+    const auto now = std::chrono::steady_clock::now();
+    if (stats.window == std::chrono::steady_clock::time_point{}) {
+        stats.window = now;
+        stats.bytes_at_window = PrecompiledKept::BytesRead().load(std::memory_order_relaxed);
+        return;
+    }
+    if (now - stats.window < std::chrono::seconds{10}) {
+        return;
+    }
+    const u64 bytes_total = PrecompiledKept::BytesRead().load(std::memory_order_relaxed);
+    const u64 bytes = bytes_total - stats.bytes_at_window;
+    const u32 built = precompiled_worker_builds.exchange(0, std::memory_order_relaxed);
+    if (stats.graphics + stats.compute + stats.failed + stats.not_precompiled + built != 0 ||
+        !stats.misses.empty()) {
+        const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+        std::string misses;
+        for (const auto& [reason, count] : stats.misses) {
+            misses += fmt::format("{}{} {}", misses.empty() ? "" : ", ", count, reason);
+        }
+        const auto index = KeptIndex();
+        LOG_INFO(Render_Vulkan,
+                 "Precompiled fast path in the last 10 s: {} graphics and {} compute pipelines "
+                 "created from kept infos ({:.1f} ms on the GPU thread, {:.2f} ms the worst), {} "
+                 "built from kept SPIR-V on workers, {} failed builds replaced, {} new keys not "
+                 "precompiled; checks sent back: {}; {} KB read from the kept and precompiled "
+                 "files; index {:.1f} MB in RAM",
+                 stats.graphics, stats.compute, ms(stats.gpu_time), ms(stats.gpu_worst), built,
+                 stats.failed, stats.not_precompiled, misses.empty() ? "none" : misses,
+                 bytes / 1024,
+                 index ? static_cast<double>(index->MemoryBytes()) / (1024.0 * 1024.0) : 0.0);
+        if (PrecompiledFastMode() == 2) {
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled audit in the last 10 s (EDEN_NX2_PRECOMPILED_FAST=2): {} "
+                     "compared with their translation of the game's state, {} differ (never "
+                     "used, built by the normal path)",
+                     stats.audited, stats.audit_differ);
+        }
+    }
+    stats.graphics = stats.compute = stats.failed = stats.not_precompiled = 0;
+    stats.audited = stats.audit_differ = 0;
+    stats.gpu_time = stats.gpu_worst = {};
+    stats.misses.clear();
+    stats.bytes_at_window = bytes_total;
+    stats.window = now;
 }
 
 vk::PipelineCache& PipelineCache::WarmPipelineCache() {
@@ -4014,6 +4747,12 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
         ReportNewPipelineKey(graphics_key);
         pipeline = TakeBackgroundPipeline(graphics_key);
         if (!pipeline) {
+            // EDEN_NX2_PRECOMPILED_FAST: a precompiled pipeline whose recorded answers hold is
+            // created from its kept infos (no translation) and built from its kept SPIR-V on a
+            // worker; its draws wait or are skipped by the usual rule (BuiltPipeline).
+            pipeline = CreatePrecompiledGraphicsPipeline();
+        }
+        if (!pipeline) {
             // EDEN_NX2_ASYNC_TRANSLATE=1/2: a draw that may be skipped has its new pipeline
             // translated on a translation thread, and is skipped (as for an unbuilt pipeline)
             // until it is ready. The entry stays empty meanwhile.
@@ -4136,10 +4875,51 @@ void ReportWorstFrame() {
 }
 } // Anonymous namespace
 
+namespace {
+/// EDEN_NX2_TRANSLATE_PROFILE=1 (zortos293/Lichii#896's profiler, off by default): every 10 s the
+/// time each translation step took on all threads, the largest first.
+void ReportTranslateProfile() {
+    if (!Shader::TranslateProfile::Enabled()) {
+        return;
+    }
+    static auto window = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window < std::chrono::seconds{10}) {
+        return;
+    }
+    window = now;
+    namespace Profile = Shader::TranslateProfile;
+    const Profile::Totals totals = Profile::Take();
+    std::array<size_t, Profile::NumSteps> order{};
+    std::iota(order.begin(), order.end(), size_t{0});
+    std::ranges::sort(order, [&](size_t lhs, size_t rhs) {
+        return totals.nanoseconds[lhs] > totals.nanoseconds[rhs];
+    });
+    std::string steps;
+    for (const size_t step : order) {
+        if (totals.counts[step] == 0) {
+            continue;
+        }
+        steps += fmt::format("{}{} {:.1f} ms ({})", steps.empty() ? "" : ", ",
+                             Profile::Name(static_cast<Profile::Step>(step)),
+                             static_cast<double>(totals.nanoseconds[step]) / 1e6,
+                             totals.counts[step]);
+    }
+    if (!steps.empty()) {
+        LOG_INFO(Render_Vulkan, "Translation profile in the last 10 s (all threads): {}", steps);
+    }
+}
+} // Anonymous namespace
+
 void PipelineCache::TickFrame() {
     ++frame_count;
     ReportWorstFrame();
     ReportAsyncDiscard();
+    ReportTranslateProfile();
+    if (PrecompiledFastMode() != 0) {
+        CheckPrecompiledBuilds();
+        ReportPrecompiled();
+    }
     if (translate_queue) {
         TickTranslations();
     }
@@ -4675,6 +5455,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             // driver crash in verify mode.
             const auto begin = std::chrono::steady_clock::now();
             record->spirv[stage_index] = EmitSPIRV(profile, runtime_info, program, binding);
+            if (record->keep_infos) {
+                // The info the pipeline is made with (it copies program.info after this).
+                record->infos[stage_index].clear();
+                Shader::SerializeInfo(program.info, record->infos[stage_index]);
+                record->libraries = use_libraries;
+            }
             if (record->translate_only) {
                 previous_stage = &program;
                 continue;
@@ -5340,8 +6126,14 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
     env.SetCachedSize(shader->size_bytes);
     env.KeepStoragePointers(keep_pointers);
 
-    main_pools.ReleaseContents();
-    auto entry{CreateComputePipeline(main_pools, key, env, nullptr, true)};
+    // EDEN_NX2_PRECOMPILED_FAST: a precompiled program whose recorded answers hold is made from
+    // its kept info and SPIR-V. A rebuild too (keep_pointers): its environment answers the kept
+    // pointers as pointers before anything is asked, as its translation would see them.
+    auto entry{CreatePrecompiledComputePipeline(key, env)};
+    if (!entry.pipeline) {
+        main_pools.ReleaseContents();
+        entry = CreateComputePipeline(main_pools, key, env, nullptr, true);
+    }
     if (const char* directory = std::getenv("EDEN_NX2_SHADER_DUMP");
         directory && !entry.pipeline && env.CanBeSerialized()) {
         const auto path = std::filesystem::path{directory} /
@@ -5366,7 +6158,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
 
 ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     ShaderPools& pools, const ComputePipelineCacheKey& key, Shader::Environment& env,
-    PipelineStatistics* statistics, bool build_in_parallel, bool warm) try {
+    PipelineStatistics* statistics, bool build_in_parallel, bool warm, ComputeKeep* keep) try {
     auto hash = key.Hash();
     if (device.HasBrokenCompute()) {
         if (!warm) {
@@ -5406,6 +6198,16 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         program.shared_memory_size = max_shared_memory;
     }
     const std::vector<u32> code{EmitSPIRV(profile, program)};
+    if (keep) {
+        // The precompiled preparation keeps these (EDEN_NX2_PRECOMPILED_FAST); its audit
+        // compares them and stops here.
+        keep->spirv = code;
+        keep->info.clear();
+        Shader::SerializeInfo(program.info, keep->info);
+        if (keep->translate_only) {
+            return {};
+        }
+    }
     SelfCheckSpirv(code, key.unique_hash, "compute");
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};

@@ -46,6 +46,7 @@
 #include "shader_recompiler/frontend/ampere/program_override.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
+#include "shader_recompiler/translate_profile.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/object_pool.h"
 #include "shader_recompiler/profile.h"
@@ -778,7 +779,12 @@ Translated TranslateAndEmit(Shader::Environment& env, Stage stage) {
     const auto host = HostInfo();
     const u32 entry = stage == Stage::Compute ? env.StartAddress()
                                               : static_cast<u32>(env.StartAddress() + SphSize);
-    Shader::Maxwell::Flow::CFG cfg{env, flow_pool, Shader::Maxwell::Location{entry}, false};
+    std::optional<Shader::Maxwell::Flow::CFG> cfg_storage;
+    {
+        Shader::TranslateProfile::Scope scope{Shader::TranslateProfile::Step::Cfg};
+        cfg_storage.emplace(env, flow_pool, Shader::Maxwell::Location{entry}, false);
+    }
+    auto& cfg = *cfg_storage;
     auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
     Shader::RuntimeInfo runtime{};
     runtime.previous_stage_stores.mask.set();
@@ -804,6 +810,7 @@ Translated TranslateAndEmit(Shader::Environment& env, Stage stage) {
     profile.support_typeless_image_loads = true;
     profile.support_float_controls = true;
     Shader::Backend::Bindings bindings{};
+    Shader::TranslateProfile::Scope scope{Shader::TranslateProfile::Step::EmitSpirv};
     return {Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings)};
 }
 
@@ -819,7 +826,12 @@ TranslateFacts Translate(Shader::Environment& env, Stage stage) {
     static const auto host = HostInfo();
     const u32 entry = stage == Stage::Compute ? env.StartAddress()
                                               : static_cast<u32>(env.StartAddress() + SphSize);
-    Shader::Maxwell::Flow::CFG cfg{env, flow_pool, Shader::Maxwell::Location{entry}, false};
+    std::optional<Shader::Maxwell::Flow::CFG> cfg_storage;
+    {
+        Shader::TranslateProfile::Scope scope{Shader::TranslateProfile::Step::Cfg};
+        cfg_storage.emplace(env, flow_pool, Shader::Maxwell::Location{entry}, false);
+    }
+    auto& cfg = *cfg_storage;
     const auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
     TranslateFacts facts;
     for (const auto& desc : program.info.texture_descriptors) {
@@ -1219,6 +1231,58 @@ int MeshEnvs(const std::filesystem::path& pkg, const std::filesystem::path& comb
 
 // Replays every environment of a precompiled file the way the engine's FileEnvironment does and
 // checks that each record's key names the code of its environments.
+void PrintTranslateProfile(const std::vector<RecordedEnvironment>& envs,
+                           const std::vector<u64>& env_nanoseconds,
+                           const std::vector<std::string>& errors, unsigned threads,
+                           std::chrono::steady_clock::duration wall) {
+    namespace P = Shader::TranslateProfile;
+    const auto totals = P::Take();
+    u64 all = 0, translated = 0;
+    std::map<std::string, std::vector<double>> by_stage;
+    for (size_t i = 0; i < envs.size(); ++i) {
+        if (!errors[i].empty() || env_nanoseconds[i] == 0) {
+            continue;
+        }
+        all += env_nanoseconds[i];
+        ++translated;
+        by_stage[StageNames[static_cast<u32>(envs[i].ShaderStage())]].push_back(
+            static_cast<double>(env_nanoseconds[i]) / 1e6);
+    }
+    fmt::print("translation profile: {} environments in {:.1f} s on {} threads, {:.1f} s of "
+               "thread time, {:.3f} ms per environment\n",
+               translated, std::chrono::duration<double>(wall).count(), threads, all / 1e9,
+               translated ? all / 1e6 / static_cast<double>(translated) : 0.0);
+    fmt::print("  {:34} {:>10} {:>7} {:>10} {:>9}\n", "step", "total ms", "share", "count",
+               "us each");
+    for (size_t step = 0; step < P::NumSteps; ++step) {
+        if (totals.counts[step] == 0) {
+            continue;
+        }
+        const double ms = static_cast<double>(totals.nanoseconds[step]) / 1e6;
+        fmt::print("  {:34} {:>10.1f} {:>6.1f}% {:>10} {:>9.1f}\n",
+                   P::Name(static_cast<P::Step>(step)), ms,
+                   all ? 100.0 * static_cast<double>(totals.nanoseconds[step]) /
+                             static_cast<double>(all)
+                       : 0.0,
+                   totals.counts[step],
+                   1000.0 * ms / static_cast<double>(totals.counts[step]));
+    }
+    fmt::print("  by stage (ms per environment: mean, median, 90th, 99th, max)\n");
+    for (auto& [stage, times] : by_stage) {
+        std::sort(times.begin(), times.end());
+        const auto at = [&](double q) {
+            return times[std::min(times.size() - 1, static_cast<size_t>(q * times.size()))];
+        };
+        double sum = 0;
+        for (const double t : times) {
+            sum += t;
+        }
+        fmt::print("  {:10} {:>6}  {:7.3f} {:7.3f} {:7.3f} {:7.3f} {:8.3f}\n", stage,
+                   times.size(), sum / static_cast<double>(times.size()), at(0.5), at(0.9),
+                   at(0.99), times.back());
+    }
+}
+
 int Check(const std::filesystem::path& path, unsigned threads) {
     const auto bytes = ReadFile(path);
     const std::span<const u8> file{bytes};
@@ -1237,6 +1301,10 @@ int Check(const std::filesystem::path& path, unsigned threads) {
     std::vector<RecordedEnvironment> envs(env_count);
     std::vector<u64> hashes(env_count);
     std::vector<std::string> errors(env_count);
+    // NX2_CHECK_SPIRV=<file> (with NX2_CHECK_EMIT=1): a hash of each environment's SPIR-V, one
+    // line per environment, to compare a translator change against: the same file means the
+    // same SPIR-V for every environment.
+    std::vector<u64> spirv_hashes(env_count);
     // NX2_CHECK_EMIT=1 also emits SPIR-V; with --threads 1 the environment being emitted is
     // written to NX2_CHECK_PROGRESS first, so a crash names it.
     const bool emit = std::getenv("NX2_CHECK_EMIT") != nullptr;
@@ -1244,6 +1312,12 @@ int Check(const std::filesystem::path& path, unsigned threads) {
     // NX2_CHECK_START=<index>: resume after a crash (environments before it are not checked).
     const char* start_text = std::getenv("NX2_CHECK_START");
     const size_t start = start_text ? std::stoull(start_text) : 0;
+    // NX2_CHECK_PROFILE=1: time each translation step (Shader::TranslateProfile) and each
+    // environment's whole translation, by stage.
+    const bool profile = std::getenv("NX2_CHECK_PROFILE") != nullptr;
+    Shader::TranslateProfile::SetEnabled(profile);
+    std::vector<u64> env_nanoseconds(env_count);
+    const auto profile_begin = std::chrono::steady_clock::now();
     ParallelFor(env_count, threads, [&](size_t i) {
         if (i < start)
             return;
@@ -1258,15 +1332,36 @@ int Check(const std::filesystem::path& path, unsigned threads) {
                     << i << ' ' << StageNames[static_cast<u32>(stage)] << ' '
                     << fmt::format("{:016x}", hashes[i]) << '\n';
             }
+            const auto begin = std::chrono::steady_clock::now();
             if (emit) {
-                (void)TranslateAndEmit(envs[i], stage);
+                const auto translated = TranslateAndEmit(envs[i], stage);
+                spirv_hashes[i] = Common::CityHash64(
+                    reinterpret_cast<const char*>(translated.spirv.data()),
+                    translated.spirv.size() * sizeof(u32));
             } else {
                 Translate(envs[i], stage);
             }
+            env_nanoseconds[i] = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - begin)
+                    .count());
         } catch (const std::exception& e) {
             errors[i] = e.what();
         }
     });
+    if (const char* spirv_out = std::getenv("NX2_CHECK_SPIRV"); spirv_out && emit) {
+        std::ofstream out(spirv_out, std::ios::trunc);
+        for (size_t i = 0; i < env_count; ++i) {
+            out << i << ' '
+                << (errors[i].empty() ? fmt::format("{:016x}", spirv_hashes[i])
+                                      : std::string{"failed"})
+                << '\n';
+        }
+    }
+    if (profile) {
+        PrintTranslateProfile(envs, env_nanoseconds, errors, threads,
+                              std::chrono::steady_clock::now() - profile_begin);
+    }
     std::map<std::string, size_t> failures;
     size_t failed_envs = 0;
     for (const auto& error : errors) {
