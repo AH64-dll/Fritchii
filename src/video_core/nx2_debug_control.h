@@ -296,6 +296,19 @@ inline std::atomic<int> g_idle_pause{-1};
 /// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
 /// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 0 (default)
 /// = off.
+/// EXP43 (live; render target relocation, fable_answer_12 2A; TextureCache::JoinImages): a render
+/// target a clear overwrites whole, whose only overlap is one image of the same single-level,
+/// single-layer 2D shape it drifted off by less than its size (Ocarina of Time's bump-allocated
+/// per-frame targets while an NPC moves), with no copies, aliases or remapped images, takes that
+/// image's place. 2 = relocate: the image moves to the new address (stale at the old one,
+/// untracked, unregistered, its overlap links dropped, registered again; its VkImage, memory,
+/// views and framebuffers stay). 1 = retire early: the old image is deleted at once and a new one
+/// made, as with 0. 0 (default) = off: candidates are only counted. Never for a shape whose
+/// GPU-written contents were sampled or rendered to without a clear in a later frame, or read by
+/// the CPU (sticky per shape for the session: "Render target relocation guard (EXP43)"), nor for
+/// rescaled, sparse, converted or CPU-read images, ones with a download queued, bound as another
+/// target of the clear or in another channel. Logs each shape's first candidate and relocation
+/// and "Render target relocation (EXP43=n) last 600 frames".
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 

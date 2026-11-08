@@ -578,6 +578,59 @@ private:
     /// Remove framebuffers using the given image views from the cache
     void RemoveFramebuffers(std::span<const ImageViewId> removed_views);
 
+    /// Render target relocation (EXP43, fable_answer_12 2A). Per shape (format, size, samples,
+    /// levels, layers), sticky for the session: a shape whose GPU-written contents were read in a
+    /// later frame (sampled, rendered to without a clear) or read by the CPU never relocates or
+    /// retires early, since its predecessor's contents may still be wanted.
+    enum RelocationGuard : u8 {
+        GuardSampled = 1,  ///< Sampled or copied from in a frame after the GPU wrote it
+        GuardLoaded = 2,   ///< Rendered to without a clear in a frame after the GPU wrote it
+        GuardCpuRead = 4,  ///< Read by the CPU (GetFlushArea, DownloadMemory)
+    };
+    struct RelocationShape {
+        u8 guard{};
+        bool candidate_logged{};
+        bool relocated_logged{};
+    };
+    ::Common::unordered_map<u64, RelocationShape> relocation_shapes;
+    /// Since the last report (TickFrame, every 600 frames once a candidate was seen).
+    u64 relocation_candidates{};
+    u64 relocation_guarded{};
+    u64 relocation_relocated{};
+    u64 relocation_retired{};
+    bool relocation_seen{};
+
+    [[nodiscard]] static bool RelocationShaped(const ImageInfo& info) noexcept {
+        return info.type == ImageType::e2D && info.resources.levels == 1 &&
+               info.resources.layers == 1 && info.num_samples == 1;
+    }
+    [[nodiscard]] static u64 RelocationShapeKey(const ImageInfo& info) noexcept {
+        return (u64{static_cast<u32>(info.format) & 0xFF} << 56) |
+               (u64{info.num_samples & 0xF} << 52) |
+               (u64{static_cast<u32>(info.resources.levels) & 0xF} << 48) |
+               (u64{static_cast<u32>(info.resources.layers) & 0xFFF} << 36) |
+               (u64{info.size.width & 0x3FFFF} << 18) | (info.size.height & 0x3FFFF);
+    }
+    /// JoinImages' only bad overlap, when the new render target could take its place: the same
+    /// single-level, single-layer 2D shape and layout, a drift of less than its size, nothing
+    /// unusual about it (sparse, converted, aliased, remapped, rescaled, CPU-read, a download
+    /// queued, bound as another target of this clear, registered in another channel). Else none.
+    [[nodiscard]] ImageId RelocationCandidate(const ImageInfo& new_info, GPUVAddr gpu_addr,
+                                              DAddr cpu_addr);
+    /// Sets `reason` on the image's shape (once per image and reason; logs the shape's first).
+    void NoteRelocationGuard(ImageBase& image, RelocationGuard reason);
+    /// The cross-frame read checks of PrepareImage and the texture memo's touch.
+    void CheckCrossFrameUse(ImageBase& image, bool is_modification, bool invalidate) {
+        if (image.last_write_frame == frame_tick || image.last_write_frame == ~u64{0} ||
+            invalidate) {
+            return;
+        }
+        const RelocationGuard reason = is_modification ? GuardLoaded : GuardSampled;
+        if ((image.relocation_guard_noted & reason) == 0 && RelocationShaped(image.info)) {
+            NoteRelocationGuard(image, reason);
+        }
+    }
+
     /// Drops a framebuffer from framebuffers_by_view and framebuffer_keys.
     void UnindexFramebuffer(FramebufferId framebuffer_id, const RenderTargets& key);
 
