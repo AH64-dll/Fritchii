@@ -4,10 +4,15 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -32,35 +37,65 @@
 namespace Kernel::Svc {
 namespace {
 
-// Ocarina of Time (main build E0F3CCFA...). Found by Hookshot (NotRexed's OoT recomp,
-// host/hos_thread.c present_poll): the main thread waits for its frame's GPU work with
+// Ocarina of Time. Found by Hookshot (NotRexed's OoT recomp, host/hos_thread.c present_poll):
+// the main thread waits for its frame's GPU work with
 //     while (nvnEventGetValue(e) != 1) nn::os::SleepThread(1 ms);
-// at main+0x590500, ~3.5 sleeps a frame, so each frame ends 0.5-1 ms after the GPU wrote the
-// event. In the loop, `bl nn::os::SleepThread` is at main+0x59051C (returns to main+0x590520) and
-// `blr` nvnEventGetValue at main+0x59052C (returns to main+0x590530, Hookshot's
-// HOS_PRESENT_NOWAIT). Here that one sleep becomes a wait that the GPU's next write of a 1 (a
-// semaphore release or report, Tegra::Nx2SemaphoreWaiters::OnWrite) ends early. It never lasts
-// longer than the sleep it replaces, so the loop polls at least as often as before.
+// ~3.5 sleeps a frame, so each frame ends 0.5-1 ms after the GPU wrote the event. In the loop a
+// call to nn::os::SleepThread returns to the "sleep return" address, and nvnEventGetValue is
+// called through a pointer (blr) right after. Here that one sleep becomes a wait that the GPU's
+// next write of a 1 (a semaphore release or report, Tegra::Nx2SemaphoreWaiters::OnWrite) ends
+// early. It never lasts longer than the sleep it replaces, so the loop polls at least as often.
+//
+// EXP24 = 2 finds the site for a build: it counts the short sleeps by call chain and logs the top
+// ones every 10 s. EDEN_NX2_OOT_PRESENT_SITE=<ret>[:<blr>] (hex main offsets: the sleep call's
+// return address, and the nvnEventGetValue blr, default ret + 0xC) tries a found site with EXP24=1
+// before it goes in the table.
 constexpr u64 OotProgramId = 0x0400486024DEC000ULL;
-constexpr std::array<u8, 20> OotMainBuildId{
-    0xE0, 0xF3, 0xCC, 0xFA, 0xF5, 0x00, 0x65, 0xAE, 0x4E, 0xA0,
-    0x1E, 0xB5, 0xAE, 0xB1, 0x3B, 0x1A, 0x45, 0xDA, 0x33, 0x48,
+
+using BuildId = std::array<u8, 20>;
+
+/// Where the present poll is in one build of main (offsets from main's start).
+struct PresentSite {
+    BuildId build_id;
+    u64 sleep_return;   // return address of the call to nn::os::SleepThread
+    u64 sleep_call;     // that call (bl)
+    u64 get_value_call; // blr nvnEventGetValue
 };
-constexpr u64 PollLoop = 0x590500;
-constexpr u64 SleepCall = 0x59051C;
-constexpr u64 SleepReturn = 0x590520;
-constexpr u64 GetValueCall = 0x59052C;
+
+constexpr std::array PresentSites{
+    // E0F3CCFA... (2.0.0, v131072). Hookshot's 0x80590520 (sleep return), 0x8059051C and
+    // 0x8059052C are absolute addresses in its Eden layout (nx2/image.py): rtld at 0x80000000,
+    // main right after rtld's 0x20000 (as in Eden: rtld@0x80fe4000, main@0x81004000), so main
+    // offsets 0x570520, 0x57051C, 0x57052C. main+0x590520 held a function epilogue. Not yet
+    // seen verified; EXP24=2 shows the real site.
+    PresentSite{
+        .build_id = {0xE0, 0xF3, 0xCC, 0xFA, 0xF5, 0x00, 0x65, 0xAE, 0x4E, 0xA0,
+                     0x1E, 0xB5, 0xAE, 0xB1, 0x3B, 0x1A, 0x45, 0xDA, 0x33, 0x48},
+        .sleep_return = 0x570520,
+        .sleep_call = 0x57051C,
+        .get_value_call = 0x57052C,
+    },
+};
+
 constexpr u32 CmpW0One = 0x7100041F; // cmp w0, #1 (expected after the GetValue call, logged only)
-constexpr u64 DumpFirst = PollLoop - 0x10;
-constexpr size_t DumpWords = 20; // main+0x5904F0 .. main+0x59053C
+constexpr u64 DumpBefore = 0x30;     // the site check logs sleep_return - 0x30 ..
+constexpr size_t DumpWords = 20;     // .. + 0x1C (20 words)
+constexpr u64 LocateDumpBefore = 0x20; // locate logs site - 0x20 ..
+constexpr size_t LocateDumpWords = 16; // .. site + 0x1C (16 words)
 
 constexpr s64 MaxPollSleepNs = 2'000'000; // the game asks for 1 ms
 constexpr s64 MaxWaitNs = 1'000'000;
 constexpr s64 ResleepWindowNs = 200'000;
 constexpr s64 LogPeriodNs = 10'000'000'000;
-constexpr int FrameWalkDepth = 4;
+constexpr size_t FrameWalkDepth = 4;
+constexpr size_t LocateTop = 8;
+constexpr size_t LocateDumped = 3; // chains whose site words are logged
+constexpr size_t LocateMaxChains = 512;
 // Return addresses compared without any pointer authentication code above a 39-bit address.
 constexpr u64 ReturnAddressMask = (u64{1} << 39) - 1;
+
+/// LR, then the return addresses of the first FrameWalkDepth frame records; 0 = none.
+using ReturnChain = std::array<u64, 1 + FrameWalkDepth>;
 
 constexpr bool IsBl(u32 word) {
     return (word & 0xFC000000U) == 0x94000000U;
@@ -72,12 +107,14 @@ constexpr bool IsBlr(u32 word) {
 
 struct PresentPollState {
     // The process the site was checked in (process ids restart every session, so the pointer
-    // too), and what was found: main base + SleepReturn (0 when the site did not verify) and the
+    // too), and what was found: main base + sleep return (0 when the site did not verify) and the
     // two call words, read again on each use in case main moved.
     std::mutex site_mutex;
     const KProcess* checked_process{};
     u64 checked_process_id = ~u64{};
     u64 site_return = 0;
+    u64 sleep_call_address = 0;
+    u64 get_value_call_address = 0;
     u32 sleep_call_word = 0;
     u32 get_value_call_word = 0;
     bool build_id_logged = false;
@@ -99,6 +136,34 @@ struct PresentPollState {
 
 PresentPollState& PollState() {
     static PresentPollState state;
+    return state;
+}
+
+struct ModuleRange {
+    u64 base;
+    u64 end;
+    std::string name;
+};
+
+struct LocateEntry {
+    u64 count = 0;
+    s64 ns_sum = 0;
+};
+
+/// EXP24 = 2: short sleeps by call chain since the last log.
+struct LocateState {
+    std::mutex mutex;
+    const KProcess* process{};
+    u64 process_id = ~u64{};
+    std::vector<ModuleRange> modules;
+    std::map<ReturnChain, LocateEntry> chains;
+    u64 sleeps = 0;
+    u64 dropped = 0;
+    s64 last_log_tick = 0;
+};
+
+LocateState& Locate() {
+    static LocateState state;
     return state;
 }
 
@@ -152,48 +217,125 @@ void OnGpuWrite(u64 device_address, u32 value) {
     thread->EndWait(*kernel, ResultSuccess);
 }
 
-/// The load address of the module called "main": from the loader's own list (the NSOs it loaded,
-/// by file name: rtld, main, subsdk*, sdk), else from the modules found in the process's memory
-/// by their path names. 0 when neither knows it. `out_modules` gets the list used, for the log.
-/// Core::FindMainModuleEntrypoint is not used: it took the code region start (0x8000000, not
-/// main) in Ocarina of Time.
-u64 FindMainModuleBase(Core::System& system, KProcess& process, std::string& out_modules) {
-    const auto describe = [&out_modules](const Loader::AppLoader::Modules& list,
-                                         const char* source) {
-        out_modules = source;
-        for (const auto& [base, module_name] : list) {
-            out_modules += fmt::format(" {}@{:#x}", module_name, base);
-        }
-    };
+/// The process's modules with their load addresses: the loader's own list (the NSOs it loaded,
+/// by file name: rtld, main, subsdk*, sdk), else the modules found in the process's memory by
+/// their path names. `out_list` describes them, for the log.
+/// (Core::FindMainModuleEntrypoint took the code region start, 0x8000000, not main.)
+std::vector<ModuleRange> LoadedModules(Core::System& system, KProcess& process,
+                                       std::string& out_list) {
     Loader::AppLoader::Modules modules;
-    if (system.GetAppLoader().ReadNSOModules(modules) == Loader::ResultStatus::Success) {
-        describe(modules, "loader:");
-        for (const auto& [base, module_name] : modules) {
-            if (module_name == "main") {
-                return base;
-            }
-        }
+    const char* source = "loader:";
+    if (system.GetAppLoader().ReadNSOModules(modules) != Loader::ResultStatus::Success ||
+        modules.empty()) {
+        modules = Core::FindModules(std::addressof(process));
+        source = "memory:";
     }
-    modules = Core::FindModules(std::addressof(process));
-    describe(modules, "memory:");
-    for (const auto& [base, module_name] : modules) {
-        if (module_name == "main" || module_name.starts_with("main.")) {
-            return base;
+    std::vector<ModuleRange> ranges;
+    out_list = source;
+    for (auto it = modules.begin(); it != modules.end(); ++it) {
+        const auto next = std::next(it);
+        const u64 end = next != modules.end()
+                            ? next->first
+                            : GetInteger(Core::GetModuleEnd(std::addressof(process), it->first)) + 1;
+        std::string name = it->second;
+        if (name.starts_with("main.")) {
+            name = "main"; // a path name from memory
         }
+        out_list += fmt::format(" {}@{:#x}", it->second, it->first);
+        ranges.push_back(ModuleRange{.base = it->first, .end = end, .name = std::move(name)});
     }
-    return 0;
+    return ranges;
 }
 
-/// main base + SleepReturn when this process runs the verified Ocarina of Time build, else 0.
-/// The module is searched once per process; later calls only read the two call words again.
+const ModuleRange* FindModule(const std::vector<ModuleRange>& modules, u64 address) {
+    for (const ModuleRange& range : modules) {
+        if (address >= range.base && address < range.end) {
+            return std::addressof(range);
+        }
+    }
+    return nullptr;
+}
+
+std::string DescribeAddress(const std::vector<ModuleRange>& modules, u64 address) {
+    if (const ModuleRange* range = FindModule(modules, address)) {
+        return fmt::format("{}+{:#x}", range->name, address - range->base);
+    }
+    return fmt::format("{:#x}", address);
+}
+
+/// The present-poll site for this build (env override first), or none.
+struct SiteOffsets {
+    u64 sleep_return;
+    u64 get_value_call;
+    bool from_env;
+};
+
+std::optional<SiteOffsets> EnvSite() {
+    static const std::optional<SiteOffsets> site = []() -> std::optional<SiteOffsets> {
+        const char* const text = std::getenv("EDEN_NX2_OOT_PRESENT_SITE");
+        if (text == nullptr || text[0] == 0) {
+            return std::nullopt;
+        }
+        char* end = nullptr;
+        const u64 sleep_return = std::strtoull(text, &end, 16);
+        if (end == text || sleep_return < 4) {
+            return std::nullopt;
+        }
+        u64 get_value_call = sleep_return + 0xC;
+        if (*end == ':') {
+            const char* const second = end + 1;
+            char* second_end = nullptr;
+            const u64 parsed = std::strtoull(second, &second_end, 16);
+            if (second_end != second) {
+                get_value_call = parsed;
+            }
+        }
+        return SiteOffsets{
+            .sleep_return = sleep_return, .get_value_call = get_value_call, .from_env = true};
+    }();
+    return site;
+}
+
+std::optional<SiteOffsets> SiteFor(const std::array<u8, 0x20>& build_id) {
+    if (const std::optional<SiteOffsets> env = EnvSite()) {
+        return env;
+    }
+    for (const PresentSite& site : PresentSites) {
+        if (std::equal(site.build_id.begin(), site.build_id.end(), build_id.begin())) {
+            if (site.sleep_call + 4 != site.sleep_return) {
+                return std::nullopt; // (a table typo: the call must be just before its return)
+            }
+            return SiteOffsets{.sleep_return = site.sleep_return,
+                               .get_value_call = site.get_value_call,
+                               .from_env = false};
+        }
+    }
+    return std::nullopt;
+}
+
+std::string HexBuildId(const std::array<u8, 0x20>& build_id) {
+    std::string text;
+    for (size_t i = 0; i < 20; ++i) {
+        text += fmt::format("{:02X}", build_id[i]);
+    }
+    return text;
+}
+
+/// main base + sleep return when this process runs a build with a known (or EDEN_NX2_OOT_
+/// PRESENT_SITE) site whose call words check out, else 0. The module is searched once per
+/// process; later calls only read the two call words again.
 u64 SiteReturnAddress(Core::System& system, KProcess& process) {
     PresentPollState& state = PollState();
     std::scoped_lock lk{state.site_mutex};
     const auto& build_id = system.GetApplicationProcessBuildID();
-    if (!std::equal(OotMainBuildId.begin(), OotMainBuildId.end(), build_id.begin())) {
+    const std::optional<SiteOffsets> site = SiteFor(build_id);
+    if (!site) {
         if (!state.build_id_logged) {
             state.build_id_logged = true;
-            LOG_INFO(Kernel_SVC, "OoT present poll (EXP24): main is not build E0F3CCFA..., off");
+            LOG_INFO(Kernel_SVC,
+                     "OoT present poll (EXP24): no site for main build {} (EXP24=2 finds it, "
+                     "EDEN_NX2_OOT_PRESENT_SITE tries it), off",
+                     HexBuildId(build_id));
         }
         return 0;
     }
@@ -201,10 +343,8 @@ u64 SiteReturnAddress(Core::System& system, KProcess& process) {
     if (state.checked_process == std::addressof(process) &&
         state.checked_process_id == process.GetProcessId()) {
         if (state.site_return == 0 ||
-            (memory.Read32(state.site_return - (SleepReturn - SleepCall)) ==
-                 state.sleep_call_word &&
-             memory.Read32(state.site_return + (GetValueCall - SleepReturn)) ==
-                 state.get_value_call_word)) {
+            (memory.Read32(state.sleep_call_address) == state.sleep_call_word &&
+             memory.Read32(state.get_value_call_address) == state.get_value_call_word)) {
             return state.site_return;
         }
     }
@@ -213,42 +353,56 @@ u64 SiteReturnAddress(Core::System& system, KProcess& process) {
     state.site_return = 0;
 
     std::string module_list;
-    const u64 main_base = FindMainModuleBase(system, process, module_list);
-    if (main_base == 0) {
+    const std::vector<ModuleRange> modules = LoadedModules(system, process, module_list);
+    const auto main_module = std::find_if(modules.begin(), modules.end(),
+                                          [](const ModuleRange& m) { return m.name == "main"; });
+    if (main_module == modules.end()) {
         LOG_WARNING(Kernel_SVC, "OoT present poll (EXP24): no module called main ({}), off",
                     module_list);
         return 0;
     }
+    const u64 main_base = main_module->base;
     LOG_INFO(Kernel_SVC, "OoT present poll (EXP24): using module main at {:#x} ({})", main_base,
              module_list);
-    if (!memory.IsValidVirtualAddressRange(main_base + DumpFirst, DumpWords * sizeof(u32))) {
+    LOG_INFO(Kernel_SVC,
+             "OoT present poll (EXP24): site main+{:#x} (sleep call main+{:#x}, blr main+{:#x}) "
+             "from {}",
+             site->sleep_return, site->sleep_return - 4, site->get_value_call,
+             site->from_env ? "EDEN_NX2_OOT_PRESENT_SITE" : "the table");
+    const u64 dump_first = main_base + site->sleep_return - DumpBefore;
+    if (!memory.IsValidVirtualAddressRange(dump_first, DumpWords * sizeof(u32)) ||
+        !memory.IsValidVirtualAddressRange(main_base + site->get_value_call, 2 * sizeof(u32))) {
         LOG_WARNING(Kernel_SVC, "OoT present poll (EXP24): main+{:#x} is not mapped (main {:#x}), off",
-                    DumpFirst, main_base);
+                    site->sleep_return - DumpBefore, main_base);
         return 0;
     }
-    std::array<u32, DumpWords> words{};
     std::string text;
     for (size_t i = 0; i < DumpWords; ++i) {
-        words[i] = memory.Read32(main_base + DumpFirst + i * sizeof(u32));
-        text += fmt::format(" {:08x}", words[i]);
+        text += fmt::format(" {:08x}", memory.Read32(dump_first + i * sizeof(u32)));
     }
-    const auto word_at = [&](u64 offset) { return words[(offset - DumpFirst) / sizeof(u32)]; };
-    const u32 sleep_call = word_at(SleepCall);
-    const u32 get_value_call = word_at(GetValueCall);
-    const u32 compare = word_at(GetValueCall + 4);
-    LOG_INFO(Kernel_SVC, "OoT present poll (EXP24): main {:#x}, main+{:#x}:{}", main_base, DumpFirst,
-             text);
-    if (!IsBl(sleep_call) || !IsBlr(get_value_call)) {
+    LOG_INFO(Kernel_SVC, "OoT present poll (EXP24): main {:#x}, main+{:#x}:{}", main_base,
+             site->sleep_return - DumpBefore, text);
+    const u64 sleep_call_address = main_base + site->sleep_return - 4;
+    const u64 get_value_call_address = main_base + site->get_value_call;
+    const u32 sleep_call = memory.Read32(sleep_call_address);
+    const u32 get_value_call = memory.Read32(get_value_call_address);
+    const u32 compare = memory.Read32(get_value_call_address + 4);
+    // The table's sleep call is a bl (nn::os::SleepThread through its PLT stub); a site under test
+    // may call through a pointer too.
+    const bool call_ok = IsBl(sleep_call) || (site->from_env && IsBlr(sleep_call));
+    if (!call_ok || !IsBlr(get_value_call)) {
         LOG_WARNING(Kernel_SVC,
                     "OoT present poll (EXP24): main+{:#x} = {:#010x} (want bl), main+{:#x} = "
                     "{:#010x} (want blr), off",
-                    SleepCall, sleep_call, GetValueCall, get_value_call);
+                    site->sleep_return - 4, sleep_call, site->get_value_call, get_value_call);
         return 0;
     }
     LOG_INFO(Kernel_SVC,
              "OoT present poll (EXP24): site verified (bl {:#010x}, blr {:#010x}, then {:#010x}{})",
              sleep_call, get_value_call, compare, compare == CmpW0One ? " = cmp w0, #1" : "");
-    state.site_return = main_base + SleepReturn;
+    state.site_return = main_base + site->sleep_return;
+    state.sleep_call_address = sleep_call_address;
+    state.get_value_call_address = get_value_call_address;
     state.sleep_call_word = sleep_call;
     state.get_value_call_word = get_value_call;
     state.kernel.store(std::addressof(system.Kernel()), std::memory_order_release);
@@ -256,36 +410,129 @@ u64 SiteReturnAddress(Core::System& system, KProcess& process) {
     return state.site_return;
 }
 
-/// Whether the current SVC was reached from the call that returns to `site_return`: the link
-/// register, or a return address in one of the innermost frame records (nn::os::SleepThread's
-/// own frames sit between the svc and the game's call).
-bool CalledFromSite(KernelCore& kernel, KProcess& process, u64 site_return) {
+/// The current SVC's caller chain: LR, then the return addresses in the innermost frame records
+/// (nn::os::SleepThread's own frames sit between the svc and the game's call).
+ReturnChain ReturnAddresses(KernelCore& kernel, KProcess& process) {
+    ReturnChain chain{};
     Core::ArmInterface* const arm = process.GetArmInterface(kernel.CurrentPhysicalCoreIndex());
     if (arm == nullptr) {
-        return false;
+        return chain;
     }
     Svc::ThreadContext ctx{};
     arm->GetContext(ctx);
-    if ((ctx.lr & ReturnAddressMask) == site_return) {
-        return true;
-    }
+    chain[0] = ctx.lr & ReturnAddressMask;
     auto& memory = process.GetMemory();
     u64 fp = ctx.fp;
-    for (int depth = 0; depth < FrameWalkDepth; ++depth) {
+    for (size_t depth = 0; depth < FrameWalkDepth; ++depth) {
         if (fp == 0 || (fp & 7) != 0 || !memory.IsValidVirtualAddressRange(fp, 16)) {
-            return false;
+            break;
         }
-        if ((memory.Read64(fp + 8) & ReturnAddressMask) == site_return) {
-            return true;
-        }
+        chain[1 + depth] = memory.Read64(fp + 8) & ReturnAddressMask;
         const u64 next = memory.Read64(fp);
         if (next <= fp) {
             // The stack grows down: a caller's frame record is above its callee's.
-            return false;
+            break;
         }
         fp = next;
     }
-    return false;
+    return chain;
+}
+
+bool CalledFromSite(KernelCore& kernel, KProcess& process, u64 site_return) {
+    const ReturnChain chain = ReturnAddresses(kernel, process);
+    return std::find(chain.begin(), chain.end(), site_return) != chain.end();
+}
+
+/// The first address of the chain inside main (the game's call), else LR.
+u64 ChainSite(const std::vector<ModuleRange>& modules, const ReturnChain& chain) {
+    for (const u64 address : chain) {
+        if (address == 0) {
+            break;
+        }
+        if (const ModuleRange* range = FindModule(modules, address);
+            range != nullptr && range->name == "main") {
+            return address;
+        }
+    }
+    return chain[0];
+}
+
+void LogLocate(LocateState& locate, KProcess& process, s64 elapsed) {
+    std::vector<std::pair<ReturnChain, LocateEntry>> top(locate.chains.begin(),
+                                                         locate.chains.end());
+    std::sort(top.begin(), top.end(),
+              [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+    if (top.size() > LocateTop) {
+        top.resize(LocateTop);
+    }
+    LOG_INFO(Kernel_SVC,
+             "OoT present poll locate (EXP24=2): {} sleeps of at most 2 ms in {:.1f} s, {} call "
+             "chains ({} sleeps not kept), top {}:",
+             locate.sleeps, static_cast<double>(elapsed) / 1e9, locate.chains.size(),
+             locate.dropped, top.size());
+    for (size_t i = 0; i < top.size(); ++i) {
+        const auto& [chain, entry] = top[i];
+        std::string text = "lr " + DescribeAddress(locate.modules, chain[0]);
+        for (size_t depth = 1; depth < chain.size() && chain[depth] != 0; ++depth) {
+            text += " < " + DescribeAddress(locate.modules, chain[depth]);
+        }
+        LOG_INFO(Kernel_SVC, "OoT present poll locate #{}: {} sleeps, {} ns asked on average: {}",
+                 i, entry.count, entry.ns_sum / static_cast<s64>(entry.count), text);
+    }
+    auto& memory = process.GetMemory();
+    for (size_t i = 0; i < top.size() && i < LocateDumped; ++i) {
+        const u64 site = ChainSite(locate.modules, top[i].first);
+        if (site < LocateDumpBefore ||
+            !memory.IsValidVirtualAddressRange(site - LocateDumpBefore,
+                                               LocateDumpWords * sizeof(u32))) {
+            continue;
+        }
+        std::string words;
+        for (size_t w = 0; w < LocateDumpWords; ++w) {
+            words += fmt::format(" {:08x}", memory.Read32(site - LocateDumpBefore + w * sizeof(u32)));
+        }
+        LOG_INFO(Kernel_SVC, "OoT present poll locate #{} site {}, words from {}:{}", i,
+                 DescribeAddress(locate.modules, site),
+                 DescribeAddress(locate.modules, site - LocateDumpBefore), words);
+    }
+}
+
+/// EXP24 = 2: counts this short sleep by its call chain; logs the top chains every 10 s.
+void LocateCount(Core::System& system, KernelCore& kernel, KProcess& process, s64 ns) {
+    const ReturnChain chain = ReturnAddresses(kernel, process);
+    const s64 now = kernel.HardwareTimer().GetTick();
+    LocateState& locate = Locate();
+    std::scoped_lock lk{locate.mutex};
+    if (locate.process != std::addressof(process) ||
+        locate.process_id != process.GetProcessId()) {
+        locate.process = std::addressof(process);
+        locate.process_id = process.GetProcessId();
+        std::string module_list;
+        locate.modules = LoadedModules(system, process, module_list);
+        locate.chains.clear();
+        locate.sleeps = 0;
+        locate.dropped = 0;
+        locate.last_log_tick = now;
+        LOG_INFO(Kernel_SVC, "OoT present poll locate (EXP24=2): modules {}", module_list);
+    }
+    ++locate.sleeps;
+    auto it = locate.chains.find(chain);
+    if (it == locate.chains.end() && locate.chains.size() < LocateMaxChains) {
+        it = locate.chains.emplace(chain, LocateEntry{}).first;
+    }
+    if (it != locate.chains.end()) {
+        ++it->second.count;
+        it->second.ns_sum += ns;
+    } else {
+        ++locate.dropped;
+    }
+    if (now - locate.last_log_tick >= LogPeriodNs) {
+        LogLocate(locate, process, now - locate.last_log_tick);
+        locate.chains.clear();
+        locate.sleeps = 0;
+        locate.dropped = 0;
+        locate.last_log_tick = now;
+    }
 }
 
 /// Sleeps up to `ns` (> 0), ended early by OnGpuWrite. Returns the wait's result.
@@ -341,12 +588,21 @@ void MaybeLog(PresentPollState& state, s64 now) {
 } // Anonymous namespace
 
 bool SleepNx2OotPresentPoll(Core::System& system, s64 ns) {
-    if (ns <= 0 || ns > MaxPollSleepNs || VideoCore::Nx2Debug::Experiment(24) == 0) {
+    if (ns <= 0 || ns > MaxPollSleepNs) {
+        return false;
+    }
+    const int mode = VideoCore::Nx2Debug::Experiment(24);
+    if (mode != 1 && mode != 2) {
         return false;
     }
     auto& kernel = system.Kernel();
     auto& process = GetCurrentProcess(kernel);
     if (!process.Is64Bit() || process.GetProgramId() != OotProgramId) {
+        return false;
+    }
+    if (mode == 2) {
+        // Locate only: the sleep itself is unchanged.
+        LocateCount(system, kernel, process, ns);
         return false;
     }
     const u64 site_return = SiteReturnAddress(system, process);
