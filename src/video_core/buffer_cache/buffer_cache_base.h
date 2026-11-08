@@ -334,6 +334,10 @@ public:
     [[nodiscard]] std::pair<Buffer*, u32> ObtainCPUBuffer(DAddr gpu_addr, u32 size,
                                                           ObtainBufferSynchronize sync_info,
                                                           ObtainBufferOperation post_op);
+
+    /// GPU work recorded now reads or writes these bytes, of a buffer obtained before (work set
+    /// up once that keeps reading them, as conditional rendering does). Creates no buffer.
+    void MarkUsed(DAddr device_addr, u64 size);
     void FlushCachedWrites();
 
     /// Where the CPU writes into GPU-written memory that were collected but not applied yet
