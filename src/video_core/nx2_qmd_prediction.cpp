@@ -9,6 +9,7 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -57,6 +58,11 @@ constexpr size_t Buckets = 512;
 /// records queued than 16 while the feed lets the front run a frame ahead, and an evicted
 /// record looked like a back release nothing predicted.
 constexpr size_t Ways = 32;
+/// A bucket grows past Ways while none of its records is done (6h (a) 4): a hot word with a
+/// frame of in-flight records no longer evicts unlanded ones. Evicting starts at MaxWays.
+constexpr size_t MaxWays = 256;
+/// No bound on a word with more unlanded records than this (Bail::Crowded, 6h fix 3).
+constexpr size_t CrowdedRecords = 24;
 constexpr size_t Releases = 1024;
 constexpr size_t Writers = static_cast<size_t>(Writer::Count);
 
@@ -74,6 +80,7 @@ enum class Bail : u32 {
     SignedMax,     ///< A signed MAX queued
     IncPayload,    ///< INC with a payload other than 0xffffffff queued
     Wrap,          ///< The bound would pass 0x7fffffff
+    Crowded,       ///< More unlanded records on the word than CrowdedRecords (6h)
     Count,
 };
 
@@ -256,6 +263,9 @@ struct AuditKey {
     /// where they stand against it, for unmatched records of `kind` before it.
     Kind kind{Kind::Plain};
     bool positional{};
+    /// A bound violated (6h fix 5): judged by whether the word reaches the bound when re-read
+    /// (a late landing: the decision stands), not by its value at the violation.
+    bool recovery{};
 };
 
 [[nodiscard]] bool IsFeedMode(int mode) {
@@ -275,7 +285,7 @@ std::string Rates(const Array& counts, double window) {
 /// Front-owned: only the front thread touches it (the back and fence threads only push to the
 /// rings).
 struct State {
-    std::array<std::array<Prediction, Ways>, Buckets> predictions{};
+    std::array<std::vector<Prediction>, Buckets> predictions{};
     std::array<u32, Buckets> next{};
     /// The newest position of a record evicted from each bucket (EXP13=2's bound).
     std::array<u64, Buckets> evicted{};
@@ -403,9 +413,55 @@ struct State {
         u64 sequence; ///< The newest folded record
         u32 bound;
         Clock::time_point since;
+        const u8* pointer; ///< The word's host memory, for the re-read (may be null)
+        u32 folded;
+        std::array<u64, 32> sequences; ///< The folded records
+        u64 evicted_before;            ///< session_evicted_unlanded at the decision
+        u64 foreign_before;            ///< session_foreign at the decision
     };
     std::array<FeedCheck, 256> feed_checks{};
     size_t feed_check_count{};
+    u64 fed_checks_unverifiable{};
+    /// Landing IOUs (6h fix 1): an unlanded record evicted still owes its word a landing, which
+    /// must not be credited to the next live record (that shifted every later landing one
+    /// record early).
+    struct Iou {
+        u64 device;
+        u64 sequence;
+        u32 payload;
+        Kind kind;
+    };
+    std::array<std::vector<Iou>, Buckets> ious{};
+    u64 ious_absorbed{};
+    u64 ious_lost{};
+    u64 session_evicted_unlanded{};
+    /// Violated bounds whose word is re-read at 1 ms and 100 ms (6h fix 5, 6).
+    struct Recheck {
+        u64 device;
+        const u8* pointer;
+        u32 bound;
+        u32 landed;
+        Clock::time_point since;
+        bool first_done;
+        AuditKey key;
+    };
+    std::array<Recheck, 32> rechecks{};
+    size_t recheck_count{};
+    u64 rechecks_recovered{};
+    u64 rechecks_never{};
+    u32 violation_logged{};
+    /// Where the feed's plain path stopped, by gate (6h observation: plain fed 0).
+    enum class PlainGate : u32 {
+        NewestNotPlain, ///< The word's newest record is a reduction, or landed
+        EarlierToLand,  ///< A reduction or max release before it still to land
+        RanAndMoved,    ///< Run, and the word no longer holds what it held when it was sent
+        ValueShort,     ///< Its value does not meet the acquire
+        LaterWriter,    ///< A write noted since it (write stamps, 256-byte blocks)
+        Source,         ///< Its QMD source (provenance gate)
+        NotSimple,      ///< The narrow feed: not a simple record
+        Count,
+    };
+    std::array<u64, static_cast<size_t>(PlainGate::Count)> plain_gates{};
     std::array<u64, static_cast<size_t>(Source::Count)> not_fed_source{};
     /// EXP13=3: the last 1024 feed decisions, checked once their record landed (each report)
     /// and at a turn-off.
@@ -457,6 +513,9 @@ struct State {
         const auto now = Clock::now();
         if (pending_count != 0) {
             ReRead(now, nullptr);
+        }
+        if (recheck_count != 0) {
+            RunRechecks(now);
         }
         const int mode = Mode();
         if (mode != last_mode) {
@@ -568,8 +627,13 @@ struct State {
                      "memory, {} after a wait, {} overlays from memory; audit: {} checked, {} "
                      "wrongly met, {} unknown (session {} checked, {} wrongly met); {} feed: "
                      "{:.0f} acquires/s left for dependency-waiting QMDs' records ({:.0f}% of "
-                     "those the predictions met); {} back releases waited for their record; "
-                     "feed {}{}",
+                     "those the predictions met); {} back releases waited for their record; bounds "
+                     "unverifiable (record evicted) {}; landings owed by evicted records absorbed "
+                     "{}, lost {}; violations re-read: {} recovered, {} never (session); plain "
+                     "path stopped (/s) by: {:.0f} newest a reduction or landed, {:.0f} an "
+                     "earlier one to land, {:.0f} ran with the word moved, {:.0f} value short, "
+                     "{:.0f} a later writer (stamp), {:.0f} QMD source, {:.0f} not simple; feed "
+                     "{}{}",
                      fed_rate(Fed::QueuedPlain, 0), fed_rate(Fed::QueuedPlain, 1),
                      fed_rate(Fed::LandedPending, 0), fed_rate(Fed::LandedPending, 1),
                      fed_rate(Fed::Bound, 0), fed_rate(Fed::Bound, 1), fed_checks_passed,
@@ -580,6 +644,10 @@ struct State {
                      audit_checked, audit_wrong, audit_unknown, session_audit_checked,
                      session_audit_wrong, mode == 3 ? "narrow" : "full",
                      rate(not_fed_nonsimple), narrow_share, deferred_events,
+                     fed_checks_unverifiable, ious_absorbed, ious_lost, rechecks_recovered,
+                     rechecks_never, rate(plain_gates[0]), rate(plain_gates[1]),
+                     rate(plain_gates[2]), rate(plain_gates[3]), rate(plain_gates[4]),
+                     rate(plain_gates[5]), rate(plain_gates[6]),
                      off_names[static_cast<size_t>(feed_off)],
                      feed_off_detail.empty() ? std::string{} : " (" + feed_off_detail + ")");
         }
@@ -592,7 +660,8 @@ struct State {
                      "{:.0f} no records, {:.0f} copy off, {:.0f} GPU-written, {:.0f} evicted, "
                      "{:.0f} plain queued, {:.0f} plain not landed, {:.0f} other writer, {:.0f} "
                      "unbounded writer, {:.0f} non-monotonic op, {:.0f} signed max, {:.0f} inc "
-                     "payload, {:.0f} wrap guard; safety: {} checked, {} bound violated, {} not "
+                     "payload, {:.0f} wrap guard, {:.0f} crowded word; safety: {} checked, {} "
+                     "bound violated, {} not "
                      "landed yet; violations: {} went down, {} landings missing, {} other; "
                      "re-read later: {}/{}/{} recovered, {}/{}/{} never recovered in 100 ms (went "
                      "down/landings missing/other); {} landings of unrecorded writes (all "
@@ -615,6 +684,7 @@ struct State {
                      bailed(Bail::PlainUnlanded), bailed(Bail::OtherWriter),
                      bailed(Bail::Unbounded), bailed(Bail::NonMonotonic),
                      bailed(Bail::SignedMax), bailed(Bail::IncPayload), bailed(Bail::Wrap),
+                     bailed(Bail::Crowded),
                      bound_checked, bound_violated, bound_unlanded, violations[0],
                      violations[1], violations[2], recovered[0], recovered[1], recovered[2],
                      never_recovered[0], never_recovered[1], never_recovered[2],
@@ -698,6 +768,9 @@ struct State {
         violations = recovered = never_recovered = {};
         fed = {};
         fed_checks_passed = fed_checks_violated = fed_checks_unverified = fed_checks_full = 0;
+        fed_checks_unverifiable = 0;
+        ious_absorbed = ious_lost = 0;
+        plain_gates = {};
         not_fed_source = {};
         audit_checked = audit_wrong = audit_unknown = 0;
         not_fed_nonsimple = 0;
@@ -724,6 +797,7 @@ struct State {
         stored.matched = false;
         Prediction* slot = nullptr;
         Prediction* oldest_done = nullptr;
+        Prediction* oldest_unchecked = nullptr; // Of a device without pending feed checks
         Prediction* oldest = nullptr;
         for (Prediction& way : ways) {
             if (way.position == 0) {
@@ -737,22 +811,97 @@ struct State {
                 oldest = &way;
             }
         }
+        if (slot == nullptr && oldest_done == nullptr && ways.size() < MaxWays) {
+            // Nothing done to reuse: grow (pointers into the bucket are not kept across calls).
+            if (ways.capacity() == 0) {
+                ways.reserve(Ways);
+            }
+            ways.push_back(stored);
+            return;
+        }
+        if (slot == nullptr && oldest_done == nullptr) {
+            for (Prediction& way : ways) {
+                if (!HasFeedChecks(way.device) &&
+                    (oldest_unchecked == nullptr || way.sequence < oldest_unchecked->sequence)) {
+                    oldest_unchecked = &way;
+                }
+            }
+        }
         if (slot == nullptr) {
-            slot = oldest_done != nullptr ? oldest_done : oldest;
+            slot = oldest_done != nullptr        ? oldest_done
+                   : oldest_unchecked != nullptr ? oldest_unchecked
+                                                 : oldest;
         }
         if (slot->position != 0 && !Done(*slot)) {
             if (!slot->landed) {
                 evicted[bucket] = (std::max)(evicted[bucket], slot->position);
                 ++evicted_unlanded;
+                ++session_evicted_unlanded;
                 if (slot->kind == Kind::Plain) {
                     evicted_plain[bucket] = slot->device;
                 }
+                // It still owes the word a landing (6h fix 1), and the device's pending bound
+                // checks can no longer be attributed exactly (fix 2).
+                if (ious[bucket].size() < 64) {
+                    ious[bucket].push_back(
+                        {slot->device, slot->sequence, slot->payload, slot->kind});
+                } else {
+                    ++ious_lost;
+                }
+                DropFeedChecks(slot->device);
             }
             if (!slot->matched && (slot->writer == Writer::Qmd || slot->writer == Writer::Dma)) {
                 NoteEvictedUnmatched(bucket, slot->device, slot->kind == Kind::Reduction);
             }
         }
         *slot = stored;
+    }
+
+    [[nodiscard]] bool HasFeedChecks(u64 device) const {
+        for (size_t i = 0; i < feed_check_count; ++i) {
+            if (feed_checks[i].device == device) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// A device lost an unlanded record: its pending bound checks are unverifiable.
+    void DropFeedChecks(u64 device) {
+        for (size_t i = 0; i < feed_check_count;) {
+            if (feed_checks[i].device == device) {
+                ++fed_checks_unverifiable;
+                feed_checks[i] = feed_checks[--feed_check_count];
+            } else {
+                ++i;
+            }
+        }
+    }
+
+    /// A landing of `kind` and `value` on `device` that an evicted record owes, older than the
+    /// live record it would otherwise go to (`before`, 0 for none): absorbed.
+    bool AbsorbIou(u64 device, Kind kind, u32 value, u64 before) {
+        auto& owed = ious[Bucket(device)];
+        size_t found = owed.size();
+        for (size_t i = 0; i < owed.size(); ++i) {
+            const Iou& iou = owed[i];
+            const bool fits = iou.kind == Kind::Reduction ? true
+                              : iou.kind == Kind::AtLeast ? iou.payload <= value
+                                                          : iou.payload == value;
+            if (iou.device != device || iou.kind != kind || !fits ||
+                (before != 0 && iou.sequence > before)) {
+                continue;
+            }
+            if (found == owed.size() || iou.sequence < owed[found].sequence) {
+                found = i;
+            }
+        }
+        if (found == owed.size()) {
+            return false;
+        }
+        owed.erase(owed.begin() + static_cast<std::ptrdiff_t>(found));
+        ++ious_absorbed;
+        return true;
     }
 
     void NoteEvictedUnmatched(size_t bucket, u64 device, bool reduction) {
@@ -862,7 +1011,10 @@ struct State {
     void Clear() {
         // In place: the table is large (a temporary would be on the stack).
         for (auto& ways : predictions) {
-            ways.fill(Prediction{});
+            ways.clear();
+        }
+        for (auto& owed : ious) {
+            owed.clear();
         }
         next = {};
         evicted = {};
@@ -879,7 +1031,13 @@ struct State {
         if (!IsFeedMode(last_mode) || feed_off != FeedOff::None) {
             return;
         }
-        ScanAudit(key);
+        if (key != nullptr && key->recovery) {
+            LOG_ERROR(HW_GPU, "QMD release prediction feed (EXP13=3/4) audit: device {:#x} is "
+                              "judged when its word is re-read (1 ms, 100 ms)",
+                      key->device);
+        } else {
+            ScanAudit(key);
+        }
         feed_off = reason;
         feed_off_detail = std::move(detail);
         constexpr std::array<const char*, static_cast<size_t>(FeedOff::Count)> reasons{
@@ -940,7 +1098,7 @@ struct State {
     /// was under-modelled (safe). Otherwise a decision d with record.position <= d.position < E
     /// that folded it (d.sequence >= record.sequence) met E - d.position ring words early.
     void ScanAuditPositional(const AuditKey& key, u64 stored) {
-        std::array<const Prediction*, Ways> early_records{};
+        std::array<const Prediction*, MaxWays> early_records{};
         size_t early_count = 0;
         for (const Prediction& way : predictions[Bucket(key.device)]) {
             if (way.position != 0 && way.device == key.device && way.kind == key.kind &&
@@ -1055,7 +1213,10 @@ struct State {
                 ++fed_checks_passed;
             } else {
                 ++fed_checks_violated;
-                const AuditKey key{check.device, check.sequence, ~u64{0}, true, value};
+                LogViolation(check, value);
+                AuditKey key{check.device, check.sequence, ~u64{0}, true, value};
+                key.recovery = true;
+                AddRecheck(check.device, check.pointer, check.bound, value, key);
                 TurnFeedOff(FeedOff::BoundViolated,
                             fmt::format("device {:#x}: bound {:#x}, landed {:#x}", check.device,
                                         check.bound, value),
@@ -1065,8 +1226,117 @@ struct State {
         }
     }
 
+    /// A violated bound (6h fix 5): its folded records, the bucket, what happened since.
+    void LogViolation(const FeedCheck& check, u32 value) {
+        if (violation_logged >= 8) {
+            return;
+        }
+        ++violation_logged;
+        const u64 back = GpuSplit::Get().ConsumedNow();
+        std::string folded;
+        for (u32 i = 0; i < check.folded; ++i) {
+            const Prediction* record = nullptr;
+            for (const Prediction& way : predictions[Bucket(check.device)]) {
+                if (way.position != 0 && way.sequence == check.sequences[i]) {
+                    record = &way;
+                    break;
+                }
+            }
+            if (record == nullptr) {
+                folded += fmt::format(" [{} gone]", check.sequences[i]);
+                continue;
+            }
+            folded += fmt::format(" [{} QMD {:#x} from {} sent at {} ({} the back at {}), {}]",
+                                  record->sequence, record->qmd,
+                                  source_names[static_cast<size_t>(record->source)],
+                                  record->position,
+                                  record->position <= back ? "run by" : "ahead of",
+                                  back,
+                                  record->landed ? fmt::format("landed {:#x}", record->landed_value)
+                                                 : std::string{"not landed"});
+        }
+        u32 in_use = 0;
+        u32 unlanded = 0;
+        u32 done = 0;
+        u32 others = 0;
+        for (const Prediction& way : predictions[Bucket(check.device)]) {
+            if (way.position == 0) {
+                continue;
+            }
+            ++in_use;
+            unlanded += way.landed ? 0 : 1;
+            done += Done(way) ? 1 : 0;
+            others += way.device != check.device ? 1 : 0;
+        }
+        LOG_ERROR(HW_GPU,
+                  "QMD release prediction feed (EXP13=3/4): bound {:#x} violated on device {:#x} "
+                  "(landed {:#x}, {} short) at the landing of its newest folded record, {} us "
+                  "after the decision; folded:{}; bucket: {} in use, {} unlanded, {} done, {} of "
+                  "other devices; since the decision {} unlanded records evicted, {} foreign "
+                  "landings; the word is re-read at 1 ms and 100 ms",
+                  check.bound, check.device, value, check.bound - value,
+                  std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - check.since)
+                      .count(),
+                  folded, in_use, unlanded, done, others,
+                  session_evicted_unlanded - check.evicted_before,
+                  session_foreign - check.foreign_before);
+    }
+
+    void AddRecheck(u64 device, const u8* pointer, u32 bound, u32 landed, const AuditKey& key) {
+        if (pointer == nullptr) {
+            // Nothing to re-read: by value, as before.
+            AuditKey by_value = key;
+            by_value.recovery = false;
+            ScanAudit(&by_value);
+            return;
+        }
+        if (recheck_count < rechecks.size()) {
+            rechecks[recheck_count++] = {device, pointer, bound, landed, Clock::now(), false, key};
+        }
+    }
+
+    /// The re-reads (6h fix 6): a word that reaches the bound was a late landing, the decision
+    /// stands; one that never does in 100 ms is judged by value.
+    void RunRechecks(Clock::time_point now) {
+        for (size_t i = 0; i < recheck_count;) {
+            Recheck& entry = rechecks[i];
+            const auto age = now - entry.since;
+            if (age < std::chrono::milliseconds{1} ||
+                (entry.first_done && age < std::chrono::milliseconds{100})) {
+                ++i;
+                continue;
+            }
+            u32 word{};
+            std::memcpy(&word, entry.pointer, sizeof(word));
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(age).count();
+            if (word >= entry.bound) {
+                ++rechecks_recovered;
+                LOG_ERROR(HW_GPU,
+                          "QMD release prediction feed (EXP13=3/4) audit: device {:#x} recovered "
+                          "by +{} at {} us (word {:#x}, bound {:#x}): a late landing, the "
+                          "decisions stand",
+                          entry.device, word - entry.landed, us, word, entry.bound);
+            } else if (!entry.first_done) {
+                entry.first_done = true;
+                ++i;
+                continue;
+            } else {
+                ++rechecks_never;
+                LOG_ERROR(HW_GPU,
+                          "QMD release prediction feed (EXP13=3/4) audit: device {:#x} never "
+                          "recovered in {} us (word {:#x}, bound {:#x})",
+                          entry.device, us, word, entry.bound);
+                AuditKey by_value = entry.key;
+                by_value.recovery = false;
+                by_value.made = word;
+                ScanAudit(&by_value);
+            }
+            entry = rechecks[--recheck_count];
+        }
+    }
+
     /// The records of `device`, in send order.
-    size_t Gather(u64 device, std::array<const Prediction*, Ways>& records) const {
+    size_t Gather(u64 device, std::array<const Prediction*, MaxWays>& records) const {
         size_t count = 0;
         for (const Prediction& way : predictions[Bucket(device)]) {
             if (way.position != 0 && way.device == device) {
@@ -1089,7 +1359,7 @@ struct State {
         u64 newest;          ///< The newest folded record
         Bound bound;
     };
-    Folded Fold(const AcquireCheck& check, const std::array<const Prediction*, Ways>& records,
+    Folded Fold(const AcquireCheck& check, const std::array<const Prediction*, MaxWays>& records,
                 size_t count) const {
         Folded folded{};
         const auto bail = [&folded](Bail reason) {
@@ -1116,6 +1386,13 @@ struct State {
             return bail(Bail::NoRecords);
         }
         folded.reduction_word = true;
+        size_t unlanded = 0;
+        for (size_t i = 0; i < count; ++i) {
+            unlanded += Landed(*records[i]) ? 0 : 1;
+        }
+        if (unlanded > CrowdedRecords) {
+            return bail(Bail::Crowded); // About to overflow its bucket: no bound there
+        }
         const size_t bucket = Bucket(check.device);
         if (check.gpu_dirty) {
             return bail(Bail::GpuDirty);
@@ -1135,7 +1412,7 @@ struct State {
         }
         // Other writers of the word sent after `done`; this table's report releases are noted
         // as writer ranges at their own positions.
-        std::array<u64, Ways> own{};
+        std::array<u64, MaxWays> own{};
         size_t own_count = 0;
         for (size_t i = 0; i < count; ++i) {
             if (records[i]->writer == Writer::Report && records[i]->position > check.done) {
@@ -1256,6 +1533,11 @@ void ApplyLanded(State& state, u64 device, u32 value, Tegra::Nx2Landing site) {
         if (fits && (oldest == nullptr || way.sequence < oldest->sequence)) {
             oldest = &way;
         }
+    }
+    // A landing an evicted record owes, older than the live one (6h fix 1).
+    if (!state.ious[bucket].empty() &&
+        state.AbsorbIou(device, kind, value, oldest != nullptr ? oldest->sequence : 0)) {
+        return;
     }
     if (oldest != nullptr) {
         oldest->landed = true;
@@ -1713,17 +1995,9 @@ void NoteAcquire(Coverage coverage) {
 std::optional<Bound> CheckAcquire(const AcquireCheck& check) {
     auto& state = Front();
     const Compare compare = CompareOf(check.operation);
-    const size_t bucket = Bucket(check.device);
     // The word's records, in send order.
-    std::array<const Prediction*, Ways> records{};
-    size_t count = 0;
-    for (const Prediction& way : state.predictions[bucket]) {
-        if (way.position != 0 && way.device == check.device) {
-            records[count++] = &way;
-        }
-    }
-    std::sort(records.begin(), records.begin() + static_cast<std::ptrdiff_t>(count),
-              [](const Prediction* a, const Prediction* b) { return a->sequence < b->sequence; });
+    std::array<const Prediction*, MaxWays> records{};
+    const size_t count = state.Gather(check.device, records);
 
     // Coverage by the plain predictions: the newest release recorded for the word decides.
     const auto would_meet = [&](const Prediction& r) {
@@ -1796,7 +2070,7 @@ bool Feed(const AcquireCheck& check, bool resume) {
         state.records_valid_from > check.done || check.gpu_dirty) {
         return false;
     }
-    std::array<const Prediction*, Ways> records{};
+    std::array<const Prediction*, MaxWays> records{};
     const size_t count = state.Gather(check.device, records);
     if (count == 0) {
         return false;
@@ -1809,7 +2083,13 @@ bool Feed(const AcquireCheck& check, bool resume) {
     // still to land before it and nothing queued after it that may write the word (6b slice B,
     // QueuedReleasePayload's miss 3).
     const Prediction& newest = *records[count - 1];
-    if (newest.kind != Kind::Reduction && !newest.landed) {
+    using PlainGate = State::PlainGate;
+    const auto stop = [&state](PlainGate gate) {
+        ++state.plain_gates[static_cast<size_t>(gate)];
+    };
+    if (newest.kind == Kind::Reduction || newest.landed) {
+        stop(PlainGate::NewestNotPlain);
+    } else {
         bool earlier_monotonic = false;
         for (size_t i = 0; i + 1 < count; ++i) {
             earlier_monotonic |= !records[i]->landed && records[i]->kind != Kind::Plain;
@@ -1819,24 +2099,30 @@ bool Feed(const AcquireCheck& check, bool resume) {
         const bool meets = newest.kind == Kind::AtLeast
                                ? compare == Compare::Gequal && check.value <= newest.payload
                                : Meets(compare, check.value, newest.payload);
-        if (!earlier_monotonic && (queued || pending) && meets) {
-            // Write stamps: no write the front noted since the release may have reached it.
-            if (GpuSplit::Get().WriteStamp(check.device, sizeof(u32), check.address) <=
-                newest.position) {
-                if (!FeedSource(newest.source)) {
-                    ++state.not_fed_source[static_cast<size_t>(newest.source)];
-                    return false;
-                }
-                if (narrow && newest.writer == Writer::Qmd && !newest.simple) {
-                    ++state.not_fed_nonsimple;
-                    return false;
-                }
-                const Fed kind = queued ? Fed::QueuedPlain : Fed::LandedPending;
-                ++state.fed[static_cast<size_t>(kind)][resumed];
-                state.Audit({check.device, newest.sequence, newest.position, Clock::now(),
-                             check.value, check.operation, newest.payload, kind, false});
-                return true;
-            }
+        if (earlier_monotonic) {
+            stop(PlainGate::EarlierToLand);
+        } else if (!queued && !pending) {
+            stop(PlainGate::RanAndMoved);
+        } else if (!meets) {
+            stop(PlainGate::ValueShort);
+        } else if (GpuSplit::Get().WriteStamp(check.device, sizeof(u32), check.address) >
+                   newest.position) {
+            // Write stamps: a write the front noted since the release may have reached it.
+            stop(PlainGate::LaterWriter);
+        } else if (!FeedSource(newest.source)) {
+            stop(PlainGate::Source);
+            ++state.not_fed_source[static_cast<size_t>(newest.source)];
+            return false;
+        } else if (narrow && newest.writer == Writer::Qmd && !newest.simple) {
+            stop(PlainGate::NotSimple);
+            ++state.not_fed_nonsimple;
+            return false;
+        } else {
+            const Fed kind = queued ? Fed::QueuedPlain : Fed::LandedPending;
+            ++state.fed[static_cast<size_t>(kind)][resumed];
+            state.Audit({check.device, newest.sequence, newest.position, Clock::now(),
+                         check.value, check.operation, newest.payload, kind, false});
+            return true;
         }
     }
     // The reduction lower bound, GEQ only (6c section 4), checked when its newest folded record
@@ -1866,8 +2152,10 @@ bool Feed(const AcquireCheck& check, bool resume) {
         ++state.fed_checks_full;
         return false;
     }
-    state.feed_checks[state.feed_check_count++] = {check.device, folded.newest,
-                                                   folded.bound.value, Clock::now()};
+    State::FeedCheck& fed_check = state.feed_checks[state.feed_check_count++];
+    fed_check = {check.device, folded.newest, folded.bound.value, Clock::now(), check.pointer,
+                 folded.bound.folded, {}, state.session_evicted_unlanded, state.session_foreign};
+    std::copy_n(folded.bound.sequences.begin(), folded.bound.folded, fed_check.sequences.begin());
     ++state.fed[static_cast<size_t>(Fed::Bound)][resumed];
     const Prediction* newest_folded = nullptr;
     for (size_t i = 0; i < count; ++i) {
@@ -1909,7 +2197,9 @@ void CheckBound(const Bound& bound, u32 word) {
     }
     ++state.bound_violated;
     ++state.session_violated;
-    const AuditKey key{bound.device, bound.sequences[bound.folded - 1], ~u64{0}, true, word};
+    AuditKey key{bound.device, bound.sequences[bound.folded - 1], ~u64{0}, true, word};
+    key.recovery = true;
+    state.AddRecheck(bound.device, bound.pointer, bound.value, word, key);
     state.TurnFeedOff(FeedOff::BoundViolated,
                       fmt::format("device {:#x}: bound {:#x}, word {:#x} once met", bound.device,
                                   bound.value, word),
