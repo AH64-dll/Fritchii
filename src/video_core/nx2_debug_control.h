@@ -295,7 +295,9 @@ inline void LoadExperiments() {
         g_experiments[34].store(1, std::memory_order_relaxed);
         // EXP35 = 1: guest writes of never-GPU-written cached pages collected for the back instead
         // of OnCPUWrite under both caches' mutexes (see the EXP35 notes above).
-        g_experiments[35].store(1, std::memory_order_relaxed);
+        // EXP35 = 2 (2026-11-08): every guest write collected (guest-core write lock spinning 0.7% ->
+        // 0, standing 45.3 -> 46.5 fps, route flash reports 253 = camera noise).
+        g_experiments[35].store(2, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {
