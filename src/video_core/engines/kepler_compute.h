@@ -33,6 +33,9 @@ class System;
 namespace VideoCommon {
 class GpuSplit;
 }
+namespace VideoCommon::QmdPrediction {
+struct Record;
+}
 
 namespace Tegra {
 class MemoryManager;
@@ -302,12 +305,15 @@ private:
     /// EXP13=2: the QMD at `address` as the back will read it; `unknown` when the copy can't
     /// tell (it resyncs then).
     bool FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
-                      NativeQmdScheduler::Descriptor& descriptor, bool& unknown) const;
+                      NativeQmdScheduler::Descriptor& descriptor, bool& unknown,
+                      VideoCommon::QmdPrediction::Record& info) const;
     /// An exec_upload with `exec` was sent: the range its data writes.
     void FrontNoteUpload(FrontState& state, u32 exec);
     /// EXP13=2: data_upload words just sent: the inline QMD overlays they fall in take them.
     void FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState& state, const u32* words,
-                            u32 count) const;
+                            u32 count, u64 position) const;
+    /// EXP13=2: the data_upload words batched since (FrontState::upload_batch) to the copy.
+    void FrontFlushUploads(VideoCommon::GpuSplit& split, FrontState& state) const;
     std::unique_ptr<FrontState> front;
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
 
