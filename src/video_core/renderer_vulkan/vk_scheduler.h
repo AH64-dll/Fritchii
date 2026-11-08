@@ -408,6 +408,9 @@ private:
         VkRenderPass renderpass{};
         VkFramebuffer framebuffer{};
         VkExtent2D render_area = {0, 0};
+        /// The pass is a deferred clear's variant of the framebuffer's render pass that differs
+        /// from it only in load ops, so later draws on that framebuffer can stay in it.
+        bool clear_variant = false;
         GraphicsPipeline* graphics_pipeline = nullptr;
         bool is_rescaling = false;
         bool rescaling_defined = false;

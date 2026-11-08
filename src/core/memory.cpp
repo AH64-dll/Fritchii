@@ -1011,6 +1011,9 @@ struct Memory::Impl {
                 }
             }
             gpu_dirty_managers[core].Collect(address, size);
+            // A download writing to guest memory here may have looked at the collected writes
+            // before this one: its bytes would land over the ones stored after this returns.
+            VideoCore::DownloadLanding::Await(address, size);
             // last_address stays on the page after its GPU-written state is gone, so these
             // writes can land on pages the buffer cache holds as clean until the next gather.
             g_collected_write_pages.Mark(address, size);

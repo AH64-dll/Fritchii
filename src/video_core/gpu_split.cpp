@@ -1108,8 +1108,9 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         const u32 argument = static_cast<u32>(head >> 32);
         auto* const engine = back_engine;
         if (engine->fast_maxwell3d) {
-            // Nx2Perf: as below without the profile zones (off with fast_maxwell3d) and the
-            // virtual call.
+            // Nx2Perf: as below without the profile zones and the virtual call. A profiled run
+            // takes this path too: Maxwell3D::CallMethod and CallConstBufferWords sample their
+            // own time (Nx2Profile::SampledScope), and ConsumeSink counts as "other".
             using Tegra::Engines::Maxwell3D;
             auto* const maxwell3d = static_cast<Maxwell3D*>(engine);
             constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);

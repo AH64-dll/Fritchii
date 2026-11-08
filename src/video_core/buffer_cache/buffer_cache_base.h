@@ -265,7 +265,9 @@ public:
     /// CPU writes collected but not yet applied (SetPendingCpuWrites).
     [[nodiscard]] Common::RangeSet<DAddr> PendingCpuWriteRanges();
 
-    /// Writes downloaded bytes to guest memory, except over `cpu_written`.
+    /// Writes downloaded bytes to guest memory, except over `cpu_written`. Callers take
+    /// `cpu_written` inside a VideoCore::DownloadLanding over the bytes and write in it: the CPU
+    /// writes collected after it store their bytes once the landing has ended.
     void WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written, DAddr device_addr,
                                const u8* data, u64 size);
 
@@ -334,6 +336,10 @@ public:
     [[nodiscard]] std::pair<Buffer*, u32> ObtainCPUBuffer(DAddr gpu_addr, u32 size,
                                                           ObtainBufferSynchronize sync_info,
                                                           ObtainBufferOperation post_op);
+
+    /// GPU work recorded now reads or writes these bytes, of a buffer obtained before (work set
+    /// up once that keeps reading them, as conditional rendering does). Creates no buffer.
+    void MarkUsed(DAddr device_addr, u64 size);
     void FlushCachedWrites();
 
     /// Where the CPU writes into GPU-written memory that were collected but not applied yet

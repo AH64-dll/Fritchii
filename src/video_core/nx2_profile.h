@@ -65,6 +65,20 @@ enum class Zone : u32 {
     ListGpuWait,
     MemoryQuery, ///< Device::QueryDeviceMemoryUsage, the driver's memory budget query (EXP29)
     QueryDmaWait, ///< Macro DMA reads of reports waiting for query results (FlushQueryResults)
+    // TEST: fine zones, EDEN_NX2_GPU_PROFILE=2 only (FineScope): they split the zones above.
+    CbBind,          ///< Of method: constant buffer binds (Maxwell3D::ProcessCBBind)
+    CbUpload,        ///< Of method: constant buffer words written to memory
+    QueryReport,     ///< Of method: report semaphores (Maxwell3D::ProcessQueryGet)
+    CounterReset,    ///< Of method: counter resets (Maxwell3D::ProcessCounterReset)
+    RenderEnable,    ///< Of method: render enable conditions (Maxwell3D::ProcessQueryCondition)
+    Sink,            ///< State writes held for the next executable method (ConsumeSinkImpl)
+    MacroEnd,        ///< A front macro's end on the back (Maxwell3D::FinishFrontMacro)
+    DrawSetup,       ///< Of draw: after the pipeline lookup, before Configure (cache locks)
+    DrawQueries,     ///< Of draw: query and transform feedback state before recording
+    TickWork,        ///< Of draw and compute: the sync operations after them (GPU::TickWork)
+    UniformBuffers,  ///< Of bind stage buffers: the uniform buffers
+    GeometryBuffers, ///< Of update buffers: index and vertex buffer binds
+    StorageBindings, ///< Of read handles: storage buffer addresses from constant buffers
     Count,
 };
 
@@ -78,21 +92,34 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "fence skipped", "method", "split drain", "split wait",
     "writer wait", "list submit wait", "list GPU wait", "memory query",
     "query DMA wait",
+    "cb bind", "cb upload", "query report", "counter reset", "render enable", "sink",
+    "macro end", "draw setup", "draw queries", "tick work", "uniform buffers",
+    "geometry buffers", "storage bindings",
 };
+static_assert(zone_names.back() != nullptr, "a zone without a name");
 
 // Read once, when the GPU thread starts (Initialize): Enabled() runs several times per method
 // write (no guard to check). Not at static initialization: nx2_switches.txt is only applied in
 // main(). Off while EDEN_NX2_SAMPLE_PROFILE samples (common/nx2_sample_profile.h): the zone timers
 // would show up in the samples.
 inline bool g_enabled = false;
+/// TEST: EDEN_NX2_GPU_PROFILE=2 adds the fine zones (FineScope) and counters (FineCounter), at
+/// the cost of more time stamp reads: =1 keeps the zones runs compare with.
+inline bool g_fine = false;
 
 inline void Initialize() {
     g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr &&
                 std::getenv("EDEN_NX2_SAMPLE_PROFILE") == nullptr;
+    const char* value = std::getenv("EDEN_NX2_GPU_PROFILE");
+    g_fine = g_enabled && value != nullptr && value[0] == '2';
 }
 
 inline bool Enabled() {
     return g_enabled;
+}
+
+inline bool Fine() {
+    return g_fine;
 }
 
 // Nanoseconds; from the host's own counter where the wall clock reads it directly (the zones
@@ -135,7 +162,27 @@ inline u64 Ticks() {
 #endif
 }
 
+/// TEST: amounts counted with EDEN_NX2_GPU_PROFILE=2, logged per second in a line of their own.
+enum class FineCounter : u32 {
+    UniformRebinds,  ///< Small uniform buffers bound again from the same stream allocation
+    UniformStreamed, ///< Small uniform buffers copied into the stream buffer
+    UniformCached,   ///< Uniform buffers bound from their host buffer
+    UniformOther,    ///< Uniform buffers bound otherwise (root tables, OpenGL, fallbacks)
+    UniformBytes,    ///< Bytes of the uniform buffers bound (all paths)
+    StorageBinds,    ///< Graphics storage buffers bound
+    TextureHandles,  ///< Graphics texture handles read
+    Count,
+};
+
+inline constexpr std::array<const char*, static_cast<size_t>(FineCounter::Count)>
+    fine_counter_names{
+        "uniform rebinds", "uniform streamed", "uniform cached",  "uniform other",
+        "uniform bytes",   "storage binds",    "texture handles",
+    };
+static_assert(fine_counter_names.back() != nullptr, "a fine counter without a name");
+
 struct ThreadData {
+    std::array<u64, static_cast<size_t>(FineCounter::Count)> fine_counters{}; ///< TEST
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
     std::array<u64, 64> counters{}; ///< See Counter (static_assert below)
@@ -146,6 +193,10 @@ struct ThreadData {
     u64 window_start{};
     u64 window_start_ticks{};
     std::optional<u64> cpu_start_ns;
+    u32 depth{};          ///< Zones open (Scope, timed SampledScope)
+    u32 samples_left{1};  ///< SampledScope: entries until the next timed one
+    u32 sample_weight{1}; ///< SampledScope: the entries the next timed one stands for
+    u32 sample_seed{0x2545F491};
 };
 
 inline thread_local ThreadData t_data;
@@ -178,9 +229,13 @@ inline thread_local ThreadData t_data;
 
 class Scope {
 public:
-    explicit Scope(Zone zone_)
-        : zone{zone_}, enabled{Enabled()},
-          timeline{Common::Nx2Timeline::Active() &&
+    explicit Scope(Zone zone_) : Scope{zone_, Enabled(), true} {}
+
+    /// A zone timed only if `on` (a profiled run's choice, such as Fine()); on the timeline only
+    /// if `timeline_on` too.
+    Scope(Zone zone_, bool on, bool timeline_on)
+        : zone{zone_}, enabled{on},
+          timeline{timeline_on && Common::Nx2Timeline::Active() &&
                    (Common::Nx2Timeline::Detail() || IsCoarse(zone_))} {
         if (timeline) {
             timeline_start = Common::Nx2Timeline::Now();
@@ -188,8 +243,10 @@ public:
         if (!enabled) {
             return;
         }
-        parent_child_ns = t_data.child_ns;
-        t_data.child_ns = 0;
+        auto& data = t_data;
+        ++data.depth;
+        parent_child_ns = data.child_ns;
+        data.child_ns = 0;
         start = Ticks();
     }
 
@@ -207,6 +264,7 @@ public:
         data.exclusive_ns[index] += elapsed - data.child_ns;
         ++data.count[index];
         data.child_ns = parent_child_ns + elapsed;
+        --data.depth;
     }
 
     Scope(const Scope&) = delete;
@@ -219,6 +277,96 @@ private:
     u64 start{};
     u64 parent_child_ns{};
     u64 timeline_start{};
+};
+
+/// TEST: a fine zone (EDEN_NX2_GPU_PROFILE=2), on the timeline only then too.
+class FineScope : public Scope {
+public:
+    explicit FineScope(Zone zone_) : Scope{zone_, Fine(), Fine()} {}
+};
+
+/// The ticks two time stamp reads in a row take: what a timed entry measures on top of its own
+/// time (the least of a few tries).
+inline u64 TimingOverheadTicks() {
+    static const u64 overhead = [] {
+        u64 least = ~u64{0};
+        for (int i = 0; i < 64; ++i) {
+            const u64 first = Ticks();
+            const u64 second = Ticks();
+            least = (std::min)(least, second - first);
+        }
+        return least;
+    }();
+    return overhead;
+}
+
+/// A zone entered millions of times a second, such as the split's back's 3D register writes
+/// (Maxwell3D::CallMethod): timing every entry took two time stamp reads each, which cost more
+/// than most entries and slowed the very runs it measured. Entered outside every other zone, one
+/// entry in about SampleEvery is timed and stands for the entries since the last timed one; all
+/// are counted. Entered inside another zone it does nothing: the entry is that zone's time.
+/// Not recorded on the Nx2Timeline (a span per sampled method would say nothing there).
+class SampledScope {
+public:
+    static constexpr u32 SampleEvery = 32;
+    /// About 25 us at 4 GHz (time stamp ticks): far longer than these entries take.
+    static constexpr u64 LongTicks = 100'000;
+
+    /// `entries`: what this entry counts as (a run of constant buffer words counts each word).
+    explicit SampledScope(Zone zone, u32 entries = 1) {
+        if (!Enabled()) [[likely]] {
+            return;
+        }
+        auto& data = t_data;
+        if (data.depth != 0) {
+            return;
+        }
+        index = static_cast<size_t>(zone);
+        data.count[index] += entries;
+        if (--data.samples_left != 0) {
+            return;
+        }
+        weight = data.sample_weight;
+        // The next interval: 1 to 2 * SampleEvery - 1 entries, so that no fixed period lines up
+        // with a repeating pattern of entries (xorshift32).
+        u32 seed = data.sample_seed;
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        data.sample_seed = seed;
+        data.sample_weight = 1 + seed % (2 * SampleEvery - 1);
+        data.samples_left = data.sample_weight;
+        ++data.depth;
+        parent_child_ns = data.child_ns;
+        data.child_ns = 0;
+        start = Ticks();
+    }
+
+    ~SampledScope() {
+        if (weight == 0) {
+            return;
+        }
+        const u64 elapsed = Ticks() - start;
+        auto& data = t_data;
+        // Less the reads' own cost, which the untimed entries did not pay.
+        const u64 overhead = TimingOverheadTicks();
+        const u64 own = elapsed - data.child_ns;
+        const u64 measured = own > overhead ? own - overhead : 0;
+        // An entry this long was most likely interrupted or preempted: it counts once, not for
+        // the untimed entries too.
+        data.exclusive_ns[index] += measured > LongTicks ? measured : measured * weight;
+        data.child_ns = parent_child_ns + elapsed;
+        --data.depth;
+    }
+
+    SampledScope(const SampledScope&) = delete;
+    SampledScope& operator=(const SampledScope&) = delete;
+
+private:
+    size_t index{};
+    u64 weight{}; ///< 0: not timed
+    u64 start{};
+    u64 parent_child_ns{};
 };
 
 /// Amounts counted on the GPU thread, logged per second with the zones.
@@ -273,6 +421,18 @@ inline void CountMethod(u32 method, bool same) {
     }
 }
 
+/// A 3D register write (Maxwell3D::CallMethod below the macro range), `same` if the register
+/// held the value already: the write counters and the per-method counts.
+inline void CountRegisterWrite(u32 method, bool same) {
+    if (!Enabled()) {
+        return;
+    }
+    auto& counters = t_data.counters;
+    ++counters[static_cast<size_t>(Counter::MethodWrites)];
+    counters[static_cast<size_t>(Counter::SameValueWrites)] += same ? 1 : 0;
+    CountMethod(method, same);
+}
+
 inline void CountDmaRead(u32 macro) {
     if (Enabled() && macro < t_dma_reads.size()) {
         ++t_dma_reads[macro];
@@ -314,6 +474,13 @@ inline std::unordered_set<u64>& DmaReadPages() {
 inline void Add(Counter counter, u64 amount) {
     if (Enabled()) {
         t_data.counters[static_cast<size_t>(counter)] += amount;
+    }
+}
+
+/// TEST: EDEN_NX2_GPU_PROFILE=2 only.
+inline void AddFine(FineCounter counter, u64 amount) {
+    if (Fine()) [[unlikely]] {
+        t_data.fine_counters[static_cast<size_t>(counter)] += amount;
     }
 }
 
@@ -480,6 +647,20 @@ inline void Report(const char* thread_name = "GPU thread") {
                             static_cast<double>(window) / 1e6);
     }
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
+    if (Fine()) {
+        // TEST: the fine counters.
+        std::string fine;
+        for (size_t i = 0; i < data.fine_counters.size(); ++i) {
+            if (data.fine_counters[i] != 0) {
+                fine += fmt::format(" {} {:.0f},", fine_counter_names[i],
+                                    static_cast<double>(data.fine_counters[i]) * 1e9 / window);
+            }
+        }
+        if (!fine.empty()) {
+            fine.pop_back();
+            LOG_INFO(HW_GPU, "{} fine counters per second:{}", thread_name, fine);
+        }
+    }
     if (const std::string methods = TopMethods(t_method_count, &t_method_same, window); !methods.empty()) {
         LOG_INFO(HW_GPU, "{} methods per second:{}", thread_name, methods);
     }
@@ -489,7 +670,10 @@ inline void Report(const char* thread_name = "GPU thread") {
     t_method_count = {};
     t_method_same = {};
     t_dma_reads = {};
+    // The zones open around this call (Report runs inside the split's back loop) stay open.
+    const u32 depth = data.depth;
     data = {};
+    data.depth = depth;
     data.window_start = now;
     data.window_start_ticks = now_ticks;
     data.cpu_start_ns = cpu_now;
