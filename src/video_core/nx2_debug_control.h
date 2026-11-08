@@ -47,10 +47,6 @@ inline std::atomic<int> g_dma_wait_writers{-1};
 /// semaphore acquires without draining the back
 /// when the value is already met and no queued write overlaps it (puller.cpp).
 inline std::atomic<int> g_sem_fast{-1};
-/// EXPERIMENT (not for nx2): EDEN_NX2_LIST_FAST=1, command list entries skip the wait for queued
-/// compute and copies while no page was newly GPU-written for 2 s; =2 also checks each skipped
-/// entry on the back and logs misses (dma_pusher.cpp).
-inline std::atomic<int> g_list_fast{-1};
 /// EXPERIMENT (not for nx2): EDEN_NX2_LOOP_SKIP=1, the split's front does not send the instance
 /// loop writes the back would ignore (draw.end in an instance loop, unchanged vertex and index
 /// buffer firsts and counts) (maxwell_3d.cpp).
@@ -259,6 +255,15 @@ inline std::atomic<int> g_idle_pause{-1};
 /// (CanUseSubmittedCommands); the lists behind it are copied as before. Default 3: both only
 /// change when the back sees work or which words nobody parses again are copied. Measure with
 /// profile_toggle (EXP39 0 vs 3): back "split wait", front "resume pending".
+/// EXP41 (live; command entries on pages no GPU work wrote yet, DmaPusher::Step): 1 = the writer
+/// waits before the port of zortos293/Lichii#805 6229487c8c + d4e8d85d4d: EDEN_NX2_LIST_WAIT_SKIP=1
+/// (built in) skips every entry's wait, =0 waits for every queued dispatch and copy. 0 (default)
+/// = the new shape: an entry waits only for the compute and copy work sent before the last host
+/// sync (WaitForSyncedWriters), and with LIST_WAIT_SKIP=1 an entry that begins between methods
+/// (a command buffer the CPU writes) doesn't wait unless copy engine work is still queued;
+/// entries inside a method's data (the parameters GPU work writes) still wait. Against the
+/// built-in skip-everything this only adds waits. Entries that didn't wait for every writer are
+/// checked on the back ("EDEN_NX2_LIST_WAIT_SKIP: command list at ... was GPU-written": stays 0).
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 
@@ -343,9 +348,6 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_SEM_FAST") {
         return &g_sem_fast;
-    }
-    if (name == "EDEN_NX2_LIST_FAST") {
-        return &g_list_fast;
     }
     if (name == "EDEN_NX2_DMA_SNAPSHOT") {
         return &g_dma_snapshot;

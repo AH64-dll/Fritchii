@@ -738,6 +738,16 @@ public:
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
     /// of it was still queued.
     bool WaitForSync();
+    /// Waits until the back executed the compute and copy work sent before the last NoteSync:
+    /// the writers a command list fetched now is ordered after (zortos293/Lichii#805
+    /// 6229487c8c). Returns whether any of it was still queued. `site`: whose wait it is, for
+    /// EDEN_NX2_GPU_PROFILE.
+    bool WaitForSyncedWriters(DrainSite site = DrainSite::ListWriters);
+    /// Whether the back executed the work sent before `position` (as far as it stored `consumed`,
+    /// every few thousand words of a batch and at its end).
+    [[nodiscard]] bool Ran(u64 position) const {
+        return consumed.load(std::memory_order_acquire) >= position;
+    }
     /// Deferred work that can write memory was just sent (puller semaphore releases, maps).
     void NoteMemoryWrite() {
         last_memory_write_position = write_position;

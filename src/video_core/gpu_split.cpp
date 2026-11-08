@@ -441,6 +441,10 @@ bool GpuSplit::WaitForSync() {
     return WaitFor(std::min(last_sync_position, write_position), DrainSite::ListSync);
 }
 
+bool GpuSplit::WaitForSyncedWriters(DrainSite site) {
+    return WaitFor(std::min({last_writer_position, last_sync_position, write_position}), site);
+}
+
 void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, size_t space) {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_RANGED_WAITS");

@@ -29,7 +29,8 @@ inline std::atomic<bool> g_nx2_ampere{false};
 inline constexpr u64 Nx2WrittenPageBits = 12;
 inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_gpu_written_pages{};
 
-/// Bumped when a page is marked GPU-written for the first time (EDEN_NX2_LIST_FAST).
+/// Bumped when a page is marked GPU-written for the first time (read by nothing since
+/// EDEN_NX2_LIST_FAST went; a diagnostic count).
 inline std::atomic<u64> g_nx2_new_written_pages{};
 
 inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
