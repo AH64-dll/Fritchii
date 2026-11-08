@@ -236,6 +236,13 @@ private:
                                               u32 expected_cache_version);
 
     void QueueVulkanPipelineCacheFlush();
+    /// Writes the driver pipeline cache on the serialization thread, unless a write is queued
+    /// already (`again_if_busy`: then one more follows it, for a save that must hold the latest
+    /// builds). Callable from any thread.
+    void QueueVulkanPipelineCacheSave(bool again_if_busy);
+    /// True (and `last` set to now) when a write of the driver cache is due since `last`.
+    [[nodiscard]] bool VulkanPipelineCacheSaveDue(
+        std::chrono::steady_clock::time_point& last) const;
 
     /// The title's warm-compute.bin (ShaderWarm::ComputeWarmPath, EDEN_NX2_COMPUTE_WARM=<file>
     /// overrides): compute programs prepared from the game files are converted (missing reads
@@ -335,6 +342,7 @@ private:
     std::chrono::steady_clock::time_point last_flush{};
     std::atomic<size_t> last_cache_size{};
     std::atomic_bool flush_in_flight{};
+    std::atomic_bool save_again{};
 
     Common::ThreadWorker workers;
     Common::ThreadWorker serialization_thread;
@@ -357,6 +365,7 @@ private:
     std::atomic<size_t> background_slots{};
     size_t background_taken{}; ///< Under background_mutex
     std::chrono::steady_clock::time_point background_start{};
+    std::chrono::steady_clock::time_point background_last_save{}; ///< Under background_mutex
     /// Last: destroyed (its threads joined) before the state above.
     std::unique_ptr<Common::ThreadWorker> background_workers;
 };

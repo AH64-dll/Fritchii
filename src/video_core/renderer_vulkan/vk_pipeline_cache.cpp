@@ -1667,6 +1667,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         size_t built{};
         bool has_loaded{};
         std::unique_ptr<PipelineStatistics> statistics;
+        std::chrono::steady_clock::time_point last_save{std::chrono::steady_clock::now()};
     } state;
     // A rebuilt translation is cached beside the stale one. Choose between them before building, so
     // loading only ever adds entries (see OrderComputeTranslations), and take the next when a
@@ -1792,6 +1793,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             if (pipeline) {
                 graphics_cache.emplace(key, std::move(pipeline));
             }
+            // A boot that builds tens of thousands of pipelines takes minutes: what it built so
+            // far is written now and then, so a boot that ends early (a crash, the app killed)
+            // does not leave the next one to compile everything again.
+            if (VulkanPipelineCacheSaveDue(state.last_save)) {
+                QueueVulkanPipelineCacheSave(false);
+            }
             ++state.built;
             if (state.has_loaded) {
                 callback(VideoCore::LoadCallbackStage::Build, state.built, state.total);
@@ -1833,6 +1840,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                  deferred_graphics.size(), threads);
         background_left.store(deferred_graphics.size(), std::memory_order_relaxed);
         background_start = std::chrono::steady_clock::now();
+        background_last_save = background_start;
         background_active.store(true, std::memory_order_release);
         background_workers.reset(new Common::ThreadWorker(threads, "VkPipelinePrebuild", {},
                                                           Common::ThreadPlacement::Background));
@@ -1865,6 +1873,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 if (pipeline && !background_claimed.contains(key)) {
                     background_ready.emplace(key, std::move(pipeline));
                 }
+                // These builds fill the driver cache too, but only GPU thread builds queued its
+                // writes: a session stopped before its exit save kept none of them.
+                if (build && VulkanPipelineCacheSaveDue(background_last_save)) {
+                    QueueVulkanPipelineCacheSave(false);
+                }
                 if (background_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     const auto seconds = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - background_start).count();
@@ -1875,6 +1888,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                              background_claimed.size());
                     background_claimed.clear();
                     background_active.store(false, std::memory_order_release);
+                    if (!background_stop.load(std::memory_order_relaxed)) {
+                        QueueVulkanPipelineCacheSave(true);
+                    }
                 }
                 lock.unlock();
                 // A pipeline dropped here was never bound, so no GPU work can still use it.
@@ -1884,11 +1900,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
 
     if (use_vulkan_pipeline_cache) {
-        SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
-                                     CACHE_VERSION);
-        size_t size = 0;
-        vulkan_pipeline_cache.Read(&size, nullptr);
-        last_cache_size.store(size, std::memory_order_relaxed);
+        // On the serialization thread: for a cache of tens of thousands of pipelines, reading
+        // the driver data (gigabytes) and writing it can hold the boot at 100% long enough to
+        // look frozen. It follows any write the boot build queued.
+        QueueVulkanPipelineCacheSave(true);
         last_flush = std::chrono::steady_clock::now();
     }
 
@@ -2531,17 +2546,47 @@ void PipelineCache::QueueVulkanPipelineCacheFlush() {
     if (last_flush.time_since_epoch().count() != 0 && now - last_flush < interval) {
         return;
     }
-    if (flush_in_flight.exchange(true, std::memory_order_acq_rel)) {
+    if (flush_in_flight.load(std::memory_order_acquire)) {
         return;
     }
     pipelines_since_flush = 0;
     last_flush = now;
+    QueueVulkanPipelineCacheSave(false);
+}
+
+bool PipelineCache::VulkanPipelineCacheSaveDue(std::chrono::steady_clock::time_point& last) const {
+    // As QueueVulkanPipelineCacheFlush: at most once a second per MiB the cache holds, as each
+    // write copies all of it.
+    const auto now = std::chrono::steady_clock::now();
+    const auto megabytes = last_cache_size.load(std::memory_order_relaxed) / (1024 * 1024);
+    const std::chrono::seconds interval{
+        std::max<size_t>(VULKAN_CACHE_FLUSH_MIN_SECONDS, megabytes)};
+    if (now - last < interval) {
+        return false;
+    }
+    last = now;
+    return true;
+}
+
+void PipelineCache::QueueVulkanPipelineCacheSave(bool again_if_busy) {
+    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
+        return;
+    }
+    if (flush_in_flight.exchange(true, std::memory_order_acq_rel)) {
+        // The write under way may have read the driver data already: one more follows it.
+        if (again_if_busy) {
+            save_again.store(true, std::memory_order_release);
+        }
+        return;
+    }
     serialization_thread.QueueWork([this] {
-        SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
-                                     CACHE_VERSION);
-        size_t size = 0;
-        vulkan_pipeline_cache.Read(&size, nullptr);
-        last_cache_size.store(size, std::memory_order_relaxed);
+        do {
+            SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
+                                         CACHE_VERSION);
+            size_t size = 0;
+            vulkan_pipeline_cache.Read(&size, nullptr);
+            last_cache_size.store(size, std::memory_order_relaxed);
+        } while (save_again.exchange(false, std::memory_order_acq_rel));
         flush_in_flight.store(false, std::memory_order_release);
     });
 }
