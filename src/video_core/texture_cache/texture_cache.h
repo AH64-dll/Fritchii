@@ -1388,6 +1388,18 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
     const auto framebuffer_start = std::chrono::steady_clock::now();
     runtime.FlushDeferredClear();
     framebuffer_id = slot_framebuffers.insert(runtime, color_buffers, depth_buffer, key);
+    framebuffer_keys.emplace(framebuffer_id, key);
+    const auto index_view = [this, id = framebuffer_id](ImageViewId view) {
+        if (!view) {
+            return;
+        }
+        auto& ids = framebuffers_by_view[view];
+        if (std::ranges::find(ids, id) == ids.end()) {
+            ids.push_back(id);
+        }
+    };
+    std::ranges::for_each(key.color_buffer_ids, index_view);
+    index_view(key.depth_buffer_id);
     ++rt_stats.framebuffers_created;
     rt_stats.framebuffer_ns += NsSince(framebuffer_start);
     return framebuffer_id;
@@ -3129,6 +3141,23 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             return;
         }
         join_overlaps_found.insert(overlap_id);
+        // A drift: a single-level, single-layer 2D target placed a little off a previous one
+        // (Ocarina of Time's bump-allocated per-frame targets move 40 KB - 2 MB a frame). The
+        // offset is under one layer, and not 0, so it is no mip or layer base of either image:
+        // ResolveOverlap and both IsSubresource checks below would fail. Skips them.
+        if (new_info.type == ImageType::e2D && overlap.info.type == ImageType::e2D &&
+            new_info.resources.levels == 1 && overlap.info.resources.levels == 1 &&
+            new_info.resources.layers == 1 && overlap.info.resources.layers == 1 &&
+            new_info.layer_stride == overlap.info.layer_stride && gpu_addr != overlap.gpu_addr) {
+            const u64 distance = gpu_addr > overlap.gpu_addr ? gpu_addr - overlap.gpu_addr
+                                                             : overlap.gpu_addr - gpu_addr;
+            const u64 limit = new_info.layer_stride != 0 ? new_info.layer_stride : size_bytes;
+            if (distance < limit && distance < size_bytes &&
+                distance < overlap.guest_size_bytes) {
+                join_bad_overlap_ids.push_back(overlap_id);
+                return;
+            }
+        }
         constexpr bool strict_size = true;
         const std::optional<OverlapResult> solution = ResolveOverlap(
             new_info, gpu_addr, cpu_addr, overlap, strict_size, broken_views, native_bgr);
@@ -4274,24 +4303,76 @@ void TextureCache<P>::RemoveImageViewReferences(std::span<const ImageViewId> rem
 template <class P>
 void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_views) {
     runtime.FlushDeferredClear();
-    rt_stats.framebuffers_scanned += static_cast<u32>(framebuffers.size());
-    auto it = framebuffers.begin();
-    while (it != framebuffers.end()) {
-        if (it->first.Contains(removed_views)) {
-            ++rt_stats.framebuffers_removed;
-            auto framebuffer_id = it->second;
-            ASSERT(framebuffer_id);
-            if (framebuffer_id == last_framebuffer_id) {
-                last_framebuffer_id = {};
-                last_framebuffer_serial = 0;
+    const auto destroy = [this](FramebufferId framebuffer_id) {
+        ASSERT(framebuffer_id);
+        ++rt_stats.framebuffers_removed;
+        if (framebuffer_id == last_framebuffer_id) {
+            last_framebuffer_id = {};
+            last_framebuffer_serial = 0;
+        }
+        sentenced_framebuffers.Push(std::move(slot_framebuffers[framebuffer_id]));
+        slot_framebuffers.erase(framebuffer_id);
+    };
+    // A null id matches every unused slot of a key: only the full scan finds those.
+    if (std::ranges::any_of(removed_views, [](ImageViewId view) { return !view; })) {
+        rt_stats.framebuffers_scanned += static_cast<u32>(framebuffers.size());
+        auto it = framebuffers.begin();
+        while (it != framebuffers.end()) {
+            if (it->first.Contains(removed_views)) {
+                const FramebufferId framebuffer_id = it->second;
+                UnindexFramebuffer(framebuffer_id, it->first);
+                destroy(framebuffer_id);
+                it = framebuffers.erase(it);
+            } else {
+                ++it;
             }
-            sentenced_framebuffers.Push(std::move(slot_framebuffers[framebuffer_id]));
-            slot_framebuffers.erase(framebuffer_id);
-            it = framebuffers.erase(it);
-        } else {
-            ++it;
+        }
+        return;
+    }
+    // The same framebuffers the scan finds (every key that holds one of the views), by index.
+    boost::container::small_vector<FramebufferId, 16> removed;
+    for (const ImageViewId view : removed_views) {
+        const auto it = framebuffers_by_view.find(view);
+        if (it == framebuffers_by_view.end()) {
+            continue;
+        }
+        for (const FramebufferId framebuffer_id : it->second) {
+            if (std::ranges::find(removed, framebuffer_id) == removed.end()) {
+                removed.push_back(framebuffer_id);
+            }
         }
     }
+    rt_stats.framebuffers_scanned += static_cast<u32>(removed.size());
+    for (const FramebufferId framebuffer_id : removed) {
+        const auto key_it = framebuffer_keys.find(framebuffer_id);
+        ASSERT(key_it != framebuffer_keys.end());
+        const RenderTargets key = key_it->second;
+        UnindexFramebuffer(framebuffer_id, key);
+        [[maybe_unused]] const size_t erased = framebuffers.erase(key);
+        ASSERT(erased == 1);
+        destroy(framebuffer_id);
+    }
+}
+
+template <class P>
+void TextureCache<P>::UnindexFramebuffer(FramebufferId framebuffer_id, const RenderTargets& key) {
+    const auto unindex_view = [this, framebuffer_id](ImageViewId view) {
+        if (!view) {
+            return;
+        }
+        const auto it = framebuffers_by_view.find(view);
+        if (it == framebuffers_by_view.end()) {
+            return;
+        }
+        auto& ids = it->second;
+        ids.erase(std::remove(ids.begin(), ids.end(), framebuffer_id), ids.end());
+        if (ids.empty()) {
+            framebuffers_by_view.erase(it);
+        }
+    };
+    std::ranges::for_each(key.color_buffer_ids, unindex_view);
+    unindex_view(key.depth_buffer_id);
+    framebuffer_keys.erase(framebuffer_id);
 }
 
 template <class P>

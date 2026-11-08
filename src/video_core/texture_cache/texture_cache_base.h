@@ -578,6 +578,16 @@ private:
     /// Remove framebuffers using the given image views from the cache
     void RemoveFramebuffers(std::span<const ImageViewId> removed_views);
 
+    /// Drops a framebuffer from framebuffers_by_view and framebuffer_keys.
+    void UnindexFramebuffer(FramebufferId framebuffer_id, const RenderTargets& key);
+
+    /// The framebuffers each image view is in, and each framebuffer's key: RemoveFramebuffers
+    /// takes a deleted image's framebuffers from here instead of scanning the whole map, which
+    /// grows by one entry per drifted render target a frame (fable_answer_12 2E).
+    ::Common::unordered_map<ImageViewId, boost::container::small_vector<FramebufferId, 4>>
+        framebuffers_by_view;
+    ::Common::unordered_map<FramebufferId, RenderTargets> framebuffer_keys;
+
     /// Mark an image as modified from the GPU
     void MarkModification(ImageBase& image) noexcept;
 
