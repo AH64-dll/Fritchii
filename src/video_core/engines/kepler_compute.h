@@ -294,6 +294,15 @@ private:
     /// EXP13: predicts the releases of the QMD a launch just sent signals (nx2_qmd_prediction.h).
     void FrontPredictQmd(VideoCommon::GpuSplit& split, const FrontState& state, u32 method,
                          u32 argument) const;
+    /// EXP13=2: feeds the front's QMD scheduler copy the signal just sent (0xaf, 0xb0, 0x107).
+    void FrontMirrorQmd(VideoCommon::GpuSplit& split, const FrontState& state, u32 method,
+                        u32 argument) const;
+    /// EXP13=2: runs the copy's scheduler for a signal of the QMD at `qmd_address`.
+    void FrontQmdSignal(VideoCommon::GpuSplit& split, GPUVAddr qmd_address, u32 argument) const;
+    /// EXP13=2: the QMD at `address` as the back will read it; `unknown` when the copy can't
+    /// tell (it resyncs then).
+    bool FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
+                      NativeQmdScheduler::Descriptor& descriptor, bool& unknown) const;
     /// An exec_upload with `exec` was sent: the range its data writes.
     void FrontNoteUpload(FrontState& state, u32 exec);
     std::unique_ptr<FrontState> front;

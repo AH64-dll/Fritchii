@@ -46,6 +46,110 @@
 
 namespace Tegra::Engines {
 
+namespace {
+
+// EDEN_NX2_EXP13=2 (diagnostic, counting only; from zortos293/Lichii#717's
+// EDEN_NX2_QMD_PREDICT): the split's front runs its own copy of the QMD scheduler. All channels'
+// native compute methods pass through the front in the order the back runs them, so fed the same
+// signals and the same QMD words, the copy runs the same QMDs at the same places and makes the
+// same releases, which it records for nx2_qmd_prediction (the back checks each one). It reads a
+// QMD only where guest memory holds what the back will read (nothing queued writes it, or the
+// inline QMD the front sent last over it, kept as an overlay); elsewhere it waits for that work
+// only, and drains and copies the back's table on GPU-written pages, all-zero QMDs and at the
+// start of a split session or of EXP13=2. Nothing it predicts meets an acquire.
+struct FrontQmdMirror {
+    struct Overlay {
+        const void* space;
+        GPUVAddr address;
+        u64 position; ///< The end of the 0x107 that writes it; 0 = empty
+        NativeQmdScheduler::Descriptor words;
+    };
+    static constexpr size_t MaxOverlays = 64;
+
+    FrontQmdMirror() {
+        scheduler.table = &table;
+    }
+
+    NativeQmdScheduler scheduler;
+    NativeQmdScheduler::StateTable table;
+    u64 session{~u64{0}};
+    bool synced{};   ///< The table matches the back's for the work sent
+    bool disabled{}; ///< Auto-off, until EXP13 leaves 2
+    std::array<Overlay, MaxOverlays> overlays{};
+    /// The newest position of an overlay replaced by another QMD's: reads of a QMD without an
+    /// overlay wait for it while it is queued.
+    u64 evicted{};
+    /// Reads in the current window, those that waited for queued writes, and resyncs.
+    u32 window_reads{};
+    u32 window_waits{};
+    u32 window_resyncs{};
+
+    const Overlay* FindOverlay(const void* space, GPUVAddr address) const {
+        for (const Overlay& overlay : overlays) {
+            if (overlay.position != 0 && overlay.address == address && overlay.space == space) {
+                return &overlay;
+            }
+        }
+        return nullptr;
+    }
+
+    void AddOverlay(const void* space, GPUVAddr address, u64 position, const u32* words) {
+        Overlay* slot = nullptr;
+        for (Overlay& overlay : overlays) {
+            if (overlay.position != 0 && overlay.address == address && overlay.space == space) {
+                slot = &overlay;
+                break;
+            }
+        }
+        if (slot == nullptr) {
+            // A free slot, else the oldest.
+            slot = &overlays[0];
+            for (Overlay& overlay : overlays) {
+                if (overlay.position < slot->position) {
+                    slot = &overlay;
+                }
+            }
+            evicted = (std::max)(evicted, slot->position);
+        }
+        slot->space = space;
+        slot->address = address;
+        slot->position = position;
+        std::memcpy(slot->words.data(), words, sizeof(slot->words));
+    }
+
+    void Clear() {
+        overlays = {};
+        evicted = 0;
+        window_reads = window_waits = window_resyncs = 0;
+    }
+};
+FrontQmdMirror g_front_qmd;
+
+// The back runs everything sent (the signal being noted too), then the front copies its table.
+void ResyncFrontQmd(VideoCommon::GpuSplit& split, VideoCommon::QmdPrediction::Mirror why) {
+    auto& mirror = g_front_qmd;
+    split.Drain(VideoCommon::DrainSite::QmdRead);
+    // The back is idle: nothing else touches its table now.
+    mirror.table = NativeQmdScheduler::SharedStates();
+    mirror.scheduler.table = &mirror.table;
+    mirror.Clear();
+    mirror.session = split.Session();
+    mirror.synced = true;
+    VideoCommon::QmdPrediction::SetRecordsValid(true, split.SentPosition());
+    VideoCommon::QmdPrediction::NoteMirror(why);
+}
+
+// EXP13 left 2, or the copy turned itself off: it starts over when EXP13=2 signals again.
+void StopFrontQmd(bool disable) {
+    auto& mirror = g_front_qmd;
+    mirror.synced = false;
+    mirror.disabled = disable;
+    mirror.Clear();
+    VideoCommon::QmdPrediction::SetRecordsValid(false, 0);
+}
+
+} // Anonymous namespace
+
 KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
     : memory_manager{memory_manager_}
     , upload_state{memory_manager, regs.upload}
@@ -145,6 +249,12 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
             const u32 value = ReduceSemaphore(reduction, false, memory_manager.Read<u32>(address),
                                               payload);
             memory_manager.Write<u32>(address, value);
+            // EXP13=2: counted as landed for the reduction bound's records (nothing else).
+            if (VideoCommon::QmdPrediction::Enabled()) {
+                if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                    Tegra::Nx2NoteLanded(*device);
+                }
+            }
             if (Common::Nx2GpuWrite::g_listener.load(std::memory_order_relaxed) != nullptr) {
                 Common::Nx2GpuWrite::Notify(Common::Nx2GpuWrite::Path::ComputeReduce,
                                             memory_manager.GpuToCpuAddress(address).value_or(0),
@@ -1561,32 +1671,49 @@ void KeplerCompute::FrontNoteWriter(VideoCommon::GpuSplit& split, FrontState& fs
     // below the macros (plain or not), the macro code and bindings and the QMD actions it
     // ignores write nothing.
     using Kind = VideoCommon::GpuSplit::WriterKind;
+    const auto predict = [&] {
+        if (VideoCommon::QmdPrediction::Enabled()) {
+            FrontPredictQmd(split, fs, method, argument);
+        } else if (g_front_qmd.synced || g_front_qmd.disabled) [[unlikely]] {
+            StopFrontQmd(false);
+        }
+    };
     switch (method) {
     case 0xaf:
         if ((argument & 2) != 0) {
             split.NoteDispatchWriter();
-            if (VideoCommon::QmdPrediction::Enabled()) {
-                FrontPredictQmd(split, fs, method, argument);
-            }
+            predict();
         }
         return;
     case 0xb0:
         if ((argument & 15) > 1) {
             split.NoteDispatchWriter();
-            if (VideoCommon::QmdPrediction::Enabled()) {
-                FrontPredictQmd(split, fs, method, argument);
-            }
+            predict();
         }
         return;
     case 0x107:
         split.NoteDispatchWriter();
-        if (VideoCommon::QmdPrediction::Enabled()) {
-            FrontPredictQmd(split, fs, method, argument);
-        }
+        predict();
         return;
     case 0x6c3: {
         const GPUVAddr address =
             (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
+        // EXP13=2: a reduction (bit 3, op in bits 11:9, always unsigned) recorded for the
+        // reduction bound (ProcessNativeReportSemaphore; operations 0 and 2 write).
+        if (const u32 report_operation = argument & 3;
+            ((argument >> 3) & 1) != 0 && (report_operation == 0 || report_operation == 2) &&
+            VideoCommon::QmdPrediction::MirrorMode()) {
+            if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                namespace Prediction = VideoCommon::QmdPrediction;
+                Prediction::Note(*device,
+                                 {.writer = Prediction::Writer::Report,
+                                  .kind = Prediction::Kind::Reduction,
+                                  .payload = fs.registers[0x6c2],
+                                  .op = (argument >> 9) & 7,
+                                  .is_signed = false},
+                                 memory_manager.Read<u32>(address), split.SentPosition(), 0);
+            }
+        }
         if ((VideoCore::Nx2Debug::Experiment(10) & 4) != 0) {
             split.NoteWriterRange(memory_manager, address, 16, Kind::Release); // As before (A/B)
             return;
@@ -1630,6 +1757,13 @@ void KeplerCompute::FrontPredictQmd(VideoCommon::GpuSplit& split, const FrontSta
     // dependent QMD (one level). Schedules (2, 3) run it once its dependency count is 0, a
     // decrement (7) when it reaches 0; increments and the rest run nothing.
     namespace Prediction = VideoCommon::QmdPrediction;
+    if (Prediction::MirrorMode()) {
+        FrontMirrorQmd(split, fs, method, argument);
+        return;
+    }
+    if (g_front_qmd.synced || g_front_qmd.disabled) [[unlikely]] {
+        StopFrontQmd(false);
+    }
     using Descriptor = NativeQmdScheduler::Descriptor;
     const u64 position = split.SentPosition();
     const auto predict = [&](GPUVAddr qmd_address, const Descriptor& qmd, bool stale) {
@@ -1694,6 +1828,155 @@ void KeplerCompute::FrontPredictQmd(VideoCommon::GpuSplit& split, const FrontSta
         Prediction::NoteSignal(Prediction::Signal::Chained);
         predict(dependent, qmd, stale);
     }
+}
+
+void KeplerCompute::FrontMirrorQmd(VideoCommon::GpuSplit& split, const FrontState& fs,
+                                   u32 method, u32 argument) const {
+    if (method != 0x107) {
+        // 0xaf with bit 1, 0xb0 with an action past 1: what ProcessNativeMethod signals.
+        FrontQmdSignal(split, GPUVAddr{fs.registers[0xad]} << 8, argument);
+        return;
+    }
+    // An inline QMD goes to memory, then may launch (ProcessNativeMethod's 0x107); unmapped, it
+    // neither writes nor launches.
+    const GPUVAddr address = ((GPUVAddr{fs.registers[0xc6]} << 32) | fs.registers[0xc7]) << 8;
+    if (!memory_manager.IsFullyMappedRange(address, sizeof(NativeQmdScheduler::Descriptor))) {
+        return;
+    }
+    if (g_front_qmd.synced) {
+        g_front_qmd.AddOverlay(&memory_manager, address, split.SentPosition(),
+                               fs.registers.data() + 0xc8);
+    }
+    if ((fs.registers[0xa7] & (1U << 24)) == 0 && (fs.registers[0xcc] & (1U << 12)) != 0) {
+        return; // Launched later, by 0xaf or 0xb0
+    }
+    FrontQmdSignal(split, address, 3);
+}
+
+void KeplerCompute::FrontQmdSignal(VideoCommon::GpuSplit& split, GPUVAddr qmd_address,
+                                   u32 argument) const {
+    namespace Prediction = VideoCommon::QmdPrediction;
+    auto& mirror = g_front_qmd;
+    if (mirror.disabled) {
+        return;
+    }
+    if (!mirror.synced || mirror.session != split.Session()) {
+        // First signal of this split session or of EXP13=2: start from the back's table, this
+        // signal included.
+        ResyncFrontQmd(split, Prediction::Mirror::SessionStart);
+        return;
+    }
+    Prediction::NoteSignal(Prediction::Signal::Read);
+    const u64 position = split.SentPosition();
+    bool unknown = false;
+    u64 running_qmd = 0; // The QMD the releases below belong to (read last), as on the back
+    const auto read = [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
+        running_qmd = address;
+        return FrontReadQmd(split, address, descriptor, unknown);
+    };
+    // As ProcessNativeMethod's release callback: a reduction (bit 26), else a four-word release
+    // (payload and time stamp), a max (bit 19) or a plain write of the payload.
+    const auto release = [&](u64 address, u32 payload, u32 flags) {
+        const bool four_words = (flags >> 30) == 0;
+        if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) {
+            return false;
+        }
+        const auto device = memory_manager.GpuToCpuAddress(address);
+        if (!device) {
+            Prediction::NoteUnmappedRelease();
+            return true;
+        }
+        Prediction::Record record{.writer = Prediction::Writer::Qmd,
+                                  .kind = Prediction::Kind::Plain,
+                                  .payload = payload,
+                                  .op = 0,
+                                  .is_signed = false};
+        if ((flags & (1U << 26)) != 0) {
+            record.kind = Prediction::Kind::Reduction;
+            record.op = (flags >> 20) & 7;
+            record.is_signed = ((flags >> 24) & 1) != 0;
+        } else if (!four_words && (flags & (1U << 19)) != 0) {
+            record.kind = Prediction::Kind::AtLeast;
+        }
+        Prediction::Note(*device, record, memory_manager.Read<u32>(address), position,
+                         running_qmd);
+        return true;
+    };
+    const auto dispatch = [](const NativeQmdScheduler::Descriptor&) { return true; };
+    (void)mirror.scheduler.Signal(qmd_address, argument, read, release, dispatch);
+    if (unknown) {
+        // The back's run of this signal may differ from the copy's: take its table.
+        ResyncFrontQmd(split, Prediction::Mirror::Resync);
+        ++mirror.window_resyncs;
+    }
+    // Reads that wait for the back (QMDs written by queued work other than inline QMDs) or that
+    // drain would cost the front more than the copy saves: #717 turns it off then.
+    // EDEN_NX2_QMD_AUTO_OFF=0 keeps it on however many reads wait (they still count).
+    static const bool auto_off = [] {
+        const char* const value = std::getenv("EDEN_NX2_QMD_AUTO_OFF");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (mirror.window_reads >= 256 || mirror.window_resyncs > 8) {
+        if ((auto_off && mirror.window_waits * 8 > mirror.window_reads) ||
+            mirror.window_resyncs > 8) {
+            LOG_WARNING(HW_GPU,
+                        "QMD release prediction (EXP13=2): {} of {} QMD reads waited for queued "
+                        "writes, {} resyncs; the QMD scheduler copy is off until EXP13 changes",
+                        mirror.window_waits, mirror.window_reads, mirror.window_resyncs);
+            Prediction::NoteMirror(Prediction::Mirror::AutoOff);
+            StopFrontQmd(true);
+            return;
+        }
+        mirror.window_reads = 0;
+        mirror.window_waits = 0;
+        mirror.window_resyncs = 0;
+    }
+}
+
+bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
+                                 NativeQmdScheduler::Descriptor& descriptor, bool& unknown) const {
+    namespace Prediction = VideoCommon::QmdPrediction;
+    constexpr u64 size = sizeof(NativeQmdScheduler::Descriptor);
+    if (!memory_manager.IsFullyMappedRange(address, size)) {
+        return false; // As the back ("unmapped QMD")
+    }
+    // Downloads of GPU-written words may land on the back at any time.
+    const auto device = memory_manager.GpuToCpuAddress(address);
+    if (!device || Nx2MayBeGpuWritten(*device, size)) {
+        unknown = true;
+        return false;
+    }
+    auto& mirror = g_front_qmd;
+    ++mirror.window_reads;
+    const u64 done = split.ConsumedNow();
+    const auto writers = split.QueuedGuestWriters(done, address, *device, size);
+    u64 target = (std::max)(writers.noted, writers.unbounded);
+    const FrontQmdMirror::Overlay* const overlay = mirror.FindOverlay(&memory_manager, address);
+    if (overlay != nullptr && overlay->position > done) {
+        if (target <= overlay->position) {
+            // The inline QMD written last over it, nothing queued after it that may write there:
+            // the back finds exactly its words (0x107 writes all 256 bytes).
+            descriptor = overlay->words;
+            Prediction::NoteMirror(Prediction::Mirror::Overlay);
+            return true;
+        }
+    } else if (overlay == nullptr && mirror.evicted > done) {
+        target = (std::max)(target, mirror.evicted); // Its inline QMD may have been evicted
+    }
+    if (target > done) {
+        ++mirror.window_waits;
+        split.WaitUntil(target, VideoCommon::DrainSite::QmdRead);
+        Prediction::NoteMirror(Prediction::Mirror::Waited);
+    } else {
+        Prediction::NoteMirror(Prediction::Mirror::Memory);
+    }
+    memory_manager.ReadBlockUnsafe(address, descriptor.data(), size);
+    // An all-zero QMD: the words may still be in the buffer cache.
+    if (std::ranges::all_of(descriptor, [](u32 word) { return word == 0; })) {
+        unknown = true;
+        return false;
+    }
+    return true;
 }
 
 void KeplerCompute::FrontNoteUpload(FrontState& fs, u32 exec) {
@@ -1766,7 +2049,12 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
                                          u32 method, const u32* base_start, u32 amount,
                                          u32 methods_pending, const GPUVAddr* segment) {
     auto& fs = Front(split);
-    if (method >= 0xe00 && method < fs.registers.size()) {
+    // EXP13=2: methods that signal the QMD scheduler go one by one, so its copy sees each (the
+    // back runs a multi-method word by word too). 0x6c3 stays a multi-method: one by one it would
+    // also note its releases (FrontNoteRelease), which acquires use.
+    const bool signals = method == 0xaf || method == 0xb0 || method == 0x107;
+    if ((method >= 0xe00 && method < fs.registers.size()) ||
+        (signals && amount > 1 && VideoCommon::QmdPrediction::MirrorMode())) {
         for (u32 i = 0; i < amount; ++i) {
             FrontCallMethod(system, split, method, base_start[i], methods_pending - i <= 1, segment);
         }
