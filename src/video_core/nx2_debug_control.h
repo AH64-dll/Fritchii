@@ -114,6 +114,13 @@ inline std::atomic<int> g_host_pace{-1};
 /// EXP19 (graphics pipeline lookup without Refresh, PipelineCache::CurrentGraphicsPipelineClean):
 /// 1 = as EDEN_NX2_PIPELINE_CLEAN=1, 2 = also #641's patches (blend registers left to the
 /// dual-source bit and Dirty::Blending, attribute types redone alone under Dirty::VertexInput).
+/// EXP22 (split ring traffic, zortos293/Lichii#641; gpu_split.h DeltaWrite and DrawBatch), bits:
+/// 1 = 3D macro state writes go in StateDelta blocks, applied in one loop (FRONT_STATE, without
+/// its per-register merge), 2 = repeated instance-loop groups go as one DrawBatch entry that
+/// counts the repeats (DRAW_BATCH), 4 = same-value index_buffer.first writes stay on the front
+/// (SKIP_SAME_DRAWREG, as EXP2), 8 = the back checks each delta and batch against the single
+/// writes and keeps theirs (logs "EXP22 check"). 7 = all three. #641's FRONT_CB_ENCODE is not
+/// ported (it holds constant buffer writes off the ring).
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 
