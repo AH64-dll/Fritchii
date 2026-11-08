@@ -24,6 +24,10 @@ public:
 
     /// Called from the warm-up threads. kind 0 hides the indicator.
     void SetWarmProgress(u32 kind, size_t done, size_t total) noexcept {
+        if (kind == 3) {
+            precompile_done.store(done, std::memory_order::relaxed);
+            precompile_total.store(total, std::memory_order::relaxed);
+        }
         warm_done.store(done, std::memory_order::relaxed);
         warm_total.store(total, std::memory_order::relaxed);
         warm_kind.store(kind, std::memory_order::release);
@@ -91,6 +95,33 @@ public:
         return precompile_state.load() == PrecompileAsked;
     }
 
+    /// From boot until the title's precompiled pipelines are known to be prepared or absent: the
+    /// file is looked for or assembled, the stamp checked, or the preparation runs. A frontend can
+    /// hold the game back meanwhile (Fritchii's "Preparing shaders" screen).
+    void SetPrecompilePending(bool pending) noexcept {
+        precompile_pending.store(pending, std::memory_order::release);
+    }
+    [[nodiscard]] bool PrecompilePending() const noexcept {
+        return precompile_pending.load(std::memory_order::acquire);
+    }
+    /// The last precompile progress (kind 3), kept apart from the warm-ups that share the
+    /// indicator. total is 0 until a preparation counts its records.
+    [[nodiscard]] WarmProgress GetPrecompileProgress() const noexcept {
+        WarmProgress progress;
+        progress.kind = 3;
+        progress.done = precompile_done.load(std::memory_order::relaxed);
+        progress.total = precompile_total.load(std::memory_order::relaxed);
+        return progress;
+    }
+    /// Full speed: the preparation may use every core at normal priority (the game waits for it);
+    /// otherwise it stays on its few idle-priority threads beside the game.
+    void SetPrecompileFullSpeed(bool full) noexcept {
+        precompile_full_speed.store(full, std::memory_order::relaxed);
+    }
+    [[nodiscard]] bool PrecompileFullSpeed() const noexcept {
+        return precompile_full_speed.load(std::memory_order::relaxed);
+    }
+
     void MarkShaderComplete() noexcept {
         ++num_complete;
     }
@@ -113,6 +144,10 @@ private:
     static constexpr int PrecompileRunning = 2; ///< a preparation runs (counted in warm_running)
     static constexpr int PrecompileAsked = 3;   ///< requested (counted in warm_running)
     std::atomic<int> precompile_state{PrecompileAbsent};
+    std::atomic<bool> precompile_pending{};
+    std::atomic<bool> precompile_full_speed{};
+    std::atomic<size_t> precompile_done{};
+    std::atomic<size_t> precompile_total{};
     int report_base{};
 
     bool completed{};
