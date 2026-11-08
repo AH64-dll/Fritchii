@@ -354,6 +354,57 @@ public:
     /// Prepare an image to be used
     void PrepareImage(ImageId image_id, bool is_modification, bool invalidate);
 
+    /// EDEN_NX2_EXP32 (texture binding memo, after zortos293/Lichii#717's BINDMEMO): what the
+    /// graphics texture bindings of a draw are resolved against. With the same state, the same
+    /// handles and the same guest TIC/TSC entries, VisitImageView and GetSamplerId give the same
+    /// view and sampler ids: a view leaves a descriptor only through RemoveImageViewReferences
+    /// (image deleted, joined or rescaled), which moves `epoch`, as do a new channel and the
+    /// collector's out of memory table reset (null views made again); null views of unmapped
+    /// addresses follow the mappings (`map_serial`). Samplers are never deleted.
+    struct TextureMemoState {
+        const void* channel{};
+        const void* memory{};
+        GPUVAddr tic_pool{};
+        GPUVAddr tsc_pool{};
+        u32 tic_limit{};
+        u32 tsc_limit{};
+        u64 map_serial{};
+        u64 epoch{};
+
+        [[nodiscard]] bool operator==(const TextureMemoState&) const noexcept = default;
+    };
+
+    /// One texture binding's guest entries as the draw that resolved it read them.
+    struct TextureMemoEntry {
+        u32 tic_index{}; ///< ~0U: the handle is out of the pool (null view whatever memory holds)
+        u32 tsc_index{}; ///< ~0U: out of the pool (null sampler)
+        TICEntry tic{};
+        TSCEntry tsc{};
+    };
+
+    [[nodiscard]] TextureMemoState GraphicsTextureMemoState() const noexcept;
+
+    /// The entries the graphics tables resolved `tic_handle` and `tsc_handle` from in this draw;
+    /// false when the tables no longer hold them as resolved to `view` and `sampler`.
+    [[nodiscard]] bool TakeTextureMemoEntry(u32 tic_handle, u32 tsc_handle, ImageViewId view,
+                                            SamplerId sampler, TextureMemoEntry& entry) const;
+
+    /// Whether guest memory still holds the entry's TIC and TSC entries (read as
+    /// DescriptorTable::Read reads them).
+    [[nodiscard]] bool TextureMemoEntryCurrent(const TextureMemoState& state,
+                                               const TextureMemoEntry& entry) const;
+
+    /// Whether preparing the view for sampling (PrepareImageView(view, false, false)) would do
+    /// nothing but touch its image in the LRU: no CPU modification to upload, no aliases.
+    [[nodiscard]] bool TextureMemoViewClean(ImageViewId view) const noexcept;
+
+    /// What preparing the view does once its contents are clean: the image's LRU touch.
+    void TouchTextureMemoView(ImageViewId view) noexcept;
+
+    [[nodiscard]] u64 FrameTick() const noexcept {
+        return frame_tick;
+    }
+
     Common::SpinRecursiveMutex mutex;
 
 private:
@@ -537,8 +588,37 @@ private:
     Tegra::MaxwellDeviceMemoryManager& device_memory;
     std::deque<TextureCacheGPUMap> gpu_page_table_storage;
 
+    /// EDEN_NX2_EXP31 (RT_FAST, zortos293/Lichii#717): whether UpdateRenderTargets' clean path
+    /// would change nothing: the same targets were prepared for a draw, no image was modified,
+    /// created or deleted since, in the same frame, and none needs an upload, alias sync or
+    /// sparse backing.
+    [[nodiscard]] bool RenderTargetsStillPrepared() const;
+    void NoteRenderTargetsPrepared();
+    /// EXP31 bit 2: the clean path ran although RenderTargetsStillPrepared; checks it changed
+    /// nothing but the targets' own modification ticks. False (and logs) on a difference.
+    bool VerifyRenderTargetsPrepared();
+
     RenderTargets render_targets;
     u64 render_targets_serial = 0;
+    struct RenderTargetsPrepared {
+        bool valid = false;
+        u64 serial = 0;
+        u64 modification_tick = 0;
+        u64 frame_tick = 0;
+        u64 bindings_epoch = 0;
+        std::array<ImageViewId, NUM_RT + 1> views{};
+    } rt_prepared;
+    /// EXP31 counts since the last report (TickFrame, every 600 frames while it is on).
+    u64 rt_fast_skips = 0;
+    u64 rt_fast_clean_paths = 0;
+    u64 rt_fast_verified = 0;
+    u64 rt_fast_mismatches = 0;
+    /// Changes whenever a prepared render target could need preparing again: images or views
+    /// created, deleted, rescaled or CPU modified, descriptor pools moved, and every frame
+    /// (zortos293/Lichii#717's bindings_epoch).
+    u64 bindings_epoch = 1;
+    /// See TextureMemoState::epoch (EXP32). 0 never matches.
+    u64 texture_memo_epoch = 1;
     u32 rt_active_mask = 0;
     std::array<ImageId, 8> rt_image_id{};
     ImageId rt_depth_image_id{};

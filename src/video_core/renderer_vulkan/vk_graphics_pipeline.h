@@ -219,6 +219,48 @@ public:
     }
 
 private:
+    /// EDEN_NX2_EXP32 (texture binding memo; zortos293/Lichii#717's BINDMEMO reduced to "the same
+    /// textures as this pipeline's previous draw"): that draw's texture bindings as resolved and
+    /// pushed, for pipelines whose image bindings are all sampled textures (no texture or image
+    /// buffers, no storage images). A draw reading the same handles with the same texture cache
+    /// state (TextureCache::TextureMemoState), the same guest TIC/TSC entries and clean images
+    /// takes the view and sampler ids and the descriptor entries from it instead of resolving them
+    /// (GetSamplerId, FillImageViews) and building them (PushImageDescriptors).
+    struct TextureMemo {
+        bool valid{};
+        u64 generation{};  ///< the switch generation it was recorded in (a switch change drops it)
+        u64 touch_frame{}; ///< the frame its images were last touched in the LRU
+        TextureCache::TextureMemoState state{};
+        std::vector<u32> handles;         ///< per texture: the TIC handle read
+        std::vector<u32> sampler_handles; ///< per texture: the TSC handle read
+        std::vector<TextureCache::TextureMemoEntry> entries;
+        std::vector<VideoCommon::ImageViewId> views;
+        std::vector<VideoCommon::SamplerId> samplers;
+        std::vector<DescriptorUpdateEntry> descriptors; ///< per texture, in push order
+        std::vector<u8> rescaled; ///< per texture descriptor (array), in push order
+    };
+
+    /// Whether the memo holds this draw's textures (counts why not).
+    [[nodiscard]] bool TextureMemoHit(const TextureCache::TextureMemoState& state,
+                                      std::span<const VideoCommon::ImageViewInOut> views,
+                                      std::span<const u32> sampler_handles);
+
+    /// Remembers the textures this draw resolved and pushed, when nothing in the texture cache
+    /// changed since `state` was taken and the tables still hold them as resolved.
+    void RecordTextureMemo(const TextureCache::TextureMemoState& state,
+                           std::span<const VideoCommon::ImageViewInOut> views,
+                           std::span<const u32> sampler_handles,
+                           std::span<const VideoCommon::SamplerId> samplers,
+                           std::span<const DescriptorUpdateEntry> descriptors,
+                           std::span<const u8> rescaled);
+
+    /// EXP32 verify: a memo hit resolved and pushed the full way; compares the memo with it,
+    /// logs and counts a difference, and turns the memo off when the switch asks (bit 4).
+    bool VerifyTextureMemo(std::span<const VideoCommon::ImageViewInOut> views,
+                           std::span<const VideoCommon::SamplerId> samplers,
+                           std::span<const DescriptorUpdateEntry> descriptors,
+                           std::span<const u8> rescaled, int switch_value);
+
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
 
@@ -280,6 +322,7 @@ private:
     bool fragment_has_color0_output{};
     u32 zero_texture_handles{};
     bool writes_storage{};
+    TextureMemo texture_memo;
 
     /// Graphics pipeline libraries (EDEN_NX2_GPL): one descriptor set per stage (set index =
     /// stage index), the shader libraries, and this pipeline's own vertex input and fragment

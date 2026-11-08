@@ -193,6 +193,31 @@ inline std::atomic<int> g_idle_pause{-1};
 /// (OpenGL keeps its FlushRegion). 0 = the operation wait as before. Off by default, not measured
 /// yet: compare the back's "query DMA wait" profile zone (ms and waits per second) and the white
 /// flash watch.
+/// EXP31 (render target memo, RT_FAST from zortos293/Lichii#717; TextureCache::
+/// UpdateRenderTargets), bits: 1 = a draw whose render targets are clean (no Dirty::RenderTargets)
+/// skips preparing them again while the same views were prepared for a draw in the same frame,
+/// no image was marked modified, created, deleted, rescaled or CPU written since (modification
+/// tick and bindings_epoch unchanged), and every target image is GPU-modified with no CPU
+/// modification, alias or sparse state, 2 = with 1: such draws run the loop anyway and check it
+/// changed nothing but the targets' own modification ticks (flags, bindings_epoch; logs "RT_FAST
+/// (EXP31) mismatch" and drops the memo on a difference). Logs skips, verified and mismatches
+/// every 600 frames while on. Off by default; measure the back's "render targets" zone (3 = verify
+/// first, then 1).
+/// EXP32 (texture binding memo, the core of zortos293/Lichii#717's BINDMEMO for "the same textures
+/// as the pipeline's previous draw"; Vulkan GraphicsPipeline::TextureMemo, graphics pipelines whose
+/// image bindings are all sampled textures), bits: 1 = a draw that reads the same TIC and TSC
+/// handles as its pipeline's previous draw, with the same pools, channel, GPU mappings and texture
+/// cache epoch (no view removed: image deleted, joined or rescaled), the same guest TIC/TSC
+/// entries and images without CPU writes to upload or aliases, takes that draw's view and sampler
+/// ids and descriptor entries instead of GetSamplerId, FillImageViews and PushImageDescriptors
+/// (handles are still read every draw: the EXP21 storage pointer rule and the per-bind uniform bank
+/// check of d79572d28a are untouched), 2 = verify: every hit for 120 frames after the switch
+/// changes, then one hit in 64, runs the full path instead and compares view ids, sampler ids,
+/// descriptor entries and rescaling bits ("Texture memo mismatch (EXP32)" log, first 32), 4 = a
+/// mismatch turns the memo off until the switch changes. "Texture memo (EXP32=n)" logs hits, misses
+/// by cause, records and verify mismatches every 10 s while set. Off by default; 7 = memo, verify
+/// and auto-off. Measure the back's "read handles", "fill image views" and "push descriptors"
+/// zones (the sampler lookups move from the first to the second with the memo on).
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 

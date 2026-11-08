@@ -412,11 +412,14 @@ public:
     std::array<f32, 4> words{};
 };
 
+/// `texture_rescaled`: when given, each texture descriptor's rescaling bit is also stored at
+/// *texture_rescaled, which advances (EDEN_NX2_EXP32 records them with the descriptors).
 inline void PushImageDescriptors(TextureCache& texture_cache,
                                  GuestDescriptorQueue& guest_descriptor_queue,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
                                  const VideoCommon::SamplerId*& samplers,
-                                 const VideoCommon::ImageViewInOut*& views) {
+                                 const VideoCommon::ImageViewInOut*& views,
+                                 u8** texture_rescaled = nullptr) {
     const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
     views += num_texture_buffers;
@@ -439,6 +442,9 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             is_rescaled |= element_rescaled;
         }
         rescaling.PushTexture(is_rescaled);
+        if (texture_rescaled != nullptr) {
+            *((*texture_rescaled)++) = is_rescaled ? 1 : 0;
+        }
     }
     for (const auto& desc : info.image_descriptors) {
         bool is_rescaled{};

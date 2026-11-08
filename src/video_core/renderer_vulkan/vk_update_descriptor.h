@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <memory>
 #include <variant>
 #include <vector>
@@ -103,6 +104,12 @@ public:
 
     void AddTexelBuffer(VkBufferView texel_buffer) {
         *(payload_cursor++) = texel_buffer;
+    }
+
+    /// Adds entries recorded from an earlier payload (a pipeline's remembered texture bindings,
+    /// EDEN_NX2_EXP32; from zortos293/Lichii#717).
+    void AddEntries(const DescriptorUpdateEntry* entries, size_t count) {
+        payload_cursor = std::copy_n(entries, count, payload_cursor);
     }
 
     void AddTexelBuffer(VkBufferView texel_buffer, VkDeviceAddress base_address,
