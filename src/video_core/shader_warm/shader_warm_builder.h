@@ -31,6 +31,12 @@ std::filesystem::path GraphicsWarmPath(u64 title_id);
 /// cache version; a matching marker skips that warm-up at boot.
 std::filesystem::path WarmMarkerPath(const std::filesystem::path& warm_file);
 
+/// "In progress" marker of a warm file (same folder, `.running` appended:
+/// warm-compute.bin.running), written by the emulator before a warm-up's first build and
+/// removed when it ends. Found at boot, the process died during that warm-up (a driver crash),
+/// so it is skipped until the warm file is rebuilt or the driver changes.
+std::filesystem::path WarmRunningPath(const std::filesystem::path& warm_file);
+
 /// Entry count of a warm file, written by the builder next to it (extension .count): the entry
 /// count and the warm file's size. The file format has no count, so the warm-up shows exact
 /// progress only with this; files from the offline tools have none.

@@ -13,6 +13,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -1778,6 +1779,31 @@ std::array<std::filesystem::path, 2> MarkerPaths(const std::filesystem::path& fi
     return {marker, title_file.parent_path() / marker.filename()};
 }
 
+/// Whether `marker` holds a stamp of the same file and device as `stamp` (the entry count is
+/// informative).
+bool StampMatches(const std::filesystem::path& marker, const WarmStamp& stamp) {
+    std::ifstream in(marker);
+    WarmStamp saved;
+    if (!(in >> saved.size >> saved.write_time >> saved.entries >> saved.driver >>
+          saved.device_id >> saved.cache_version)) {
+        return false;
+    }
+    return saved.size == stamp.size && saved.write_time == stamp.write_time &&
+           saved.driver == stamp.driver && saved.device_id == stamp.device_id &&
+           saved.cache_version == stamp.cache_version;
+}
+
+/// Writes `stamp` to `marker`; false when it could not be written.
+bool WriteStamp(const std::filesystem::path& marker, const WarmStamp& stamp) {
+    std::error_code ec;
+    std::filesystem::create_directories(marker.parent_path(), ec);
+    std::ofstream out(marker, std::ios::trunc);
+    out << stamp.size << ' ' << stamp.write_time << ' ' << stamp.entries << ' ' << stamp.driver
+        << ' ' << stamp.device_id << ' ' << stamp.cache_version << '\n';
+    out.close();
+    return static_cast<bool>(out);
+}
+
 /// True when a marker matches the file and the device (the entry count is informative).
 bool WarmAlreadyDone(const std::filesystem::path& file, const std::filesystem::path& title_file,
                      const Device& device) {
@@ -1786,15 +1812,8 @@ bool WarmAlreadyDone(const std::filesystem::path& file, const std::filesystem::p
         return false;
     }
     for (const auto& marker : MarkerPaths(file, title_file)) {
-        std::ifstream in(marker);
-        WarmStamp saved;
-        if (in >> saved.size >> saved.write_time >> saved.entries >> saved.driver >>
-            saved.device_id >> saved.cache_version) {
-            if (saved.size == stamp->size && saved.write_time == stamp->write_time &&
-                saved.driver == stamp->driver && saved.device_id == stamp->device_id &&
-                saved.cache_version == stamp->cache_version) {
-                return true;
-            }
+        if (StampMatches(marker, *stamp)) {
+            return true;
         }
     }
     return false;
@@ -1807,15 +1826,58 @@ void WriteWarmMarker(const std::filesystem::path& file, const std::filesystem::p
         return;
     }
     for (const auto& marker : MarkerPaths(file, title_file)) {
-        std::error_code ec;
-        std::filesystem::create_directories(marker.parent_path(), ec);
-        std::ofstream out(marker, std::ios::trunc);
-        out << stamp->size << ' ' << stamp->write_time << ' ' << stamp->entries << ' '
-            << stamp->driver << ' ' << stamp->device_id << ' ' << stamp->cache_version << '\n';
-        out.close();
-        if (out) {
+        if (WriteStamp(marker, *stamp)) {
             return;
         }
+    }
+}
+
+/// The "in progress" marker (warm-compute.bin.running), next to the warm file or in the title's
+/// shader folder like the done marker. Written before a warm-up's first build and removed when
+/// the warm-up ends, so one found at boot means the process died during a warm-up (a driver
+/// compiler crash or a recompiler assert on a guessed entry).
+std::array<std::filesystem::path, 2> RunningMarkerPaths(const std::filesystem::path& file,
+                                                        const std::filesystem::path& title_file) {
+    const auto marker = VideoCommon::ShaderWarm::WarmRunningPath(file);
+    return {marker, title_file.parent_path() / marker.filename()};
+}
+
+/// True when a warm-up of this file died on this driver: it stays skipped until the warm file
+/// is rebuilt or the driver changes. A marker of another file or driver is removed.
+bool WarmDiedBefore(const std::filesystem::path& file, const std::filesystem::path& title_file,
+                    const Device& device) {
+    const auto stamp = CurrentStamp(file, device, 0);
+    for (const auto& marker : RunningMarkerPaths(file, title_file)) {
+        std::error_code ec;
+        if (!std::filesystem::exists(marker, ec)) {
+            continue;
+        }
+        if (stamp && StampMatches(marker, *stamp)) {
+            return true;
+        }
+        std::filesystem::remove(marker, ec);
+    }
+    return false;
+}
+
+void WriteRunningMarker(const std::filesystem::path& file, const std::filesystem::path& title_file,
+                        const Device& device) {
+    const auto stamp = CurrentStamp(file, device, 0);
+    if (!stamp) {
+        return;
+    }
+    for (const auto& marker : RunningMarkerPaths(file, title_file)) {
+        if (WriteStamp(marker, *stamp)) {
+            return;
+        }
+    }
+}
+
+void RemoveRunningMarkers(const std::filesystem::path& file,
+                          const std::filesystem::path& title_file) {
+    for (const auto& marker : RunningMarkerPaths(file, title_file)) {
+        std::error_code ec;
+        std::filesystem::remove(marker, ec);
     }
 }
 
@@ -1848,6 +1910,14 @@ void PipelineCache::StartComputeWarm(u64 title_id) {
     const std::filesystem::path title_file = VideoCommon::ShaderWarm::ComputeWarmPath(title_id);
     if (WarmAlreadyDone(warm_file, title_file, device)) {
         LOG_INFO(Render_Vulkan, "Nx2Perf compute_warm: already done for this file and driver");
+        return;
+    }
+    if (WarmDiedBefore(warm_file, title_file, device)) {
+        LOG_WARNING(Render_Vulkan,
+                    "Nx2Perf compute_warm: skipped, the last one did not end (the emulator "
+                    "stopped during it, a driver crash?); it runs again once {} is rebuilt or "
+                    "the driver changes",
+                    path);
         return;
     }
     size_t file_entries = 0;
@@ -1919,6 +1989,7 @@ void PipelineCache::StartComputeWarm(u64 title_id) {
         std::atomic<size_t> built{};
         std::atomic<size_t> failed{};
         std::atomic<size_t> running{};
+        std::once_flag running_marker; ///< Written before the first build
         WarmProgressThrottle throttle;
         std::chrono::steady_clock::time_point begin{std::chrono::steady_clock::now()};
     };
@@ -1941,6 +2012,9 @@ void PipelineCache::StartComputeWarm(u64 title_id) {
                 if (index >= entries->size()) {
                     break;
                 }
+                std::call_once(progress->running_marker, [this, &warm_file, &title_file] {
+                    WriteRunningMarker(warm_file, title_file, device);
+                });
                 Entry& entry = (*entries)[index];
                 entry.env.SetGuessMissing(&guess);
                 bool ok = false;
@@ -1965,6 +2039,8 @@ void PipelineCache::StartComputeWarm(u64 title_id) {
                 }
             }
             if (progress->running.fetch_sub(1) == 1) {
+                // Ended (finished, stopped or cancelled): no build is in flight any more.
+                RemoveRunningMarkers(warm_file, title_file);
                 shader_notify.SetWarmProgress(0, 0, 0);
                 if (read_ok && !stop.stop_requested() && !warm_cancel &&
                     progress->built + progress->failed >= entries->size()) {
@@ -2002,6 +2078,14 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
         LOG_INFO(Render_Vulkan, "Nx2Perf graphics_warm: already done for this file and driver");
         return;
     }
+    if (WarmDiedBefore(warm_file, title_file, device)) {
+        LOG_WARNING(Render_Vulkan,
+                    "Nx2Perf graphics_warm: skipped, the last one did not end (the emulator "
+                    "stopped during it, a driver crash?); it runs again once {} is rebuilt or "
+                    "the driver changes",
+                    path);
+        return;
+    }
     // Streamed: the file is 1.5 GB; workers take the next entry under the reader's lock.
     struct Reader {
         std::mutex mutex;
@@ -2013,6 +2097,7 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
         /// Builds the driver refused: worth another warm-up, unlike entries that cannot be built.
         std::atomic<size_t> driver_failures{};
         std::atomic<size_t> running{};
+        std::once_flag running_marker; ///< Written before the first build
         size_t read{}; ///< Entries taken from the file (under the mutex)
         size_t known_total{}; ///< Entry count recorded by the builder, 0 when unknown
         std::streamoff position{};
@@ -2109,6 +2194,9 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
                         break;
                     }
                 }
+                std::call_once(reader->running_marker, [this, &warm_file, &title_file] {
+                    WriteRunningMarker(warm_file, title_file, device);
+                });
                 env.SetGuessMissing(&guess);
                 WarmResult result = WarmResult::Unbuildable;
                 try {
@@ -2147,6 +2235,8 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
                 }
             }
             if (reader->running.fetch_sub(1) == 1) {
+                // Ended (finished, stopped or cancelled): no build is in flight any more.
+                RemoveRunningMarkers(warm_file, title_file);
                 shader_notify.SetWarmProgress(0, 0, 0);
                 bool complete = false;
                 size_t entries_read = 0;
