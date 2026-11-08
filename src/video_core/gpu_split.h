@@ -920,6 +920,9 @@ private:
     static constexpr size_t RingMask = RingWords - 1;
     static constexpr u32 MaxMultiWords = 8192;
     static constexpr size_t PublishEvery = 256;
+    /// EXP39 & 1: the fewest words the front publishes to a back that waits for them (Commit).
+    /// A back that runs faster than the front would otherwise take one entry per publish.
+    static constexpr size_t PublishAfterWait = 8;
 
     template <typename Func>
     static void CallThunk(const u64* payload) {
@@ -943,12 +946,16 @@ private:
     void Commit(size_t words, Effect effect) {
         write_position += words;
         writes.Entry(effect, write_position);
-        // EDEN_NX2_EXP27 & 2 (zortos293/Lichii#717 EDEN_NX2_PUBLISH_IDLE): a back that ran out
-        // of work gets each entry at once, except while a Pairs or StateDelta block is open
-        // (publishing ends the block).
-        if (write_position - published_local >= publish_every ||
-            (publish_idle && pairs_header == nullptr && delta_header == nullptr &&
-             back_idle.load(std::memory_order_relaxed))) {
+        // EXP39 & 1 (zortos293/Lichii#805 62db242b34): the back waits for work at the last
+        // position published (it stored it in back_idle_at before it spun), so it waits for
+        // exactly the words the front holds: it gets them after PublishAfterWait, not after
+        // publish_every. Not while a Pairs or StateDelta block is open (publishing ends it).
+        // Replaces EXP27 & 2, which published every entry while the back was idle.
+        const u64 unpublished = write_position - published_local;
+        if (unpublished >= publish_every ||
+            (publish_waiting && unpublished >= PublishAfterWait && pairs_header == nullptr &&
+             delta_header == nullptr &&
+             back_idle_at.load(std::memory_order_relaxed) == published_local)) {
             Publish();
         }
     }
@@ -1108,8 +1115,8 @@ private:
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
-    /// EXP27 & 2, read at each Publish: Commit publishes at once while back_idle is set.
-    bool publish_idle{};
+    /// EXP39 & 1, read at each Publish: Commit publishes a few words to a back that waits.
+    bool publish_waiting{};
     Tegra::Engines::EngineInterface* front_engine{};
     /// The open Pairs block's head (PairWrite), and its count.
     u64* pairs_header{};
@@ -1163,9 +1170,11 @@ private:
     alignas(128) std::atomic<u64> consumed{};
     /// A position the front waits for (WaitFor): the back stores `consumed` once past it.
     alignas(128) std::atomic<u64> wait_target{~u64{0}};
-    /// The back found the ring empty (it spins, then sleeps): with EXP27 & 2 Commit publishes at
-    /// once. A hint only, stored when it changes.
-    alignas(128) std::atomic<bool> back_idle{};
+    /// The back's position when it last ran out of work, stored before it waits for more: while
+    /// it equals published_local, the back waits for the words the front holds (Commit, EXP39 &
+    /// 1). The back writes it once per wait, the front reads it at every Commit. ~0: none since
+    /// the split started (positions start over at 0).
+    alignas(128) std::atomic<u64> back_idle_at{~u64{0}};
     alignas(128) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
     /// The front sleeps in Backoff (#161: instead of yielding).

@@ -216,8 +216,9 @@ public:
     bool SkipWriterWait(u64 size);
     u64 list_fast_marks{};
     std::chrono::steady_clock::time_point list_fast_since{};
-    /// Copies the list's words from memory again, as of suspension count `now`.
-    void RefreshSnapshot(CommandList& list, u64 now);
+    /// Copies the list's words from memory again, as of suspension count `now`, from entry
+    /// `first_entry` on (the entries before it ran already).
+    void RefreshSnapshot(CommandList& list, u64 now, size_t first_entry = 0);
     /// Copies the list's deferred entries (CommandList::deferred_entries) from memory.
     void RefreshDeferredEntries(CommandList& list);
 

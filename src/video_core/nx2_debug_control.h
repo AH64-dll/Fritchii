@@ -169,9 +169,8 @@ inline std::atomic<int> g_idle_pause{-1};
 /// syncpoint increment (SyncpointManager guest increment hook), not only at its 500 us poll.
 /// EXP27 (keep the split's back fed, fewer submits; zortos293/Lichii#717), bits: 1 = the front
 /// publishes before it yields or sleeps polling suspended channels (PUBLISH_WAITS,
-/// GpuSplit::PublishBeforeWait), 2 = while the back found the ring empty, each entry is published
-/// at once (outside open Pairs and StateDelta blocks) and a publish takes back_waiting back so
-/// only the first wakes the back (PUBLISH_IDLE), 4 = the back prefetches the ring 128 words
+/// GpuSplit::PublishBeforeWait), 2 = retired (was PUBLISH_IDLE, each entry published at once
+/// while the back found the ring empty; EXP39 & 1 replaces it), 4 = the back prefetches the ring 128 words
 /// ahead (RING_PREFETCH), 8 = command list copies after a dispatch are submitted when the front
 /// waits for them, when the back goes idle or with the next submission, instead of at once
 /// (DISPATCH_BATCH, RasterizerVulkan::SubmitNx2ListCopies). Off by default; 1, 2 and 4 change
@@ -251,6 +250,15 @@ inline std::atomic<int> g_idle_pause{-1};
 /// answers into the path level 2 takes for a word below the value, never the other way, so it is
 /// a strict tightening; its cost is the drains it puts back (compare 0, 1 and 2 with
 /// profile_toggle and the AcquiresFast count).
+/// EXP39 (live; keep the split's back fed, zortos293/Lichii#805 62db242b34), bits: 1 = the back
+/// stores its position when it runs out of work (GpuSplit::back_idle_at) and, while that is the
+/// position last published, the front publishes at its next Commit once it holds 8 words, not
+/// after 256 (outside open Pairs and StateDelta blocks; replaces EXP27 & 2), 2 = when an acquire
+/// resumes, the snapshot refresh (DmaPusher::RefreshSnapshot) skips the current list's entries
+/// that ran already and the entry the acquire suspended inside, which reads memory anyway
+/// (CanUseSubmittedCommands); the lists behind it are copied as before. Default 3: both only
+/// change when the back sees work or which words nobody parses again are copied. Measure with
+/// profile_toggle (EXP39 0 vs 3): back "split wait", front "resume pending".
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 
@@ -293,6 +301,9 @@ inline void LoadExperiments() {
         // EXP35 = 1: guest writes of never-GPU-written cached pages collected for the back instead
         // of OnCPUWrite under both caches' mutexes (see the EXP35 notes above).
         g_experiments[35].store(1, std::memory_order_relaxed);
+        // EXP39 = 3: publish to a back that waits after 8 words, no snapshot refresh of entries
+        // that ran (zortos293/Lichii#805 62db242b34; see the EXP39 notes above). Timing only.
+        g_experiments[39].store(3, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {
