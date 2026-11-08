@@ -573,7 +573,7 @@ bool MetByQmdPrediction(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
                 .word = word,
                 .done = done,
                 .gpu_dirty = Nx2IsGpuWritten(*device),
-                .pointer = nullptr,
+                .pointer = dma_pusher.memory_manager.GetPointer(acquire.address),
             },
             resume)) {
         return false;
