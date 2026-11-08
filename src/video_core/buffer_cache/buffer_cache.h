@@ -2051,6 +2051,10 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     if (uploads.count != 0) {
         FlushNativeBankUploads(buffer, uploads);
     }
+    // The clock only every 1,024 binds (~100k binds a second at Castle Town).
+    if ((stats.binds & 1023) != 0) {
+        return;
+    }
     const auto now = std::chrono::steady_clock::now();
     if (now - stats.last_log < std::chrono::seconds{5}) {
         return;
