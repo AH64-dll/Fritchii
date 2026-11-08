@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/nx2_gpu_write_listener.h"
 
 namespace Tegra {
 
@@ -417,6 +418,8 @@ public:
 
     /// A GPU write of `value` to the u32 at `device_address`.
     void OnWrite(u64 device_address, u32 value) {
+        // Ocarina of Time's present poll (EXP24, svc_nx2_oot_present.cpp); unset otherwise.
+        Common::Nx2GpuWrite::Notify(device_address, value);
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }

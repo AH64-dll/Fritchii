@@ -377,6 +377,8 @@ add_library(core STATIC
     hle/kernel/svc/svc_light_ipc.cpp
     hle/kernel/svc/svc_lock.cpp
     hle/kernel/svc/svc_memory.cpp
+    hle/kernel/svc/svc_nx2_oot_poll.cpp
+    hle/kernel/svc/svc_nx2_oot_present.cpp
     hle/kernel/svc/svc_physical_memory.cpp
     hle/kernel/svc/svc_port.cpp
     hle/kernel/svc/svc_power_management.cpp
