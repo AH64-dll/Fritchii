@@ -366,8 +366,10 @@ private:
                             const std::filesystem::path& file = {}, bool force = false);
 
     /// Native pipelines: the key without state that cannot change the pipeline (see
-    /// FixedPipelineState::CanonicalizeNative). From #895, not called yet (see
-    /// port_895_report.md: draws and the disk cache loader would have to key canonically).
+    /// FixedPipelineState::CanonicalizeNative), with #895's attribute mask from the header. Not
+    /// called: EDEN_NX2_CANONICAL_KEYS=1 canonicalizes draws, the loader and the precompiled
+    /// preparation with CanonicalizeKeyState (vk_pipeline_cache.cpp), which leaves the attribute
+    /// types to VideoCommon::KeyedAttributeTypes, the masking our keys had before.
     void CanonicalizeNativeKey(GraphicsPipelineCacheKey& key,
                                std::span<const Shader::Environment* const> envs) const noexcept;
 

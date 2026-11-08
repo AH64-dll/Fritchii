@@ -919,6 +919,40 @@ void MaskKeyedAttributeTypes(GraphicsPipelineCacheKey& key, std::span<const File
         key.state.attribute_types, key.unique_hashes, attribute_masks);
 }
 
+/// EDEN_NX2_CANONICAL_KEYS=1 (off by default; read on first use, after nx2_switches.txt): native
+/// graphics keys without the state that cannot change the pipeline (zortos293/Lichii#895's
+/// FixedPipelineState::CanonicalizeNative), at the draw, at disk cache load and in the
+/// precompiled preparation, so a precompiled pipeline is created with the draw's create info.
+bool CanonicalKeys() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_CANONICAL_KEYS");
+        const bool on = value != nullptr && value[0] == '1';
+        if (on) {
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_CANONICAL_KEYS=1: native pipeline keys are canonical "
+                                    "(blend state of attachments without blending, attachments "
+                                    "past the last colour target, depth bounds)");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+/// The canonical form of a native key's state (EDEN_NX2_CANONICAL_KEYS=1). The attribute types
+/// are left as they are: draws and the loader already keep only those the programs read
+/// (VideoCommon::KeyedAttributeTypes, the rule #895's mask follows). Idempotent.
+void CanonicalizeKeyState(FixedPipelineState& state, const DynamicFeatures& features) noexcept {
+    // With a dynamic stipple enable the key never says whether lines are stippled (Refresh3
+    // leaves line_stipple_enable 0), while the factor and pattern stay static in the pipeline:
+    // clearing them would give a game that enables stippling a factor of 0. Kept then.
+    const u32 stipple_factor = state.line_stipple_factor;
+    const u32 stipple_pattern = state.line_stipple_pattern;
+    state.CanonicalizeNative(~0U);
+    if (features.has_dynamic_state3_line_stipple_enable) {
+        state.line_stipple_factor = stipple_factor;
+        state.line_stipple_pattern = stipple_pattern;
+    }
+}
+
 // EDEN_NX2_REKEY_FOREIGN_PIPELINES=0: cached graphics pipelines another GPU driver (or driver
 // version) stored are skipped at boot instead of loaded under this driver (see load_graphics).
 bool RekeyForeignPipelines() {
@@ -2073,6 +2107,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
         }
         if (patch_blending) {
             graphics_key.state.RefreshBlending(*maxwell3d);
+            if (CanonicalKeys() && maxwell3d->GetNativeMacroEngine().native_turing) {
+                CanonicalizeKeyState(graphics_key.state, dynamic_features);
+            }
         }
     } else {
         TakeCleanSnapshot();
@@ -2099,17 +2136,23 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
 void PipelineCache::RefreshGraphicsKey() {
     if (!dynamic_features.has_dynamic_vertex_input) {
         graphics_key.state.Refresh(*maxwell3d, dynamic_features);
-        return;
+    } else {
+        // Refresh only rewrites the types when the vertex input changes, so the masked copy in
+        // the key must not carry over to the next programs. Types of attributes the programs
+        // don't read would split their pipelines by whatever the game left in those registers
+        // (Ocarina of Time: up to 20 keys for the same shaders, each built again on the GPU
+        // thread).
+        graphics_key.state.attribute_types = vertex_attribute_types;
+        graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+        vertex_attribute_types = graphics_key.state.attribute_types;
+        graphics_key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
+            vertex_attribute_types, graphics_key.unique_hashes, vertex_attribute_masks);
     }
-    // Refresh only rewrites the types when the vertex input changes, so the masked copy in the
-    // key must not carry over to the next programs. Types of attributes the programs don't read
-    // would split their pipelines by whatever the game left in those registers (Ocarina of Time:
-    // up to 20 keys for the same shaders, each built again on the GPU thread).
-    graphics_key.state.attribute_types = vertex_attribute_types;
-    graphics_key.state.Refresh(*maxwell3d, dynamic_features);
-    vertex_attribute_types = graphics_key.state.attribute_types;
-    graphics_key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
-        vertex_attribute_types, graphics_key.unique_hashes, vertex_attribute_masks);
+    // Everything CanonicalizeNative clears is rewritten by every Refresh (the attachments too:
+    // without dynamic blend state Refresh always rebuilds them), so it can be cleared in place.
+    if (CanonicalKeys() && maxwell3d->GetNativeMacroEngine().native_turing) {
+        CanonicalizeKeyState(graphics_key.state, dynamic_features);
+    }
 }
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
@@ -2379,6 +2422,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     std::unordered_set<u64> rekeyed_pipelines;
     std::unordered_set<u64> native_pipelines;
     size_t foreign_records = 0;
+    size_t canonical_rekeyed = 0; ///< EDEN_NX2_CANONICAL_KEYS=1: records whose key hash changed
 
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename =
@@ -2565,6 +2609,26 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             }
         }
 
+        // EDEN_NX2_CANONICAL_KEYS=1: native records are looked up as draws key them now. Records
+        // stored before (or while the switch was off) are rekeyed here and their used-list age
+        // moves to the canonical key, as for the masking above; records stored with it on are
+        // canonical already (it is idempotent).
+        if (CanonicalKeys() && std::ranges::all_of(envs, [](const FileEnvironment& env) {
+                return env.IsNativeProgram();
+            })) {
+            const u64 stored_hash = key.Hash();
+            CanonicalizeKeyState(key.state, dynamic_features);
+            if (const u64 hash = key.Hash(); hash != stored_hash) {
+                ++canonical_rekeyed;
+                if (const auto used = used_pipelines.find(stored_hash);
+                    used != used_pipelines.end()) {
+                    const u8 age = used->second;
+                    const auto [entry, inserted] = used_pipelines.try_emplace(hash, age);
+                    entry->second = (std::min)(entry->second, age);
+                }
+            }
+        }
+
         const bool key_requests_provoking_last = key.state.provoking_vertex_last != 0;
         if (key_requests_provoking_last && !dynamic_features.has_provoking_vertex_last_mode) {
             return;
@@ -2676,6 +2740,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                  "{} cached graphics pipeline records were stored by another GPU driver{}",
                  foreign_records,
                  RekeyForeignPipelines() ? ", loaded under this one" : " and are skipped");
+    }
+    if (CanonicalKeys()) {
+        LOG_INFO(Render_Vulkan,
+                 "EDEN_NX2_CANONICAL_KEYS: {} cached graphics pipeline records loaded under a new "
+                 "(canonical) key",
+                 canonical_rekeyed);
     }
     if (PreloadAllPipelines() && queued_graphics > 10000) {
         LOG_WARNING(Render_Vulkan,
@@ -3778,6 +3848,12 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                     // as draws will key them.
                     key_state.driver_id = dynamic_features.driver_id;
                     key_state.driver_version = dynamic_features.driver_version;
+                    // Canonical as draws key them (EDEN_NX2_CANONICAL_KEYS=1), so the pipeline is
+                    // created with the create info a draw gives it (depth bounds included, which
+                    // the tool's keys keep as recorded) and the driver finds it compiled.
+                    if (CanonicalKeys()) {
+                        CanonicalizeKeyState(key_state, dynamic_features);
+                    }
                     const bool other_device =
                         (key_state.extended_dynamic_state != 0) !=
                             dynamic_features.has_extended_dynamic_state ||
