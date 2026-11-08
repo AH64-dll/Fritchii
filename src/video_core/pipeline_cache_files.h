@@ -19,7 +19,14 @@
 namespace VideoCommon {
 
 inline constexpr u32 OpenGLPipelineCacheVersion = 48;
-inline constexpr u32 VulkanPipelineCacheVersion = 52;
+/// 54 since 2026-11-08 (was 52): zortos293/Lichii writes the same records under 53 and 54, and our
+/// graphics keys already keep only the attribute types a program reads (KeyedAttributeTypes, their
+/// #408), which is all their version 55 changes. So shared caches and #895 recipes of 54 are taken as
+/// they are, and moving to 55 later is this number plus VulkanOwnPreviousVersions.
+inline constexpr u32 VulkanPipelineCacheVersion = 54;
+/// This fork's earlier versions of the same record format, newest first: their files are copied
+/// once to the current version's names (header version rewritten; records unchanged).
+inline constexpr std::array<u32, 1> VulkanOwnPreviousVersions{52};
 
 // Official Eglantine (cache version 18 at c0cb3325) and this fork (a different version) both
 // used <shader dir>/<title>/vulkan.bin and vulkan_pipelines.bin. Each build deletes a file
@@ -61,6 +68,16 @@ inline bool AdoptLegacyPipelineCache(const std::filesystem::path& legacy,
     }
     std::filesystem::rename(legacy, versioned, error);
     return !error;
+}
+
+/// Copies a file of this fork's earlier version that has no version in it (the used-pipelines
+/// list, the merge log) when the current one doesn't exist yet; the old file stays for older builds.
+inline void CopyOwnUnversionedFile(const std::filesystem::path& old_file,
+                                   const std::filesystem::path& new_file) {
+    std::error_code error;
+    if (!std::filesystem::exists(new_file, error) && std::filesystem::exists(old_file, error)) {
+        std::filesystem::copy_file(old_file, new_file, error);
+    }
 }
 
 /// Copies a cache whose records this build reads, written with another cache version, to

@@ -32,6 +32,7 @@
 #include "video_core/gpu_wait_site.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -181,6 +182,12 @@ public:
         if (value >= Tegra::Host1x::SyncpointManager::NUM_MAX_SYNCPOINTS) {
             LOG_ERROR(HW_GPU, "Signal of syncpoint {} past the table, ignored", value);
             return;
+        }
+        // The render-frame clock (video_core/nx2.h), before the increment: a flip its actions
+        // wake must already see the bump.
+        if (Tegra::g_nx2_render_clock_wanted.load(std::memory_order_relaxed)) {
+            Tegra::Nx2NoteSyncpointSignal(
+                value, static_cast<u32>(syncpoint_manager.GetGuestSyncpointValue(value)) + 1);
         }
         syncpoint_manager.IncrementGuest(value);
         std::function<void()> func([this, value] { syncpoint_manager.IncrementHost(value); });

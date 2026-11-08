@@ -23,6 +23,7 @@
 #include "video_core/buffer_cache/nx2_bytes_equal.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
+#include "video_core/churn_counters.h"
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -3119,7 +3120,27 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
 }
 
 template <class P>
-void BufferCache<P>::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
+bool BufferCache<P>::JoinCopyIsDead(DAddr device_addr, u64 size) {
+    // Every page CPU-modified: SynchronizeBuffer uploads such pages whole from guest memory
+    // (ForEachModifiedRange reports whole pages) before any bind, DMA copy or download reads
+    // the new buffer there, so the bytes a join copy puts in would be overwritten unread. The
+    // exceptions keep host data the upload leaves alone or read the host buffer later: a page
+    // GPU-modified or Preflushable, GPU writes the upload skips (gpu_modified_ranges), and GPU
+    // writes queued or in flight for download.
+    if (!memory_tracker.IsRegionWhollyCpuModified(device_addr, size) ||
+        gpu_modified_ranges.Intersects(device_addr, size) ||
+        uncommitted_gpu_modified_ranges.Intersects(device_addr, size)) {
+        return false;
+    }
+    const auto intersects = [&](const Common::RangeSet<DAddr>& ranges) {
+        return ranges.Intersects(device_addr, size);
+    };
+    return std::ranges::none_of(committed_gpu_modified_ranges, intersects) &&
+           std::ranges::none_of(pending_download_ranges, intersects);
+}
+
+template <class P>
+bool BufferCache<P>::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
                                  bool accumulate_stream_score) {
     Buffer& new_buffer = slot_buffers[new_buffer_id];
     Buffer& overlap = slot_buffers[overlap_id];
@@ -3134,12 +3155,28 @@ void BufferCache<P>::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
         .size = overlap.SizeBytes(),
     });
     new_buffer.MarkUsage(copies[0].dst_offset, copies[0].size);
-    runtime.CopyBuffer(new_buffer, overlap, copies, true);
+    VideoCommon::Churn::Add(VideoCommon::Churn::BuffersJoined);
+    // EDEN_NX2_JOIN_SKIP_CPU=1 (fable_answer_17 4): a drifted per-frame range the guest rewrote
+    // whole since its last upload needs no copy, the first bind uploads all of it anyway
+    // (JoinCopyIsDead). Read on first use: nx2_switches.txt is applied after static init.
+    static const bool skip_cpu = [] {
+        const char* value = std::getenv("EDEN_NX2_JOIN_SKIP_CPU");
+        return value != nullptr && value[0] == '1';
+    }();
+    const bool copy = !skip_cpu || !JoinCopyIsDead(overlap.CpuAddr(), overlap.SizeBytes());
+    if (copy) {
+        VideoCommon::Churn::Add(VideoCommon::Churn::BufferJoinBytes, overlap.SizeBytes());
+        runtime.CopyBuffer(new_buffer, overlap, copies, true);
+    } else {
+        VideoCommon::Churn::Add(VideoCommon::Churn::BufferJoinsSkipped);
+        VideoCommon::Churn::Add(VideoCommon::Churn::BufferJoinSkippedBytes, overlap.SizeBytes());
+    }
 #ifdef YUZU_LEGACY
     if (immediately_free)
         runtime.Finish();
 #endif
     DeleteBuffer(overlap_id, true);
+    return copy;
 }
 
 template <class P>
@@ -3152,12 +3189,22 @@ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
     const u32 size = static_cast<u32>(overlap.end - overlap.begin);
     const BufferId new_buffer_id =
         slot_buffers.insert(runtime, overlap.begin, size, sparse_compatible);
+    VideoCommon::Churn::Add(VideoCommon::Churn::BuffersCreated);
     auto& new_buffer = slot_buffers[new_buffer_id];
     const size_t size_bytes = new_buffer.SizeBytes();
     runtime.ClearBuffer(new_buffer, 0, size_bytes, 0);
     new_buffer.MarkUsage(0, size_bytes);
+    bool copied = false;
+    bool skipped = false;
     for (const BufferId overlap_id : overlap.ids) {
-        JoinOverlap(new_buffer_id, overlap_id, !overlap.has_stream_leap);
+        const bool joined_copy = JoinOverlap(new_buffer_id, overlap_id, !overlap.has_stream_leap);
+        copied |= joined_copy;
+        skipped |= !joined_copy;
+    }
+    if (skipped && !copied) {
+        // The barrier a join copy ends with (CopyBuffer) also ordered the clear above before a
+        // reordered upload in a later submission; keep it when every copy was skipped.
+        runtime.PostCopyBarrier();
     }
     Register(new_buffer_id);
     TouchBuffer(new_buffer, new_buffer_id);
@@ -3594,6 +3641,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
 
 template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+    VideoCommon::Churn::Add(VideoCommon::Churn::BuffersDeleted);
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
     }

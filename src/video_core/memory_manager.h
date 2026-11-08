@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 
@@ -133,6 +134,17 @@ public:
      */
     void ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size) const;
     void WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
+
+    /// ReadBlockUnsafe for a thread that is not the GPU thread (EDEN_NX2_ASYNC_TRANSLATE: the
+    /// translation workers' texture descriptor reads). Holds the page table lock shared, so Map,
+    /// MapSparse and Unmap can't change the tables under the copy. Gives up (false, nothing read)
+    /// when a writer keeps the lock for 2 ms: a writer can wait on the GPU thread (the caches'
+    /// unmap callbacks), so a worker never waits on one without a limit.
+    [[nodiscard]] bool ReadBlockGuarded(GPUVAddr gpu_src_addr, void* dest_buffer,
+                                        std::size_t size) const;
+    /// IsFullyMappedRange under the same lock, with the same limit (nullopt when it gave up).
+    [[nodiscard]] std::optional<bool> IsFullyMappedRangeGuarded(GPUVAddr gpu_addr,
+                                                                std::size_t size) const;
 
     /// Reads `count` consecutive words as Read<u32> would (Switch 2 syncpoint shim included),
     /// without a translation per word.
@@ -296,6 +308,12 @@ private:
 
     bool native_tiling{};
     mutable std::mutex guard;
+    /// Taken exclusively by Map, MapSparse and Unmap around their page table updates while
+    /// translation workers read guest memory (VideoCommon::AsyncTranslateWorkers), shared by the
+    /// guarded reads. Untouched otherwise.
+    mutable std::shared_mutex page_table_lock;
+    /// Shared lock of page_table_lock, waiting 2 ms at most.
+    [[nodiscard]] bool TryLockPageTableShared() const;
     /// Bumped after each page table change; readers keep their MappingSnapshot until then.
     std::atomic<u64> map_serial{};
 

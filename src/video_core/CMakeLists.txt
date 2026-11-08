@@ -14,6 +14,7 @@ if(LIBVA_FOUND)
 endif()
 
 add_library(video_core STATIC
+    async_translate.h
     buffer_cache/buffer_base.h
     buffer_cache/buffer_cache_base.h
     buffer_cache/buffer_cache.cpp
@@ -27,6 +28,7 @@ add_library(video_core STATIC
     capture.h
     cdma_pusher.cpp
     cdma_pusher.h
+    churn_counters.h
     compatible_formats.cpp
     compatible_formats.h
     control/channel_state.cpp
@@ -120,7 +122,12 @@ add_library(video_core STATIC
     nx2.h
     nx2_cmdpage_diag.h
     nx2_debug_control.cpp
+    nx2_precompile.cpp
+    nx2_precompile.h
+    nx2_recipe.cpp
+    nx2_recipe.h
     nx2_debug_control.h
+    nx2_frame_fence.h
     nx2_list_verify.h
     nx2_profile.h
     nx2_qmd_prediction.cpp
@@ -224,6 +231,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_master_semaphore.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
+    renderer_vulkan/vk_pipeline_translate_queue.cpp
+    renderer_vulkan/vk_pipeline_translate_queue.h
     renderer_vulkan/vk_present_manager.cpp
     renderer_vulkan/vk_present_manager.h
     renderer_vulkan/vk_host_pacer.cpp

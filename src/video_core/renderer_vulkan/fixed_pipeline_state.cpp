@@ -417,6 +417,46 @@ void FixedPipelineState::DynamicState::Refresh3(const Maxwell& regs,
     }
 }
 
+// From zortos293/Lichii#895. Not called by draws or the disk cache loader in Fritchii yet: keying
+// draws canonically changes the hashes the used list and the prebuild look up, which waits for
+// review (see port_895_report.md). Our draws already key attribute types by the input map
+// (VideoCommon::KeyedAttributeTypes), which is the first part of this.
+void FixedPipelineState::CanonicalizeNative(u32 generic_read_mask) noexcept {
+    if (dynamic_vertex_input) {
+        u64 keep = 0;
+        for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+            if ((generic_read_mask >> index) & 1) {
+                keep |= u64{3} << (index * 2);
+            }
+        }
+        attribute_types &= keep;
+    }
+    if (!extended_dynamic_state_3_blend) {
+        size_t used = 0;
+        for (size_t index = 0; index < Maxwell::NumRenderTargets; ++index) {
+            if (color_formats[index] != 0) {
+                used = index + 1;
+            }
+        }
+        for (size_t index = 0; index < Maxwell::NumRenderTargets; ++index) {
+            auto& attachment = attachments[index];
+            if (index >= used) {
+                attachment.raw = 0;
+            } else if (!attachment.enable) {
+                attachment.raw &= 0xF; // the colour write mask
+            }
+        }
+    }
+    // Outside the hashed bytes but given to the driver: depth bounds are dynamic state, and the
+    // stipple applies only with stippled lines.
+    depth_bounds_min = 0;
+    depth_bounds_max = 0;
+    if (!dynamic_state.line_stipple_enable) {
+        line_stipple_factor = 0;
+        line_stipple_pattern = 0;
+    }
+}
+
 size_t FixedPipelineState::Hash() const noexcept {
     const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(this), Size());
     return static_cast<size_t>(hash);

@@ -233,6 +233,24 @@ struct WordManager {
         return result;
     }
 
+    /// Every page of the region CPU-modified, and none GPU-modified or Preflushable (the raw bits,
+    /// Untracked not masked out): its host contents are all stale (BufferCache::JoinOverlap).
+    [[nodiscard]] bool IsRegionWhollyCpuModified(u64 offset, u64 size) const noexcept {
+        const std::span<const u64> cpu_words = Span(Type::CPU);
+        const std::span<const u64> gpu_words = Span(Type::GPU);
+        const std::span<const u64> preflush_words = Span(Type::Preflushable);
+        bool whole = true;
+        IterateWords(offset, size, [&](size_t index, u64 mask) {
+            if ((cpu_words[index] & mask) != mask || (gpu_words[index] & mask) != 0 ||
+                (preflush_words[index] & mask) != 0) {
+                whole = false;
+                return true;
+            }
+            return false;
+        });
+        return whole;
+    }
+
     /// @brief Returns a begin end pair with the inclusive modified region
     /// @param offset Offset in bytes from the start of the buffer
     /// @param size   Size in bytes of the region to query for modifications

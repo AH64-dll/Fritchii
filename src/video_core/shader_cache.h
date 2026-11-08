@@ -45,7 +45,12 @@ struct ShaderInfo {
     /// attribute as in FixedPipelineState::attribute_types. None for task and mesh programs, all
     /// set for any other program.
     u64 vertex_attribute_mask{~u64{0}};
+    /// Native vertex programs: the generic attributes their header says they read (#895).
+    u32 generic_read_mask{~0U};
 };
+
+/// Generic attributes a vertex program's header says it reads (any component of each).
+u32 GenericReadMask(const Shader::ProgramHeader& sph) noexcept;
 
 /// ShaderInfo::vertex_attribute_mask of the program in `env` (a runtime or a disk environment).
 /// EDEN_NX2_KEY_ALL_ATTRIBUTES=1 keeps every attribute type in the keys, as before.
@@ -116,8 +121,11 @@ protected:
     const ShaderInfo* ComputeShader();
 
     /// @brief Collect the current graphics environments
-    void GetGraphicsEnvironments(GraphicsEnvironments& result,
-                                 const std::array<u64, NUM_PROGRAMS>& unique_hashes);
+    /// @param snapshot Take each environment's snapshot (GraphicsEnvironment::TakeSnapshot)
+    /// @return Bytes the snapshots copied
+    size_t GetGraphicsEnvironments(GraphicsEnvironments& result,
+                                   const std::array<u64, NUM_PROGRAMS>& unique_hashes,
+                                   bool snapshot = false);
 
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
     /// vertex_attribute_mask of shader_infos, copied so the lookup of every draw doesn't read a

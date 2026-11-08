@@ -4544,6 +4544,9 @@ void MainWindow::OnPrepareShadersNow() {
         return;
     }
     auto& notify = QtCommon::system->GPU().ShaderNotify();
+    // EDEN_NX2_PRECOMPILE: the title's precompiled pipelines are prepared again (they count as a
+    // warm-up from here on).
+    notify.RequestPrecompile();
     if (!notify.WarmActive()) {
         QMessageBox::information(
             this, tr("Prepare Shaders Now"),
@@ -4603,6 +4606,7 @@ void MainWindow::OnPrepareShadersNow() {
             const auto total = static_cast<qulonglong>(warm.total);
             text = warm.kind == 1   ? tr("Building compute shaders")
                    : warm.kind == 2 ? tr("Building graphics shaders")
+                   : warm.kind == 3 ? tr("Building precompiled shaders")
                                     : tr("Starting");
             if (warm.kind != 0 && total > 0) {
                 text += QStringLiteral(": ") + tr("%L1 / %L2").arg(done).arg(total);

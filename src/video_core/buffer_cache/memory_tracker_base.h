@@ -56,6 +56,25 @@ public:
         });
     }
 
+    /// Returns true if every page of a region is CPU-modified and none is GPU-modified or
+    /// Preflushable. False where the tracker has no manager yet (nothing to prove it).
+    [[nodiscard]] bool IsRegionWhollyCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
+        if (query_size == 0) {
+            return false;
+        }
+        const size_t first = query_cpu_addr >> HIGHER_PAGE_BITS;
+        const size_t last = (query_cpu_addr + query_size - 1) >> HIGHER_PAGE_BITS;
+        for (size_t page_index = first; page_index <= last; ++page_index) {
+            if (top_tier[page_index] == nullptr) {
+                return false;
+            }
+        }
+        return !IteratePages<false>(query_cpu_addr, query_size,
+                                    [](Manager* manager, u64 offset, size_t size) {
+                                        return !manager->IsRegionWhollyCpuModified(offset, size);
+                                    });
+    }
+
     /// Returns true if a region has been modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         return IteratePages<false>(query_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {

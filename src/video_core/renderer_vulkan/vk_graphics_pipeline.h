@@ -114,6 +114,9 @@ public:
         EmitStagesFunc emit_stages = {}, LibraryParams library_params = {});
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
+    /// Draws held for unbuilt pipelines this session (never reset; the worst frame line takes
+    /// differences of it).
+    static std::chrono::nanoseconds HoldTimeTotal() noexcept;
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
