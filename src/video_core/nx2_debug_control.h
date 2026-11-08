@@ -253,7 +253,11 @@ inline void LoadExperiments() {
         g_experiments[8].store(15, std::memory_order_relaxed);
         // EXP9 = 1: native uniform bank pages compared only when they may have changed (verified
         // with EXP9=2: 0 missed in 120 s walking). Idle 54.5 -> 57.7 fps, walking 56.6 -> 58.9.
-        g_experiments[9].store(1, std::memory_order_relaxed);
+        // EXP9 = 3 (2026-11-08): the same without the once-a-frame compare of every page, which
+        // never found a change ("frame check N / 0", "missed without the frame check 0"). Castle
+        // Town, one session, 4 x 35 s each: uniform buffers 135.6 -> 97.9 ms/s on the split's back,
+        // 40.8 -> 42.3 fps; flash watch on the Castle Town route 267 reports vs 273 with EXP9=1.
+        g_experiments[9].store(3, std::memory_order_relaxed);
         // EXP10 = 1: macro DMA reads wait only for the dispatches, uploads, copies and releases
         // that may have written them (EDEN_NX2_DMA_SNAPSHOT=10 verify: 0 differed in 2 x 90 s
         // walking). GPU front idle 81 -> 105 ms/s, waits for the back 368 -> 338 ms/s.
