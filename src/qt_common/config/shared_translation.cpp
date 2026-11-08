@@ -294,7 +294,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Shader libraries (faster first-time shader builds)"),
            tr("Builds each shader stage once and links them into pipelines, so new shaders "
               "cause shorter stutters.
-Takes effect after restarting the game."));
+Used on NVIDIA and AMD GPUs.
+Takes effect after "
+              "restarting the game."));
     INSERT(Settings, enable_compute_pipelines, tr("Enable Compute Pipelines (Intel Vulkan Only)"),
            tr("Required by some games.\nThis setting only exists for Intel "
               "proprietary drivers and may crash if enabled.\nCompute pipelines are always enabled "

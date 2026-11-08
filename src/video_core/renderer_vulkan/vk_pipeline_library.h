@@ -50,10 +50,10 @@ namespace Vulkan {
 constexpr u32 GPL_FRAGMENT_TEXTURE_SCALING_BASE = 64;
 constexpr u32 GPL_FRAGMENT_IMAGE_SCALING_BASE = 32;
 
-/// EDEN_NX2_GPL_OPTIMIZE=1 (with EDEN_NX2_GPL=1): after the fast link, an optimized link
-/// (VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT) is built on a worker and swapped in at a
-/// later draw, like the fast first build. The shader libraries are then created with
-/// VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT.
+/// EDEN_NX2_GPL_OPTIMIZE=1: every pipeline is linked optimized
+/// (VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT) instead of fast linked, as on drivers
+/// whose fast links are not usable (Device::CanFastLinkGraphicsLibraries). The shader libraries
+/// are then created with VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT.
 bool GplOptimizeEnabled();
 
 enum class GplPart : u32 {

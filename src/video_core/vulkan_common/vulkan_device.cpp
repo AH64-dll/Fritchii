@@ -1170,14 +1170,16 @@ bool Device::GetSuitability(bool requires_swapchain) {
     FOR_EACH_VK_FEATURE_EXT(FEATURE_EXTENSION);
     FOR_EACH_VK_EXTENSION(EXTENSION);
 
-    // Shader libraries setting or EDEN_NX2_GPL=1: graphics pipelines linked from per-stage
-    // libraries (vk_pipeline_library).
-    graphics_pipeline_library_requested = [] {
-        if (Settings::values.use_graphics_pipeline_library.GetValue()) {
-            return true;
+    // Graphics pipelines linked from per-stage libraries (vk_pipeline_library): the Shader
+    // libraries setting turns them on for NVIDIA and AMD GPUs (Intel and others are untested),
+    // EDEN_NX2_GPL=1 for any GPU, EDEN_NX2_GPL=0 turns them off.
+    graphics_pipeline_library_requested = [this] {
+        if (const char* value = std::getenv("EDEN_NX2_GPL"); value && *value) {
+            return *value != '0';
         }
-        const char* value = std::getenv("EDEN_NX2_GPL");
-        return value && *value && *value != '0';
+        const u32 vendor = properties.properties.vendorID;
+        return Settings::values.use_graphics_pipeline_library.GetValue() &&
+               (vendor == 0x10DE || vendor == 0x1002);
     }();
     if (graphics_pipeline_library_requested &&
         supported_extensions.contains(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
@@ -1698,7 +1700,7 @@ void Device::RemoveUnsuitableExtensions() {
         if (!usable) {
             LOG_WARNING(Render_Vulkan,
                         "Nx2Perf gpl: the device has no graphics pipeline library fast linking, "
-                        "EDEN_NX2_GPL ignored");
+                        "shader libraries off");
             loaded_extensions.erase(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
             loaded_extensions.erase(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
             graphics_pipeline_library_features.graphicsPipelineLibrary = VK_FALSE;

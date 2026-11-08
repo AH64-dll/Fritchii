@@ -1963,7 +1963,8 @@ bool GraphicsPipeline::MakeLibraryPipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
-    pipeline = LinkLibraries(render_pass, !device.CanFastLinkGraphicsLibraries());
+    pipeline =
+        LinkLibraries(render_pass, GplOptimizeEnabled() || !device.CanFastLinkGraphicsLibraries());
     linked = true;
     return true;
 }
