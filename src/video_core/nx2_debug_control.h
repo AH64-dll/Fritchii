@@ -211,6 +211,12 @@ inline void LoadExperiments() {
         // (VideoCommon::HandleIsStoragePointer). Ocarina of Time's Zora's River waterfall
         // flickered every other frame in bursts without it.
         g_experiments[21].store(1, std::memory_order_relaxed);
+        // EXP26 = 3 (zortos293/Lichii#717 wave 1): binds that stream their buffer skip the native
+        // bank page check, and the check compares with SSE2. Castle Town, profile toggle (4
+        // balanced cycles): 40.3 -> 43.7 fps, all pairs positive, bind stage buffers 4.28 -> 3.90
+        // ms per frame; route with EXP9=2 verify: 0 missed pages, no added flash reports. Bit 4
+        // (snapshot uploads) stays off until measured.
+        g_experiments[26].store(3, std::memory_order_relaxed);
         // EXP29 = 6: the exact parts of #717's micro bundle (TickWork's lock-free check, native
         // compute inline uploads not recorded); 1 (memory usage reuse) changes what the caches'
         // GC sees and stays off.
