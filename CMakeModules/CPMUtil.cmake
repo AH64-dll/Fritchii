@@ -1054,14 +1054,30 @@ function(AddCIPackage)
             STATUS sha512sum_status)
         list(GET sha512sum_status 0 sha512sum_error)
 
+        # The checksum only verifies a download. When GitHub can't serve it (an outage) but this
+        # exact version is already unpacked in the source cache, nothing is downloaded: go on
+        # without it. A package that isn't cached still needs the checksum.
+        string(TOLOWER "${ARTIFACT_PACKAGE}" cached_package)
+        set(cached_dir "${CPM_SOURCE_CACHE}/${cached_package}/${ARTIFACT_VERSION}-${pkgname}")
+        set(hash_args)
         if(sha512sum_error)
-            message(FATAL_ERROR "[CPMUtil] Failed to download sha512sum "
-                "for ${ARTIFACT_NAME} from ${sha512sum_url}")
+            file(REMOVE "${sha512sum_file}")
+            if(CPM_SOURCE_CACHE AND IS_DIRECTORY "${cached_dir}")
+                message(WARNING "[CPMUtil] Could not download the sha512sum for "
+                    "${ARTIFACT_NAME} (${sha512sum_url}); using the cached ${cached_dir}")
+                # fetch_package returns before the hash is used when the cache is valid; if it
+                # were not, a download would fail its check against this placeholder.
+                set(hash_args HASH "unverified-cached-copy")
+            else()
+                message(FATAL_ERROR "[CPMUtil] Failed to download sha512sum "
+                    "for ${ARTIFACT_NAME} from ${sha512sum_url}")
+            endif()
+        else()
+            file(READ "${sha512sum_file}" sha512sum_hash)
+            string(STRIP "${sha512sum_hash}" sha512sum_hash)
+            file(REMOVE "${sha512sum_file}")
+            set(hash_args HASH ${sha512sum_hash})
         endif()
-
-        file(READ "${sha512sum_file}" sha512sum_hash)
-        string(STRIP "${sha512sum_hash}" sha512sum_hash)
-        file(REMOVE "${sha512sum_file}")
 
         AddPackage(
             NAME ${ARTIFACT_PACKAGE}
@@ -1069,7 +1085,7 @@ function(AddCIPackage)
             VERSION ${ARTIFACT_VERSION}
             ARTIFACT ${ARTIFACT}
             CUSTOM_KEY "${ARTIFACT_VERSION}-${pkgname}"
-            HASH ${sha512sum_hash}
+            ${hash_args}
             FORCE_BUNDLED_PACKAGE ON
             ${EXTRA_ARGS})
 
