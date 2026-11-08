@@ -75,6 +75,7 @@
 #include "yuzu/configuration/configure_per_game_addons.h"
 #include "yuzu/configuration/configure_system.h"
 #include "yuzu/util/util.h"
+#include "yuzu/fritchii/fritchii_ui.h"
 
 namespace {
 
@@ -403,6 +404,14 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
 
     setFocusPolicy(Qt::ClickFocus);
     setWindowTitle(tr("Properties"));
+    if (FritchiiUi::Enabled()) {
+        setWindowTitle(tr("Game Settings"));
+        ui->tabWidget->setTabText(ui->tabWidget->indexOf(graphics_advanced_tab.get()),
+                                  tr("Advanced Graphics"));
+        ui->tabWidget->setTabText(ui->tabWidget->indexOf(graphics_extensions_tab.get()),
+                                  tr("Graphics Extras"));
+        ui->tabWidget->setTabText(ui->tabWidget->indexOf(input_tab.get()), tr("Controls"));
+    }
 
     addons_tab->SetTitleId(title_id);
 

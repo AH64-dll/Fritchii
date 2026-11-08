@@ -31,6 +31,7 @@
 #include "yuzu/configuration/configure_ui.h"
 #include "yuzu/configuration/configure_web.h"
 #include "yuzu/hotkeys.h"
+#include "yuzu/fritchii/fritchii_ui.h"
 
 ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
                                  InputCommon::InputSubsystem* input_subsystem,
@@ -112,6 +113,17 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
 
     adjustSize();
     ui->selectorList->setCurrentRow(0);
+    if (FritchiiUi::Enabled()) {
+        // After the first group is shown: its pages sit in scroll areas by then, so the window
+        // can take a normal size.
+        setWindowTitle(tr("Settings"));
+        ui->label->setText(tr("Some settings can't change while a game runs."));
+        ui->label->setVisible(system.IsPoweredOn());
+        ui->selectorList->setFixedWidth(180);
+        layout()->setSizeConstraint(QLayout::SetNoConstraint);
+        setMinimumSize(640, 460);
+        resize(940, 680);
+    }
 
     // Selects the leftmost button on the bottom bar (Cancel as of writing)
     ui->buttonBox->setFocus();
@@ -184,10 +196,28 @@ void ConfigureDialog::PopulateSelectionList() {
          {tr("Controls"), input_tab->GetSubTabs()}},
     };
 
+    // Fritchii: everyday settings first, everything a player rarely needs under Advanced.
+    const std::array<std::pair<QString, QList<QWidget*>>, 6> fritchii_items{
+        {{tr("General"), {general_tab.get(), ui_tab.get(), hotkeys_tab.get()}},
+         {tr("Graphics"),
+          {graphics_tab.get(), graphics_advanced_tab.get(), graphics_extensions_tab.get()}},
+         {tr("Controls"), input_tab->GetSubTabs()},
+         {tr("Audio"), {audio_tab.get()}},
+         {tr("System"), {system_tab.get(), profile_tab.get()}},
+         {tr("Advanced"),
+          {cpu_tab.get(), network_tab.get(), filesystem_tab.get(), applets_tab.get(),
+           web_tab.get(), debug_tab_tab.get()}}},
+    };
+    if (FritchiiUi::Enabled()) {
+        ui_tab->setAccessibleName(tr("Interface"));
+        hotkeys_tab->setAccessibleName(tr("Shortcuts"));
+        profile_tab->setAccessibleName(tr("Users"));
+    }
+
     [[maybe_unused]] const QSignalBlocker blocker(ui->selectorList);
 
     ui->selectorList->clear();
-    for (const auto& entry : items) {
+    for (const auto& entry : FritchiiUi::Enabled() ? fritchii_items : items) {
         auto* const item = new QListWidgetItem(entry.first);
         item->setData(Qt::UserRole, QVariant::fromValue(entry.second));
 
@@ -219,6 +249,6 @@ void ConfigureDialog::UpdateVisibleTabs() {
 
     for (auto* const tab : tabs) {
         LOG_DEBUG(Frontend, "{}", tab->accessibleName().toStdString());
-        ui->tabWidget->addTab(tab, tab->accessibleName());
+        ui->tabWidget->addTab(FritchiiUi::SettingsPage(tab), tab->accessibleName());
     }
 }
