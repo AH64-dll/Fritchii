@@ -204,6 +204,12 @@ add_executable(yuzu
     util/clickable_label.h
     util/controller_navigation.cpp
     util/controller_navigation.h
+    fritchii/fritchii.qrc
+    fritchii/fritchii_ui.cpp
+    fritchii/fritchii_ui.h
+    fritchii/home.cpp
+    fritchii/home.h
+    fritchii/main_window_fritchii.cpp
     util/export_log.cpp
     util/export_log.h
     util/limitable_input_dialog.cpp
@@ -282,6 +288,10 @@ file(GLOB_RECURSE THEMES ${PROJECT_SOURCE_DIR}/dist/qt_themes/*)
 if (ENABLE_UPDATE_CHECKER)
     target_compile_definitions(yuzu PUBLIC ENABLE_UPDATE_CHECKER)
 endif()
+# fritchii/ includes ui_main.h, which AutoUic already generates for main_window.cpp.
+set_source_files_properties(fritchii/fritchii_ui.cpp fritchii/main_window_fritchii.cpp
+    PROPERTIES SKIP_AUTOUIC ON)
+
 # The updater unpacks the release zip (updater/update_dialog.cpp); Export Log writes one
 # (util/export_log.cpp).
 target_link_libraries(yuzu PRIVATE QuaZip::QuaZip)

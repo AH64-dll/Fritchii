@@ -232,8 +232,6 @@
     <property name="title">
      <string>&amp;Help</string>
     </property>
-    <addaction name="action_Export_Log"/>
-    <addaction name="separator"/>
     <addaction name="action_Report_Compatibility"/>
     <addaction name="action_Open_Mods_Page"/>
     <addaction name="action_Open_UserHandbook"/>
@@ -610,14 +608,6 @@
   <action name="action_Post_Processing_Shaders">
    <property name="text">
     <string>Post-Processing &amp;Shaders...</string>
-   </property>
-  </action>
-  <action name="action_Export_Log">
-   <property name="text">
-    <string>&amp;Export Log...</string>
-   </property>
-   <property name="toolTip">
-    <string>Save your log and a short PC summary as a zip to post in a Discord issue</string>
    </property>
   </action>
   <action name="action_Carousel_View">

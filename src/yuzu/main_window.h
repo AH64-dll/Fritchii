@@ -68,6 +68,9 @@ class ConfigurePostProcessing;
 enum class GameListOpenTarget;
 enum class DumpRomFSTarget;
 class GameListPlaceholder;
+namespace FritchiiUi {
+class Home;
+}
 
 class QtAmiiboSettingsDialog;
 class QtControllerSelectorDialog;
@@ -404,8 +407,10 @@ private slots:
     void OnOpenModFolder();
     void OnOpenLogFolder();
     void OnExportLog();
-    /// A critical error box with an "Export Log..." button next to OK.
+    /// A critical error box; Fritchii builds add an "Export Log..." button next to OK.
     void ShowErrorWithExportLog(const QString& title, const QString& text);
+    /// The Fritchii look (fritchii/main_window_fritchii.cpp); nothing in Lichii builds.
+    void SetUpFritchiiUi();
     void OnVerifyInstalledContents();
     void OnInstallFirmware();
     void OnInstallFirmwareFromZIP();
@@ -551,6 +556,7 @@ private:
 #endif
 
     GameListPlaceholder* game_list_placeholder = nullptr;
+    FritchiiUi::Home* fritchii_home = nullptr;
 
     std::vector<VkDeviceInfo::Record> vk_device_records;
 
