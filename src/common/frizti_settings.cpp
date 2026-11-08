@@ -35,6 +35,12 @@ std::vector<BasicSetting*> TunedSettings(Values& values) {
         &values.memory_layout_mode,       // 8 GB: Ocarina's own memory size
         &values.nvdec_emulation,          // GPU: Ocarina's cutscene videos
         &values.scaling_filter,           // ScaleForce (newer Lichii builds seed FSR)
+        &values.resolution_setup,         // 1x: a higher scale left over from other games costs fps
+        &values.anti_aliasing,            // FXAA
+        &values.cpu_accuracy,             // Auto
+        &values.use_disk_shader_cache,    // On: no shader rebuild every boot
+        &values.use_vulkan_driver_pipeline_cache, // On
+        &values.use_reactive_flushing,    // On
     };
 }
 
