@@ -265,7 +265,9 @@ public:
     /// CPU writes collected but not yet applied (SetPendingCpuWrites).
     [[nodiscard]] Common::RangeSet<DAddr> PendingCpuWriteRanges();
 
-    /// Writes downloaded bytes to guest memory, except over `cpu_written`.
+    /// Writes downloaded bytes to guest memory, except over `cpu_written`. Callers take
+    /// `cpu_written` inside a VideoCore::DownloadLanding over the bytes and write in it: the CPU
+    /// writes collected after it store their bytes once the landing has ended.
     void WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written, DAddr device_addr,
                                const u8* data, u64 size);
 
