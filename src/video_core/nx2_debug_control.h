@@ -158,6 +158,11 @@ inline std::atomic<int> g_idle_pause{-1};
 /// no GPU-written data (UploadNativeBank's upload, without its once-a-frame bank shadows: the
 /// check stays per bind, d79572d28a). Off by default; measure 1 and 2 first, then 4. Verify
 /// with EXP9=2 ("missed" stays 0) and the flash watch.
+/// EXP35 (guest writes of never-GPU-written cached pages, Core::Memory::HandleRasterizerWrite):
+/// 1 = collected for the split's back (applied at its next FlushCaching) instead of OnCPUWrite
+/// under both caches' mutexes. On by default (2026-11-08): Castle Town guest-core lock spinning
+/// 11.6% -> 7.6% of busy (writes 6.1% -> 0.7%), standing 43.0 -> 45.3 fps, route 45.0 fps with
+/// 175 flash reports (camera-motion noise ~270 either way).
 /// EXP27 (keep the split's back fed, fewer submits; zortos293/Lichii#717), bits: 1 = the front
 /// publishes before it yields or sleeps polling suspended channels (PUBLISH_WAITS,
 /// GpuSplit::PublishBeforeWait), 2 = while the back found the ring empty, each entry is published
@@ -281,6 +286,9 @@ inline void LoadExperiments() {
         // queued for the back (a reset there let a channel run before its producer). A strict
         // tightening: only met answers become the normal path.
         g_experiments[34].store(1, std::memory_order_relaxed);
+        // EXP35 = 1: guest writes of never-GPU-written cached pages collected for the back instead
+        // of OnCPUWrite under both caches' mutexes (see the EXP35 notes above).
+        g_experiments[35].store(1, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {

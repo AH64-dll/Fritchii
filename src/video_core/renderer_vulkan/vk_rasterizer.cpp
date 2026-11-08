@@ -1974,7 +1974,68 @@ bool RasterizerVulkan::HasCachedReports(DAddr addr, u64 size) {
     return query_cache.HasCachedReports(addr, size);
 }
 
+namespace {
+/// Guest reads and writes of cached memory (GetFlushArea, OnCPUWrite), logged every 5 s: the
+/// lock-free answers, the locked ones, and the locked reads that must flush.
+struct GuestAccessCounters {
+    std::atomic<u64> read_fast{};
+    std::atomic<u64> read_locked{};
+    std::atomic<u64> read_flush{};
+    std::atomic<u64> write_locked{};
+    std::atomic<s64> last_log{};
+};
+GuestAccessCounters g_guest_access;
+
+void CountGuestAccess(std::atomic<u64>& counter) {
+    counter.fetch_add(1, std::memory_order_relaxed);
+    auto& c = g_guest_access;
+    const u64 total = c.read_fast.load(std::memory_order_relaxed) +
+                      c.read_locked.load(std::memory_order_relaxed);
+    if ((total & 4095) != 0) {
+        return;
+    }
+    const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 last = c.last_log.load(std::memory_order_relaxed);
+    if (now - last < 5000 || !c.last_log.compare_exchange_strong(last, now)) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Guest access of cached memory (5 s): reads {} lock-free, {} locked ({} must "
+             "flush); writes {} locked, {} collected",
+             c.read_fast.exchange(0), c.read_locked.exchange(0), c.read_flush.exchange(0),
+             c.write_locked.exchange(0),
+             Tegra::g_nx2_guest_writes_collected.exchange(0, std::memory_order_relaxed));
+}
+} // Anonymous namespace
+
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
+    // A guest read of cached memory asked under both caches' mutexes, which the split's back holds
+    // through each draw: 12% of the guest cores' busy time at Castle Town went to waiting for
+    // them. Pages no image was ever registered on (page_filter) and that no GPU write ever marked
+    // (MayBeGpuModified, bits that never clear) need no look: neither cache finds anything there,
+    // and the locked path would answer this same preemptive page-aligned area.
+    const DAddr page_begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
+    const DAddr page_end = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE);
+    if (!texture_cache.page_filter.Any(addr, size) &&
+        !MayBeGpuModified(page_begin, page_end - page_begin)) {
+        CountGuestAccess(g_guest_access.read_fast);
+        return VideoCore::RasterizerDownloadArea{
+            .start_address = page_begin,
+            .end_address = page_end,
+            .preemtive = true,
+        };
+    }
+    const auto area = GetFlushAreaLocked(addr, size);
+    CountGuestAccess(g_guest_access.read_locked);
+    if (!area.preemtive) {
+        g_guest_access.read_flush.fetch_add(1, std::memory_order_relaxed);
+    }
+    return area;
+}
+
+VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushAreaLocked(DAddr addr, u64 size) {
     {
         std::scoped_lock lock{texture_cache.mutex};
         auto area = texture_cache.GetFlushArea(addr, size);
@@ -2063,6 +2124,7 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
 
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     DEBUG_ASSERT(addr != 0 || size != 0);
+    CountGuestAccess(g_guest_access.write_locked);
     {
         std::scoped_lock lock{buffer_cache.mutex};
         if (buffer_cache.OnCPUWrite(addr, size)) {

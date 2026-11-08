@@ -198,6 +198,11 @@ inline void Nx2ClearGpuWrittenPages() {
     return (g_nx2_gpu_written_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
 }
 
+/// Guest writes of cached pages no GPU write ever marked, collected for the split's back without
+/// OnCPUWrite's cache mutexes (EDEN_NX2_EXP35, Core::Memory::HandleRasterizerWrite); counted for
+/// RasterizerVulkan's guest access log.
+inline std::atomic<u64> g_nx2_guest_writes_collected{};
+
 /// Whether any page of the range may have been written by the GPU (zortos293/Lichii#463).
 [[nodiscard]] inline bool Nx2MayBeGpuWritten(u64 device_address, u64 size) {
     if (size == 0) {
