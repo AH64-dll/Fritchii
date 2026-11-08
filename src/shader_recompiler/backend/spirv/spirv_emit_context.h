@@ -169,6 +169,7 @@ struct CooperativeHmmaTypes {
     Id matrix_a{};
     Id matrix_b{};
     Id matrix_c{};
+    u32 rows{16}; ///< Rows of A and the accumulator
 };
 
 class EmitContext final : public Sirit::Module {

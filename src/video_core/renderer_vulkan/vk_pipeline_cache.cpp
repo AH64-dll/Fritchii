@@ -630,8 +630,13 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         device.IsCooperativeHmmaSupported() && TestCooperativeHmma(device);
     profile.support_cooperative_hmma_16x16x16 =
         !profile.support_cooperative_hmma && device.IsCooperativeHmma16x16x16Supported();
+    profile.support_cooperative_hmma_8x16x16 = !profile.support_cooperative_hmma &&
+                                               !profile.support_cooperative_hmma_16x16x16 &&
+                                               device.IsCooperativeHmma8x16x16Supported();
     if (profile.support_cooperative_hmma_16x16x16) {
         LOG_INFO(Render_Vulkan, "Guest tensor operations run on 16x16x16 cooperative matrices");
+    } else if (profile.support_cooperative_hmma_8x16x16) {
+        LOG_INFO(Render_Vulkan, "Guest tensor operations run on 8x16x16 cooperative matrices");
     }
 
     host_info = Shader::HostTranslateInfo{
