@@ -8,6 +8,8 @@
 
 #include <cstddef>
 #include <optional>
+#include <span>
+#include <string>
 
 #include <boost/container/small_vector.hpp>
 
@@ -242,11 +244,11 @@ public:
         });
     }
 
-    vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout) const {
+    VkPushConstantRange PushConstantRange() const {
         using Shader::Backend::SPIRV::RenderAreaLayout;
         using Shader::Backend::SPIRV::RescalingLayout;
         const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
-        const VkPushConstantRange range{
+        return VkPushConstantRange{
             .stageFlags = static_cast<VkShaderStageFlags>(
                 is_compute ? VK_SHADER_STAGE_COMPUTE_BIT
                            : (uses_mesh ? VK_SHADER_STAGE_ALL_GRAPHICS |
@@ -257,6 +259,50 @@ public:
             .size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
                     static_cast<u32>(sizeof(RenderAreaLayout)),
         };
+    }
+
+    /// Graphics pipeline libraries (EDEN_NX2_GPL): one set per stage, set index = stage index,
+    /// null where the stage has no descriptors or is not part of the library.
+    vk::PipelineLayout CreateIndependentPipelineLayout(
+        std::span<const VkDescriptorSetLayout> set_layouts, bool independent_sets) const {
+        const VkPushConstantRange range{PushConstantRange()};
+        return device->GetLogical().CreatePipelineLayout({
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = independent_sets ? static_cast<VkPipelineLayoutCreateFlags>(
+                                            VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT)
+                                      : VkPipelineLayoutCreateFlags{},
+            .setLayoutCount = static_cast<u32>(set_layouts.size()),
+            .pSetLayouts = set_layouts.data(),
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &range,
+        });
+    }
+
+    /// What CreateDescriptorSetLayout(false) is made of: two layouts with the same signature are
+    /// identically defined (a library's set layout and the linked pipeline's one).
+    std::string SetLayoutSignature() const {
+        std::string signature;
+        const auto add = [&signature](u32 value) {
+            signature.append(reinterpret_cast<const char*>(&value), sizeof(value));
+        };
+        add(device->IsDescriptorBindingPartiallyBoundSupported() ? 1u : 0u);
+        add(static_cast<u32>(bindings.size()));
+        for (const VkDescriptorSetLayoutBinding& entry : bindings) {
+            add(entry.binding);
+            add(static_cast<u32>(entry.descriptorType));
+            add(entry.descriptorCount);
+            add(static_cast<u32>(entry.stageFlags));
+        }
+        return signature;
+    }
+
+    [[nodiscard]] bool Empty() const noexcept {
+        return bindings.empty();
+    }
+
+    vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout) const {
+        const VkPushConstantRange range{PushConstantRange()};
         return device->GetLogical().CreatePipelineLayout({
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             .pNext = nullptr,
@@ -336,6 +382,16 @@ public:
             image_bit = 1u;
             ++image_ptr;
         }
+    }
+
+    /// Graphics pipeline libraries: the next texture and image bits are these (the fragment stage
+    /// starts at fixed ones, GPL_FRAGMENT_*_SCALING_BASE).
+    void Seek(u32 texture_index, u32 image_index) noexcept {
+        texture_ptr = words.data() + texture_index / 32;
+        texture_bit = 1u << (texture_index % 32);
+        image_ptr = words.data() + Shader::Backend::SPIRV::NUM_TEXTURE_SCALING_WORDS +
+                    image_index / 32;
+        image_bit = 1u << (image_index % 32);
     }
 
     const std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>& Data() const noexcept {

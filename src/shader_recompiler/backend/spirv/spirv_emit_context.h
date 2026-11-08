@@ -316,6 +316,7 @@ public:
     u32 rescaling_downfactor_member_index{};
     u32 texture_rescaling_index{};
     u32 image_rescaling_index{};
+    u32 descriptor_set{}; ///< Set of every resource of the stage (Bindings::descriptor_set)
 
     Id render_area_push_constant{};
     u32 render_are_member_index{};
