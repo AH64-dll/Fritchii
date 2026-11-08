@@ -302,6 +302,12 @@ private:
     /// was prepared in) whose answers hold for `env`. An entry without a pipeline otherwise.
     ComputePipelineCacheEntry CreatePrecompiledComputePipeline(const ComputePipelineCacheKey& key,
                                                                Shader::Environment& env);
+    /// EDEN_NX2_PRECOMPILED_FAST=2: the stages translated from the game's state as the normal
+    /// path would, on the GPU thread, compared with the kept SPIR-V and infos (true when they
+    /// are the same). The programs are translated and emitted once, into audit_pools.
+    bool AuditPrecompiled(const PrecompiledKept::Index& index, const PrecompiledKept::Record& record,
+                          std::span<Shader::Environment* const> envs, bool compute,
+                          const ComputePipelineCacheKey* compute_key);
     /// TickFrame: precompiled graphics pipelines whose build failed are dropped (their keys
     /// rejected), so their next draw translates them.
     void CheckPrecompiledBuilds();
@@ -324,6 +330,8 @@ private:
     std::unordered_set<u64> precompiled_rejected;
     /// GPU thread: precompiled graphics pipelines not built yet (checked by TickFrame).
     std::vector<GraphicsPipelineCacheKey> precompiled_pending;
+    /// EDEN_NX2_PRECOMPILED_FAST=2: the audit's own pools (nothing else holds IR in them).
+    std::unique_ptr<ShaderPools> audit_pools;
     /// GPU thread counts for the 10 s line (the worker builds count in an atomic).
     struct PrecompiledStats {
         u32 graphics{};

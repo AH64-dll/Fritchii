@@ -4190,7 +4190,87 @@ u32 UsedFormatTraits(std::span<const Shader::Info* const> infos) {
 }
 
 std::atomic<u32> precompiled_worker_builds{};
+std::atomic<u32> precompiled_audit_logged{};
 } // Anonymous namespace
+
+bool PipelineCache::AuditPrecompiled(const PrecompiledKept::Index& index,
+                                     const PrecompiledKept::Record& record,
+                                     std::span<Shader::Environment* const> envs, bool compute,
+                                     const ComputePipelineCacheKey* compute_key) {
+    const u64 key_hash = compute ? compute_key->Hash() : graphics_key.Hash();
+    const auto differ = [&](size_t stage, std::string_view what) {
+        if (precompiled_audit_logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_ERROR(Render_Vulkan,
+                      "Precompiled audit: {} pipeline {:016x} stage {}: {} differ from its "
+                      "translation of the game's state; not used, the normal path builds it",
+                      compute ? "compute" : "graphics", key_hash, stage, what);
+        }
+        return false;
+    };
+    // Pools of its own: nothing else on the GPU thread holds IR in them. The live programs are
+    // translated and emitted once here (EmitSPIRV changes the IR it emits); the normal path,
+    // when it runs after a difference, translates them again from scratch.
+    if (!audit_pools) {
+        audit_pools = std::make_unique<ShaderPools>();
+    }
+    audit_pools->ReleaseContents();
+    std::array<std::vector<u32>, Maxwell::MaxShaderStage> spirv;
+    std::array<std::vector<u8>, Maxwell::MaxShaderStage> infos;
+    try {
+        if (compute) {
+            ComputeKeep keep;
+            keep.translate_only = true;
+            [[maybe_unused]] const auto none =
+                CreateComputePipeline(*audit_pools, *compute_key, *envs[0], nullptr, false, true,
+                                      &keep);
+            spirv[0] = std::move(keep.spirv);
+            infos[0] = std::move(keep.info);
+        } else {
+            TranslationRecord translated;
+            translated.translate_only = true;
+            translated.keep_infos = true;
+            [[maybe_unused]] const auto none =
+                CreateGraphicsPipeline(*audit_pools, graphics_key, envs, nullptr, false, nullptr,
+                                       nullptr, false, &translated);
+            if (!translated.complete) {
+                return differ(0, "the pipeline (its translation failed)");
+            }
+            if (translated.libraries != ((record.flags & PrecompiledKept::FlagLibraries) != 0)) {
+                return differ(0, "the library split");
+            }
+            spirv = std::move(translated.spirv);
+            infos = std::move(translated.infos);
+        }
+    } catch (const std::exception& exception) {
+        return differ(0, exception.what());
+    }
+    std::vector<u8> kept_info;
+    std::vector<u32> kept_spirv;
+    for (size_t stage = 0; stage < spirv.size(); ++stage) {
+        const bool kept = record.spirv[stage] != PrecompiledKept::NoBlob;
+        if (kept != !spirv[stage].empty()) {
+            return differ(stage, "the stages");
+        }
+        if (!kept) {
+            continue;
+        }
+        if (!index.ReadInfoBytes(record.infos[stage], kept_info) ||
+            !index.ReadSpirv(record.spirv[stage], kept_spirv)) {
+            return differ(stage, "the kept files (unreadable)");
+        }
+        if (kept_info != infos[stage]) {
+            return differ(stage, "the infos");
+        }
+        if (kept_spirv != spirv[stage]) {
+            const auto [mismatch, unused] = std::ranges::mismatch(kept_spirv, spirv[stage]);
+            return differ(stage, fmt::format("the SPIR-V words ({} kept, {} translated, first at "
+                                             "word {})",
+                                             kept_spirv.size(), spirv[stage].size(),
+                                             std::distance(kept_spirv.begin(), mismatch)));
+        }
+    }
+    return true;
+}
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeline() {
     const int mode = PrecompiledFastMode();
@@ -4296,7 +4376,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
         return nullptr;
     }
     const auto checked = std::chrono::steady_clock::now();
-    const auto audit_end = checked;
+    if (mode == 2) {
+        ++precompiled_stats.audited;
+        if (!AuditPrecompiled(*index, *matched, live, false, nullptr)) {
+            ++precompiled_stats.audit_differ;
+            precompiled_rejected.insert(hash);
+            NotePrecompiledMiss("audit differed");
+            return nullptr;
+        }
+    }
+    const auto audit_end = std::chrono::steady_clock::now();
     // The worker builds the SPIR-V the preparation kept: this build's translation of the
     // recorded environments, which the check found to give the game state's.
     GraphicsPipeline::EmitStagesFunc emit_stages =
@@ -4401,7 +4490,17 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
         return {};
     }
     const auto checked = std::chrono::steady_clock::now();
-    const auto audit_end = checked;
+    if (mode == 2) {
+        ++precompiled_stats.audited;
+        Shader::Environment* const env_ptr = &env;
+        if (!AuditPrecompiled(*index, *matched, std::span(&env_ptr, 1), true, &key)) {
+            ++precompiled_stats.audit_differ;
+            precompiled_rejected.insert(hash);
+            NotePrecompiledMiss("audit differed");
+            return {};
+        }
+    }
+    const auto audit_end = std::chrono::steady_clock::now();
     auto make_module = [this, index, blob = matched->spirv[0], shader = key.unique_hash] {
         std::vector<u32> words;
         if (!index->ReadSpirv(blob, words)) {
@@ -4502,6 +4601,13 @@ void PipelineCache::ReportPrecompiled() {
                  stats.failed, stats.not_precompiled, misses.empty() ? "none" : misses,
                  bytes / 1024,
                  index ? static_cast<double>(index->MemoryBytes()) / (1024.0 * 1024.0) : 0.0);
+        if (PrecompiledFastMode() == 2) {
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled audit in the last 10 s (EDEN_NX2_PRECOMPILED_FAST=2): {} "
+                     "compared with their translation of the game's state, {} differ (never "
+                     "used, built by the normal path)",
+                     stats.audited, stats.audit_differ);
+        }
     }
     stats.graphics = stats.compute = stats.failed = stats.not_precompiled = 0;
     stats.audited = stats.audit_differ = 0;
