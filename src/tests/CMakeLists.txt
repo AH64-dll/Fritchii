@@ -182,7 +182,9 @@ endif()
 
 add_executable(update_checker_tests
     common/update_checker.cpp
-    ../frontend_common/update_checker.cpp)
+    common/update_installer.cpp
+    ../frontend_common/update_checker.cpp
+    ../frontend_common/update_installer.cpp)
 target_link_libraries(update_checker_tests PRIVATE common Catch2::Catch2WithMain)
 add_test(NAME update_checker_tests COMMAND update_checker_tests)
 

@@ -40,7 +40,7 @@
 #ifdef ENABLE_UPDATE_CHECKER
 #include <QFuture>
 #include <QFutureWatcher>
-#include "common/net/net.h"
+#include "frontend_common/update_checker.h"
 #endif
 
 class QtConfig;
@@ -450,6 +450,7 @@ private slots:
 
 #ifdef ENABLE_UPDATE_CHECKER
     void OnEmulatorUpdateAvailable();
+    void OnCheckForUpdates();
 #endif
 
 private:
@@ -507,8 +508,14 @@ private:
     std::shared_ptr<InputCommon::InputSubsystem> input_subsystem;
 
 #ifdef ENABLE_UPDATE_CHECKER
-    QFuture<std::optional<Common::Net::Release>> update_future;
-    QFutureWatcher<std::optional<Common::Net::Release>> update_watcher;
+    void StartUpdateCheck(bool manual);
+    void ShowUpdate(const UpdateChecker::CheckResult& result);
+
+    QFuture<UpdateChecker::CheckResult> update_future;
+    QFutureWatcher<UpdateChecker::CheckResult> update_watcher;
+    bool update_check_manual = false;
+    // An update found while a game runs, offered once it stops.
+    std::optional<UpdateChecker::CheckResult> pending_update;
 #endif
 
     MultiplayerState* multiplayer_state = nullptr;
