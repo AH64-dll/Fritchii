@@ -24,10 +24,13 @@
 namespace Common::Nx2Timeline {
 namespace {
 
+using ArgSet = std::array<Arg, MaxArgs>;
+
 struct Event {
     u64 begin;
     u64 duration;
     const char* name;
+    u32 args; ///< 1 + the index of the event's args in its buffer's arg chunks; 0 = none
 };
 
 // At most this many spans per thread and recording (the GPU threads make ~200,000 a second,
@@ -42,6 +45,9 @@ struct ThreadBuffer {
     std::mutex mutex;
     std::vector<std::vector<Event>> chunks;
     size_t count{};
+    // The args of the events that have any, chunked like the events (drains carry them).
+    std::vector<std::vector<ArgSet>> arg_chunks;
+    size_t arg_count{};
     u64 thread_id{};
     std::string name;
 
@@ -55,9 +61,24 @@ struct ThreadBuffer {
         chunks.back().push_back(event);
         ++count;
     }
+    /// Stores `args` and returns the Event::args slot that refers to them.
+    [[nodiscard]] u32 PushArgs(const ArgSet& args) {
+        if (arg_chunks.empty() || arg_chunks.back().size() == ChunkEvents) {
+            arg_chunks.emplace_back().reserve(ChunkEvents);
+        }
+        arg_chunks.back().push_back(args);
+        ++arg_count;
+        return static_cast<u32>(arg_count);
+    }
+    [[nodiscard]] ArgSet& ArgsOf(const Event& event) {
+        const size_t index = event.args - 1;
+        return arg_chunks[index / ChunkEvents][index % ChunkEvents];
+    }
     void Clear() {
         chunks.clear();
         count = 0;
+        arg_chunks.clear();
+        arg_count = 0;
     }
 };
 // Spans of the same name closer than this merge into one.
@@ -69,6 +90,11 @@ std::atomic<bool> g_running{false};
 std::mutex g_last_mutex;
 std::string g_last_file;
 u64 g_start_ns{};
+// For merging with an ETW trace recorded on the performance counter clock (tools/nx2/
+// critical_path.py, round 2): the counter read right after g_start_ns, and its frequency. An ETW
+// event at counter value q is at (q - g_start_qpc) * 1e6 / g_qpc_frequency us on the timeline.
+s64 g_start_qpc{};
+s64 g_qpc_frequency{};
 
 thread_local std::shared_ptr<ThreadBuffer> t_buffer;
 
@@ -129,7 +155,17 @@ void Write(const std::filesystem::path& path, double seconds) {
         std::scoped_lock lock{g_registry_mutex};
         buffers = g_buffers;
     }
-    std::string json = "{\"displayTimeUnit\":\"ms\",\"traceEvents\":[\n";
+    // otherData (ignored by trace viewers): the clock, for merging an ETW trace (g_start_qpc).
+#ifdef _WIN32
+    const u64 process_id = GetCurrentProcessId();
+#else
+    const u64 process_id = 0;
+#endif
+    std::string json = fmt::format(
+        "{{\"displayTimeUnit\":\"ms\",\"otherData\":{{\"clock\":\"steady_clock\","
+        "\"start_ns\":{},\"qpc_start\":{},\"qpc_frequency\":{},\"process_id\":{},"
+        "\"seconds\":{:.3f}}},\"traceEvents\":[\n",
+        g_start_ns, g_start_qpc, g_qpc_frequency, process_id, seconds);
     size_t total = 0;
     bool first = true;
     const auto comma = [&] {
@@ -140,11 +176,14 @@ void Write(const std::filesystem::path& path, double seconds) {
     };
     for (const auto& buffer : buffers) {
         std::vector<std::vector<Event>> chunks;
+        std::vector<std::vector<ArgSet>> arg_chunks;
         size_t count{};
         {
             std::scoped_lock lock{buffer->mutex};
             chunks.swap(buffer->chunks);
             count = std::exchange(buffer->count, 0);
+            arg_chunks.swap(buffer->arg_chunks);
+            buffer->arg_count = 0;
         }
         if (count == 0) {
             continue;
@@ -172,6 +211,20 @@ void Write(const std::filesystem::path& path, double seconds) {
             } else {
                 json += R"(,"s":"t")";
             }
+            if (event.args != 0) {
+                const size_t slot = event.args - 1;
+                const ArgSet& args = arg_chunks[slot / ChunkEvents][slot % ChunkEvents];
+                json += R"(,"args":{)";
+                bool first_arg = true;
+                for (const Arg& arg : args) {
+                    if (arg.key == nullptr) {
+                        continue;
+                    }
+                    json += fmt::format(R"({}"{}":{})", first_arg ? "" : ",", arg.key, arg.value);
+                    first_arg = false;
+                }
+                json += '}';
+            }
             json += '}';
         }
         total += count;
@@ -196,7 +249,9 @@ u64 Now() {
                                 .count());
 }
 
-void Record(const char* name, u64 begin_ns, u64 end_ns) {
+namespace {
+
+void RecordSpan(const char* name, u64 begin_ns, u64 end_ns, const ArgSet* args) {
     ThreadBuffer& buffer = Buffer();
     std::scoped_lock lock{buffer.mutex};
     if (!Active()) {
@@ -205,25 +260,56 @@ void Record(const char* name, u64 begin_ns, u64 end_ns) {
     if (Event* const last = buffer.Last()) {
         const u64 last_end = last->begin + last->duration;
         if (last->name == name && last->duration != 0 && begin_ns >= last_end &&
-            begin_ns - last_end < MergeGapNs) {
+            begin_ns - last_end < MergeGapNs && (last->args != 0) == (args != nullptr)) {
             last->duration = end_ns - last->begin;
+            if (args != nullptr) {
+                ArgSet& kept = buffer.ArgsOf(*last);
+                for (size_t i = 0; i < MaxArgs; ++i) {
+                    kept[i].value = (std::max)(kept[i].value, (*args)[i].value);
+                }
+            }
             return;
         }
     }
     if (buffer.count < MaxEvents) {
-        buffer.Push({begin_ns, (std::max)(end_ns - begin_ns, u64{1}), name});
+        const u32 slot = args != nullptr ? buffer.PushArgs(*args) : 0;
+        buffer.Push({begin_ns, (std::max)(end_ns - begin_ns, u64{1}), name, slot});
     }
 }
 
-void Instant(const char* name) {
+void RecordInstant(const char* name, const ArgSet* args) {
     if (!Active()) {
         return;
     }
     ThreadBuffer& buffer = Buffer();
     std::scoped_lock lock{buffer.mutex};
     if (buffer.count < MaxEvents && Active()) {
-        buffer.Push({Now(), 0, name});
+        const u32 slot = args != nullptr ? buffer.PushArgs(*args) : 0;
+        buffer.Push({Now(), 0, name, slot});
     }
+}
+
+} // Anonymous namespace
+
+void Record(const char* name, u64 begin_ns, u64 end_ns) {
+    RecordSpan(name, begin_ns, end_ns, nullptr);
+}
+
+void Record(const char* name, u64 begin_ns, u64 end_ns, Arg a, Arg b, Arg c) {
+    const ArgSet args{a, b, c};
+    RecordSpan(name, begin_ns, end_ns, &args);
+}
+
+void Instant(const char* name) {
+    RecordInstant(name, nullptr);
+}
+
+void Instant(const char* name, Arg a, Arg b, Arg c) {
+    if (!Active()) {
+        return;
+    }
+    const ArgSet args{a, b, c};
+    RecordInstant(name, &args);
 }
 
 bool Start(const std::filesystem::path& path, double seconds, bool detail) {
@@ -239,6 +325,16 @@ bool Start(const std::filesystem::path& path, double seconds, bool detail) {
         }
     }
     g_start_ns = Now();
+#ifdef _WIN32
+    {
+        LARGE_INTEGER counter{};
+        LARGE_INTEGER frequency{};
+        QueryPerformanceCounter(&counter);
+        QueryPerformanceFrequency(&frequency);
+        g_start_qpc = static_cast<s64>(counter.QuadPart);
+        g_qpc_frequency = static_cast<s64>(frequency.QuadPart);
+    }
+#endif
     g_detail.store(detail, std::memory_order_relaxed);
     g_active.store(true, std::memory_order_release);
     LOG_INFO(Debug, "Timeline: recording {:.1f} s", seconds);

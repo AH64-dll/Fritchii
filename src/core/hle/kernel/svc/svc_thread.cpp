@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <thread>
 
+#include "common/nx2_timeline.h"
 #include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -189,6 +190,18 @@ void SleepThread(Core::System& system, s64 ns) {
 
     // When the input tick is positive, sleep.
     if (ns > 0) {
+        // The timeline marks Ocarina of Time's present poll sleeps: a timer wait for the GPU's
+        // event, not guest work (tools/nx2/critical_path.py). Recorded on the host thread the
+        // guest thread resumes on.
+        const bool poll_span =
+            Common::Nx2Timeline::Active() && IsNx2OotPresentPollSleep(system, ns);
+        const u64 poll_begin = poll_span ? Common::Nx2Timeline::Now() : 0;
+        SCOPE_EXIT {
+            if (poll_span) {
+                Common::Nx2Timeline::Record("OoT: present poll sleep", poll_begin,
+                                            Common::Nx2Timeline::Now());
+            }
+        };
         // Ocarina of Time's present poll waits for the GPU's write instead (EXP24, off by default).
         if (SleepNx2OotPresentPoll(system, ns)) {
             return;

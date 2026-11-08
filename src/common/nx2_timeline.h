@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <filesystem>
 #include <string>
@@ -33,11 +34,31 @@ inline std::atomic<bool> g_detail{false};
 /// Nanoseconds on the clock the spans use.
 [[nodiscard]] u64 Now();
 
+/// A named number on a span or marker, written as the event's args: a command list's sequence
+/// number, a syncpoint value, a GPU tick, how far behind the back was. `key` must be a literal;
+/// an Arg without a key is not written.
+struct Arg {
+    constexpr Arg() = default;
+    template <typename T>
+    constexpr Arg(const char* key_, T value_) : key{key_}, value{static_cast<s64>(value_)} {}
+
+    const char* key{};
+    s64 value{};
+};
+inline constexpr size_t MaxArgs = 3;
+
 /// Records a span on the calling thread. `name` must outlive the recording (a literal).
 void Record(const char* name, u64 begin_ns, u64 end_ns);
 
+/// The same with args. Consecutive spans of one name still merge: the merged span keeps each
+/// arg's largest value (the deepest phase of a wait, the furthest a drain was behind).
+void Record(const char* name, u64 begin_ns, u64 end_ns, Arg a, Arg b = {}, Arg c = {});
+
 /// Records a zero-length marker on the calling thread.
 void Instant(const char* name);
+
+/// The same with args (markers never merge).
+void Instant(const char* name, Arg a, Arg b = {}, Arg c = {});
 
 /// Starts a recording of `seconds` written to `path` (`detail`: the fine-grained spans too).
 /// False if one is already running.
@@ -68,6 +89,41 @@ private:
     const char* name;
     bool on;
     u64 begin{};
+};
+
+/// A Span with args. Values known only at its end (which phase a wait reached) are set with Set.
+class ArgSpan {
+public:
+    explicit ArgSpan(const char* name_, Arg a = {}, Arg b = {}, Arg c = {})
+        : name{name_}, on{Active()}, args{a, b, c} {
+        if (on) {
+            begin = Now();
+        }
+    }
+    ~ArgSpan() {
+        if (on) {
+            Record(name, begin, Now(), args[0], args[1], args[2]);
+        }
+    }
+    ArgSpan(const ArgSpan&) = delete;
+    ArgSpan& operator=(const ArgSpan&) = delete;
+
+    /// Replaces arg `index` (below MaxArgs).
+    void Set(size_t index, Arg arg) {
+        if (on && index < MaxArgs) {
+            args[index] = arg;
+        }
+    }
+
+    [[nodiscard]] bool On() const {
+        return on;
+    }
+
+private:
+    const char* name;
+    bool on;
+    u64 begin{};
+    std::array<Arg, MaxArgs> args;
 };
 
 } // namespace Common::Nx2Timeline

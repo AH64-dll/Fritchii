@@ -14,6 +14,7 @@
 #include <vector>
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/nx2_timeline.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/nvdrv/core/container.h"
@@ -496,6 +497,13 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
     u32 increment{(flags.fence_increment.Value() != 0 ? 2 : 0) +
                   (flags.increment_value.Value() != 0 ? params.fence.value : 0)};
     params.fence.value = syncpoint_manager.IncrementSyncpointMaxExt(channel_syncpoint, increment);
+    // The syncpoint value this submission's fence reaches, which the guest's event waits name;
+    // the lists it sends are PushCommand's "submit list" markers right after.
+    if (Common::Nx2Timeline::Active()) {
+        Common::Nx2Timeline::Instant("guest: submit gpfifo", {"syncpoint", channel_syncpoint},
+                                     {"value", params.fence.value},
+                                     {"entries", entries.command_lists.size()});
+    }
     gpu.PushGPUEntries(bind_id, std::move(entries));
 
     if (g_nx2_driver && !flags.fence_increment.Value() && increment > 0) {

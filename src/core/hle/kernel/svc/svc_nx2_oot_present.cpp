@@ -178,6 +178,7 @@ struct PresentPollState {
     bool build_id_logged = false;
 
     std::atomic<KernelCore*> kernel{};
+    std::atomic<bool> listener_set{}; // OnGpuWrite is installed (EXP24 = 1 or 3 found the site)
     KThread* waiter{}; // the thread in the wait; guarded by the scheduler lock
     std::atomic<bool> has_waiter{};
     // Set by the waker under the scheduler lock before it ends the wait; read by the woken thread.
@@ -548,7 +549,6 @@ u64 SiteReturnAddress(Core::System& system, KProcess& process) {
     state.sleep_call_word = sleep_call;
     state.get_value_call_word = get_value_call;
     state.kernel.store(std::addressof(system.Kernel()), std::memory_order_release);
-    Common::Nx2GpuWrite::SetListener(&OnGpuWrite);
     return state.site_return;
 }
 
@@ -996,6 +996,23 @@ void MaybeLog(PresentPollState& state, s64 now, int mode) {
 
 } // Anonymous namespace
 
+bool IsNx2OotPresentPollSleep(Core::System& system, s64 ns) {
+    if (ns <= 0 || ns > MaxPollSleepNs) {
+        return false;
+    }
+    auto& kernel = system.Kernel();
+    auto& process = GetCurrentProcess(kernel);
+    if (!process.Is64Bit() || process.GetProgramId() != OotProgramId) {
+        return false;
+    }
+    const u64 site_return = SiteReturnAddress(system, process);
+    if (site_return == 0) {
+        return false;
+    }
+    Svc::ThreadContext ctx{};
+    return ReadContext(kernel, process, ctx) && CalledFromSite(process, ctx, site_return);
+}
+
 bool SleepNx2OotPresentPoll(Core::System& system, s64 ns) {
     if (ns <= 0 || ns > MaxPollSleepNs) {
         return false;
@@ -1019,12 +1036,16 @@ bool SleepNx2OotPresentPoll(Core::System& system, s64 ns) {
     if (site_return == 0) {
         return false;
     }
+    // Here, not in SiteReturnAddress: IsNx2OotPresentPollSleep finds the site too, without EXP24.
+    PresentPollState& state = PollState();
+    if (!state.listener_set.exchange(true, std::memory_order_acq_rel)) {
+        Common::Nx2GpuWrite::SetListener(&OnGpuWrite);
+    }
     Svc::ThreadContext ctx{};
     if (!ReadContext(kernel, process, ctx) || !CalledFromSite(process, ctx, site_return)) {
         return false;
     }
 
-    PresentPollState& state = PollState();
     {
         std::scoped_lock lk{state.poll_mutex};
         const s64 start = kernel.HardwareTimer().GetTick();

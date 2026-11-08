@@ -247,7 +247,7 @@ public:
                 Flush();
             }
             VideoCommon::BackWaitScope wait_scope{"Scheduler::Wait (host GPU execution)"};
-            Common::Nx2Timeline::Span timeline_span{"wait for host GPU"};
+            Common::Nx2Timeline::ArgSpan timeline_span{"wait for host GPU", {"tick", tick}};
             master_semaphore->Wait(tick);
         }
         const auto trace_waited = trace ? std::chrono::steady_clock::now()

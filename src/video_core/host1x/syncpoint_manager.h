@@ -70,8 +70,10 @@ public:
     }
 
 private:
+    /// `timeline_name`: the Nx2Timeline marker of the increment (a literal), with the id.
     void Increment(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv,
-                   std::list<RegisteredAction>& action_storage);
+                   std::list<RegisteredAction>& action_storage, const char* timeline_name,
+                   u32 syncpoint_id);
 
     ActionHandle RegisterAction(std::atomic<u32>& syncpoint,
                                 std::list<RegisteredAction>& action_storage, u32 expected_value,
