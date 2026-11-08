@@ -217,6 +217,12 @@ inline void LoadExperiments() {
         // ms per frame; route with EXP9=2 verify: 0 missed pages, no added flash reports. Bit 4
         // (snapshot uploads) stays off until measured.
         g_experiments[26].store(3, std::memory_order_relaxed);
+        // EXP24 = 3: Ocarina of Time's frame-end poll (main+0x570520, verified per build) sleeps
+        // 250 us instead of 1 ms between checks. The event it waits for is not set by a GPU
+        // write we see, so a wake-up (EXP24=1) can't help; ~400 frames per 10 s found it only
+        // after a full 1 ms sleep. Castle Town toggle, 4 balanced cycles: 45.9 -> 46.7 fps
+        // (3 of 4 pairs positive). Other games and builds: untouched.
+        g_experiments[24].store(3, std::memory_order_relaxed);
         // EXP29 = 6: the exact parts of #717's micro bundle (TickWork's lock-free check, native
         // compute inline uploads not recorded); 1 (memory usage reuse) changes what the caches'
         // GC sees and stays off.
