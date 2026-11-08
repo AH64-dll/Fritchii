@@ -452,6 +452,9 @@ private slots:
     void OnEmulationStopped();
     void OnEmulationStopTimeExpired();
     void OnEmulationStopTimeout();
+    /// True while the emulation thread's teardown still makes progress (Common::ShutdownProgress
+    /// moved since the last call), for at most MaxEmuThreadShutdownMs after it was asked to stop.
+    bool EmulationShutdownProgressing();
 
 #ifdef ENABLE_UPDATE_CHECKER
     void OnEmulatorUpdateAvailable();
@@ -536,6 +539,8 @@ private:
     LoadingScreen* loading_screen = nullptr;
     QTimer shutdown_timer;
     QTimer emu_terminate_timer;
+    QElapsedTimer emu_force_stop_clock;
+    u64 shutdown_progress_seen{};
     OverlayDialog* shutdown_dialog{};
     PerformanceOverlay* perf_overlay = nullptr;
 #ifdef HAS_RESHADE
