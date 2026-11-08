@@ -348,6 +348,7 @@ u32 Maxwell3D::ProcessShadowRam(u32 method, u32 argument) {
 }
 
 void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
+    const VideoCommon::Nx2Profile::FineScope profile_scope{VideoCommon::Nx2Profile::Zone::Sink};
     const auto control = shadow_state.shadow_ram_control;
     // Sunk methods are state writes only (not in execution_mask): skip unchanged values, as
     // CallMethod does.
@@ -703,6 +704,7 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
         }
         ProcessDirtyRegisters(methods[i], ProcessShadowRam(methods[i], arguments[i]));
     }
+    const VideoCommon::Nx2Profile::FineScope upload_scope{VideoCommon::Nx2Profile::Zone::CbUpload};
     memory_manager.WriteWordsCached(address + offset, values.data(), count);
     regs.const_buffer.offset += static_cast<u32>(bytes);
 }
@@ -866,6 +868,8 @@ void Maxwell3D::StampQueryResult(Core::System& system, u64 payload, bool long_qu
 }
 
 void Maxwell3D::ProcessQueryGet() {
+    const VideoCommon::Nx2Profile::FineScope profile_scope{
+        VideoCommon::Nx2Profile::Zone::QueryReport};
     VideoCommon::QueryPropertiesFlags flags{};
     if (regs.report_semaphore.query.short_query == 0) {
         flags |= VideoCommon::QueryPropertiesFlags::HasTimeout;
@@ -900,6 +904,8 @@ void Maxwell3D::ProcessQueryGet() {
 }
 
 void Maxwell3D::ProcessQueryCondition() {
+    const VideoCommon::Nx2Profile::FineScope profile_scope{
+        VideoCommon::Nx2Profile::Zone::RenderEnable};
     if (rasterizer->AccelerateConditionalRendering()) {
         execute_on = true;
         return;
@@ -966,6 +972,8 @@ void Maxwell3D::ProcessQueryCondition() {
 }
 
 void Maxwell3D::ProcessCounterReset() {
+    const VideoCommon::Nx2Profile::FineScope profile_scope{
+        VideoCommon::Nx2Profile::Zone::CounterReset};
     const auto query_type = [clear_report = regs.clear_report_value]() {
         switch (clear_report) {
         case Tegra::Engines::Maxwell3D::Regs::ClearReport::ZPassPixelCount:
@@ -994,6 +1002,7 @@ void Maxwell3D::ProcessSyncPoint() {
 }
 
 void Maxwell3D::ProcessCBBind(size_t stage_index) {
+    const VideoCommon::Nx2Profile::FineScope profile_scope{VideoCommon::Nx2Profile::Zone::CbBind};
     // Bind the buffer currently in CB_ADDRESS to the specified index in the desired shader
     // stage.
     const auto& bind_data = regs.bind_groups[stage_index];
@@ -1022,6 +1031,7 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
 }
 
 void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
+    const VideoCommon::Nx2Profile::FineScope profile_scope{VideoCommon::Nx2Profile::Zone::CbUpload};
     // Write the input value to the current const buffer at the current position.
     const GPUVAddr buffer_address = regs.const_buffer.Address();
     ASSERT(buffer_address != 0);
@@ -2508,6 +2518,7 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
 }
 
 void Maxwell3D::FinishFrontMacro(Core::System& system) {
+    const VideoCommon::Nx2Profile::FineScope profile_scope{VideoCommon::Nx2Profile::Zone::MacroEnd};
     // What ProcessMacro and CallMacroMethod do around the macro.
     ConsumeSink(system);
     draw_manager.DrawDeferred(*this);

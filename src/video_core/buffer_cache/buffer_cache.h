@@ -744,7 +744,13 @@ void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
 
 template <class P>
 void BufferCache<P>::BindHostStageBuffers(size_t stage) {
-    BindHostGraphicsUniformBuffers(stage);
+    {
+        const Nx2Profile::FineScope uniform_scope{Nx2Profile::Zone::UniformBuffers};
+        BindHostGraphicsUniformBuffers(stage);
+    }
+    Nx2Profile::AddFine(
+        Nx2Profile::FineCounter::StorageBinds,
+        static_cast<u64>(std::popcount(channel_state->enabled_storage_buffers[stage])));
     if (channel_state->enabled_storage_buffers[stage] != 0) {
         BindHostGraphicsStorageBuffers(stage);
     }
@@ -1533,6 +1539,8 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         channel_state->fast_bound_uniform_buffers[stage] |= 1u << binding_index;
         channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
+        Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformOther, 1);
+        Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformBytes, size);
         return;
     }
     const Binding& binding = channel_state->uniform_buffers[stage][index];
@@ -1703,6 +1711,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             }
         }
     }
+    Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformBytes, size);
     if (use_fast_buffer) {
         if constexpr (IS_OPENGL) {
             if (runtime.HasFastBufferSubData()) {
@@ -1718,6 +1727,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                 }
                 const auto span = ImmediateBufferWithData(device_addr, size);
                 runtime.PushFastUniformBuffer(stage, binding_index, span);
+                Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformOther, 1);
                 return;
             }
         }
@@ -1731,17 +1741,30 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             // EDEN_NX2_UBOREUSE=0 turns it off. EDEN_NX2_EXP17=1: any stage or slot's copy of
             // the same range is bound again too.
             if (VideoCommon::UniformStreamReuseEnabled()) {
+                // TEST: rebinds counted (EDEN_NX2_GPU_PROFILE=2).
+                const u64 rebinds =
+                    VideoCommon::UniformStreamReuseState<typename Runtime::StreamUniformRef>()
+                        .rebinds;
                 streamed = VideoCommon::BindSmallUniformReusing(
                     runtime, device_memory, stage, index, binding_index, device_addr, size,
                     VideoCore::Nx2Debug::Experiment(17) != 0);
+                const u64 rebound =
+                    VideoCommon::UniformStreamReuseState<typename Runtime::StreamUniformRef>()
+                        .rebinds -
+                    rebinds;
+                Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformRebinds, rebound);
+                Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformStreamed,
+                                    streamed ? 1 - rebound : 0);
             }
         }
         if (!streamed) {
             const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
             device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+            Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformStreamed, 1);
         }
         return;
     }
+    Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformCached, 1);
     // Classic cached path
     if (SynchronizeBuffer(buffer, device_addr, size)) {
         ++channel_state->uniform_cache_hits[0];

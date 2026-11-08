@@ -119,6 +119,7 @@ public:
     std::array<u8, NumSets> mru{}; ///< per set: the way used last
     std::unique_ptr<u8[]> bytes;   ///< MaxBytes per copy
     std::array<u8, MaxBytes> scratch{};
+    u64 rebinds{}; ///< TEST: allocations bound again (EDEN_NX2_GPU_PROFILE=2 counts them)
 };
 
 template <class Ref>
@@ -175,6 +176,7 @@ template <class Runtime, class DeviceMemory>
     const auto rebind = [&](size_t copy_index) {
         const typename Reuse::Copy& copy = reuse.copies[copy_index];
         runtime.RebindStreamUniform(copy.ref, size);
+        ++reuse.rebinds;
         slot = typename Reuse::Slot{static_cast<u32>(copy_index), copy.serial};
         return true;
     };

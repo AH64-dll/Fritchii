@@ -889,15 +889,18 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
-        buffer_cache.UnbindGraphicsStorageBuffers(stage);
-        if constexpr (Spec::has_storage_buffers) {
-            size_t ssbo_index{};
-            for (const auto& desc : info.storage_buffers_descriptors) {
-                ASSERT(desc.count == 1);
-                buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
-                                                       desc.cbuf_offset, desc.is_written,
-                                                       desc.indirect_offset);
-                ++ssbo_index;
+        {
+            const Profile::FineScope storage_scope{Profile::Zone::StorageBindings};
+            buffer_cache.UnbindGraphicsStorageBuffers(stage);
+            if constexpr (Spec::has_storage_buffers) {
+                size_t ssbo_index{};
+                for (const auto& desc : info.storage_buffers_descriptors) {
+                    ASSERT(desc.count == 1);
+                    buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
+                                                           desc.cbuf_offset, desc.is_written,
+                                                           desc.indirect_offset);
+                    ++ssbo_index;
+                }
             }
         }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
@@ -1052,6 +1055,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             config_stage(4);
         }
     }
+    Profile::AddFine(Profile::FineCounter::TextureHandles, views.size());
     ASSERT(views.size() == num_image_elements);
     mark();
     // EXP32: a hit takes the ids (here) and the descriptors (prepare_stage) of the pipeline's
@@ -1232,6 +1236,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
+        const Profile::FineScope geometry_scope{Profile::Zone::GeometryBuffers};
         buffer_cache.BindHostGeometryBuffers(is_indexed);
     }
     mark();
