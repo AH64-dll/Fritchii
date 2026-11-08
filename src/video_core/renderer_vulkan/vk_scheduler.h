@@ -68,6 +68,10 @@ public:
     bool DeferFlush();
     /// Submits deferred work (the split's back, from its idle hook).
     void FlushDeferred();
+    /// The split's back (EDEN_NX2_EXP27 & 8, zortos293/Lichii#717 DISPATCH_BATCH): the work so
+    /// far goes with the next submission, when the back goes idle or when another thread waits
+    /// for it (WaitSubmitted), with no time window. False on other threads (the caller submits).
+    bool DeferFlushUntilWanted();
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
     /// submit deferred work (logged every 2 s while it waits). False only when the back thread
     /// is not running, so nothing will submit it: the caller then submits it itself.

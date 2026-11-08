@@ -1848,8 +1848,17 @@ void RasterizerVulkan::FlushAll() {}
 void RasterizerVulkan::SubmitNx2ListCopies(u64 writer) {
     // Submitted at once: ReadGpuWrittenCommands waits on these copies, so they can't sit out
     // the longer DeferFlush interval (#161).
-    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick(), writer) &&
-        (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush) || !scheduler.DeferFlush())) {
+    if (!buffer_cache.Nx2CopyListPages(scheduler.CurrentTick(), writer)) {
+        return;
+    }
+    // EDEN_NX2_EXP27 & 8 (zortos293/Lichii#717 DISPATCH_BATCH): the front reads few of the lists
+    // (Ocarina: ~150 dispatches a frame, a submission each), so the copies go when it waits for
+    // one (BufferCacheRuntime::WaitSubmittedTick asks the back), when the back goes idle, or
+    // with the next submission.
+    if ((VideoCore::Nx2Debug::Experiment(27) & 8) != 0 && scheduler.DeferFlushUntilWanted()) {
+        return;
+    }
+    if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush) || !scheduler.DeferFlush()) {
         scheduler.Flush();
     }
 }
