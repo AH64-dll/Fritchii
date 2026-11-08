@@ -19,6 +19,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include "common/container/unordered_map.h"
 #include <vector>
@@ -330,6 +331,11 @@ private:
     /// GPU thread builds them.
     std::unordered_set<u64> failed_disk_pipelines;
     std::mutex failed_disk_pipelines_mutex;
+    /// Disk cache records the translation rejected since the last report: the first few are
+    /// logged, the rest counted (ReportDiskRecordFailures, after the boot and background builds).
+    std::atomic<size_t> disk_record_failures{};
+    void NoteDiskRecordFailure(std::string_view kind, u64 hash, const char* reason);
+    void ReportDiskRecordFailures();
     std::unordered_map<u64, u8> used_pipelines; ///< Key hash -> sessions since it was last used
     std::unordered_set<const GraphicsPipeline*> used_this_session;
     std::filesystem::path used_pipelines_filename;

@@ -1127,6 +1127,29 @@ PipelineCache::~PipelineCache() {
     DestroyPipelinesWithProgress(evicted_pipelines);
 }
 
+void PipelineCache::NoteDiskRecordFailure(std::string_view kind, u64 hash, const char* reason) {
+    constexpr size_t Shown = 4;
+    if (disk_record_failures.fetch_add(1, std::memory_order_relaxed) < Shown) {
+        LOG_INFO(Render_Vulkan,
+                 "{} pipeline {:016x}: a cached record this build cannot translate ({}), built "
+                 "when first needed instead",
+                 kind, hash, reason);
+    } else {
+        LOG_DEBUG(Render_Vulkan, "{} pipeline {:016x}: cached record not translated: {}", kind,
+                  hash, reason);
+    }
+}
+
+void PipelineCache::ReportDiskRecordFailures() {
+    const size_t failures = disk_record_failures.exchange(0, std::memory_order_relaxed);
+    if (failures != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "{} cached pipeline records could not be translated by this build (stored by "
+                 "another or an older build); their pipelines are built when first needed",
+                 failures);
+    }
+}
+
 void PipelineCache::SaveUsedPipelines() {
     used_pipelines_saved = std::chrono::steady_clock::now();
     // A session too short to say what the game uses (a boot to the menu) keeps the old list.
@@ -1986,6 +2009,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                              background_claimed.size());
                     background_claimed.clear();
                     background_active.store(false, std::memory_order_release);
+                    ReportDiskRecordFailures();
                     if (!background_stop.load(std::memory_order_relaxed)) {
                         QueueVulkanPipelineCacheSave(true);
                     }
@@ -2008,6 +2032,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     if (state.statistics) {
         state.statistics->Report();
     }
+    ReportDiskRecordFailures();
     if (!stop_loading.stop_requested()) {
         warm_cancel = false;
         // Stopping emulation also stops the background builds at once: they would otherwise
@@ -3269,6 +3294,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                   exception.what());
         return nullptr;
     }
+    if (!build_in_parallel) {
+        // A disk cache record: one another (or an older) build stored can lack what this
+        // translator asks for
+        // (merged packs: "Uncached storage pointer classification", 144 errors and dumps for
+        // 108 pipelines). Not an error: the GPU thread builds the pipeline from the game when a
+        // draw needs it, and stores that record (see CreateCachedGraphicsPipeline).
+        NoteDiskRecordFailure("Graphics", hash, exception.what());
+        return nullptr;
+    }
     size_t env_index{0};
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
         if (key.unique_hashes[index] == 0) {
@@ -3286,8 +3320,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         env.Dump(hash, key.unique_hashes[index]);
     }
-    LOG_ERROR(Render_Vulkan, "Graphics pipeline compilation failed {}{}: {}", PipelineShaders(key),
-              build_in_parallel ? "" : " (disk cache)", exception.what());
+    LOG_ERROR(Render_Vulkan, "Graphics pipeline compilation failed {}: {}", PipelineShaders(key),
+              exception.what());
     return nullptr;
 }
 
@@ -3516,6 +3550,10 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         // A warm-up guess the translation rejects: counted by the warm-up, logged at its end.
         LOG_DEBUG(Render_Vulkan, "Warm compute pipeline shader={:#016x} pipeline={:#016x}: {}",
                   key.unique_hash, key.Hash(), exception.what());
+    } else if (!build_in_parallel) {
+        // A disk cache record this build cannot translate, as for graphics: built from the game
+        // when first dispatched.
+        NoteDiskRecordFailure("Compute", key.Hash(), exception.what());
     } else {
         LOG_ERROR(Render_Vulkan,
                   "Compute pipeline compilation failed shader={:#016x} pipeline={:#016x}: {}",
