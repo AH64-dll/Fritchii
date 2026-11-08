@@ -1199,8 +1199,8 @@ bool TextureCache<P>::RenderTargetsStillPrepared() const {
         return false;
     }
     for (size_t index = 0; index <= NUM_RT; ++index) {
-        const ImageViewId id =
-            index < NUM_RT ? render_targets.color_buffer_ids[index] : render_targets.depth_buffer_id;
+        const ImageViewId id = index < NUM_RT ? render_targets.color_buffer_ids[index]
+                                              : render_targets.depth_buffer_id;
         if (id != prepared.views[index]) {
             return false;
         }
@@ -1246,8 +1246,8 @@ bool TextureCache<P>::VerifyRenderTargetsPrepared() {
     std::array<ImageFlagBits, NUM_RT + 1> flags_before{};
     u64 marked = 0;
     for (size_t index = 0; index <= NUM_RT; ++index) {
-        const ImageViewId id =
-            index < NUM_RT ? render_targets.color_buffer_ids[index] : render_targets.depth_buffer_id;
+        const ImageViewId id = index < NUM_RT ? render_targets.color_buffer_ids[index]
+                                              : render_targets.depth_buffer_id;
         if (!id || slot_image_views[id].IsBuffer()) {
             continue;
         }

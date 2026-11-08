@@ -1323,8 +1323,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         prepare_stage(4);
     }
     if (texture_memo_on && !memo_hit) {
-        const std::span<const u8> rescaled_span{
-            fresh_rescaled.data(), static_cast<size_t>(fresh_rescaled_cursor - fresh_rescaled.data())};
+        const size_t rescaled_count{
+            static_cast<size_t>(fresh_rescaled_cursor - fresh_rescaled.data())};
+        const std::span<const u8> rescaled_span{fresh_rescaled.data(), rescaled_count};
         const std::span<const VideoCommon::ImageViewInOut> views_span{views.data(), views.size()};
         const std::span<const VideoCommon::SamplerId> samplers_span{samplers.data(),
                                                                     samplers.size()};
