@@ -452,20 +452,16 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
     return true;
 }
 
-// GPU semaphore writes that landed in guest memory, counted per word by a hash (collisions only
-// add, so a release can look landed early, never late): EXP13 tells a release the back ran but
-// a fence still holds back from one already written (from zortos293/Lichii#717).
-inline constexpr size_t Nx2LandedSlots = 4096;
-inline std::array<std::atomic<u32>, Nx2LandedSlots> g_nx2_semaphore_landed{};
+// GPU semaphore writes that landed in guest memory: EXP13=2 tells a release the back ran but a
+// fence still holds back from one already written (#717's landed counter, tracked exactly per
+// word by VideoCommon::QmdPrediction::NoteLanded, which sets the hook once it records).
+inline std::atomic<void (*)(u64, u32)> g_nx2_landed_hook{};
 
-[[nodiscard]] inline size_t Nx2LandedSlot(u64 device_address) {
-    return static_cast<size_t>(((device_address >> 2) * 0x9E3779B97F4A7C15ULL) >> 52) &
-           (Nx2LandedSlots - 1);
-}
-
-/// A GPU semaphore write to the u32 at `device_address` landed (counted only).
-inline void Nx2NoteLanded(u64 device_address) {
-    g_nx2_semaphore_landed[Nx2LandedSlot(device_address)].fetch_add(1, std::memory_order_release);
+/// A GPU semaphore write of `value` to the u32 at `device_address` landed (counted only).
+inline void Nx2NoteLanded(u64 device_address, u32 value) {
+    if (const auto hook = g_nx2_landed_hook.load(std::memory_order_acquire)) [[unlikely]] {
+        hook(device_address, value);
+    }
 }
 
 /// Channels suspended on a semaphore acquire. A console channel polls and sees every release;
@@ -512,7 +508,7 @@ public:
     void OnWrite(u64 device_address, u32 value) {
         // (Common::Nx2GpuWrite::Notify, for Ocarina of Time's present poll, is called by each
         // write site itself, with its path and host pointer.)
-        Nx2NoteLanded(device_address);
+        Nx2NoteLanded(device_address, value);
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }

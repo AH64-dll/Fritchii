@@ -24,6 +24,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_qmd_prediction.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
@@ -1535,8 +1536,19 @@ void Maxwell3D::FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontState&
         (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
         fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)];
     if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-        split.NoteRelease(*device, address,
-                          fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.payload)]);
+        const u32 payload = fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.payload)];
+        split.NoteRelease(*device, address, payload);
+        if (VideoCommon::QmdPrediction::MirrorMode()) {
+            // EXP13=2: recorded so the reduction bound sees it queued or run but not landed.
+            namespace Prediction = VideoCommon::QmdPrediction;
+            Prediction::Note(*device,
+                             {.writer = Prediction::Writer::Report,
+                              .kind = Prediction::Kind::Plain,
+                              .payload = payload,
+                              .op = 0,
+                              .is_signed = false},
+                             memory_manager.Read<u32>(address), split.SentPosition(), 0);
+        }
     }
 }
 

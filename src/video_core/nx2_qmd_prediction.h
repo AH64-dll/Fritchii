@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <optional>
 
 #include "common/common_types.h"
@@ -20,7 +21,11 @@
 ///    the inline QMD words the front sent; max releases (bit 19) are lower bounds, reductions
 ///    (bit 26) and compute report reductions are recorded for the reduction lower bound
 ///    (fable_answer_6 6c), which is counted too.
-/// One log line every 5 s (HW_GPU, Info), two with 2.
+/// One log line every 5 s (HW_GPU, Info), three with 2.
+namespace VideoCommon {
+enum class GuestWriterCause : u8; // gpu_split.h
+}
+
 namespace VideoCommon::QmdPrediction {
 
 [[nodiscard]] inline int Mode() {
@@ -36,8 +41,9 @@ namespace VideoCommon::QmdPrediction {
     return Mode() == 2;
 }
 
-/// Report: a compute report semaphore reduction (0x6c3 with bit 3; EXP13=2 records only).
-enum class Writer : u32 { Qmd, Dma, Report, Count };
+/// EXP13=2 records only: Report, a compute report semaphore (0x6c3) or a 3D payload report;
+/// Puller, a puller semaphore release.
+enum class Writer : u32 { Qmd, Dma, Report, Puller, Count };
 
 /// Front: how a QMD signal was read (Predict follows for its releases).
 enum class Signal : u32 {
@@ -83,6 +89,11 @@ enum class Mirror : u32 {
     Count,
 };
 void NoteMirror(Mirror event);
+/// Front, EXP13=2: a QMD read waited; `cause` set its target (`what`: an unknown noted write's).
+void NoteWait(GuestWriterCause cause, const char* what);
+/// Any thread, EXP13=2: a GPU write of `value` landed in the u32 at `device` (OnWrite, compute
+/// report reductions): marks the word's oldest unlanded record landed.
+void NoteLanded(u64 device, u32 value);
 /// Front, EXP13=2: the records are complete for the work sent from `position` on (the copy just
 /// started over), or not any more (`valid` false: it stopped).
 void SetRecordsValid(bool valid, u64 position);
@@ -106,6 +117,7 @@ enum class Coverage : u32 {
     None,
     LandedPending, ///< EXP13=2, of AlreadyRan: run, not landed, and its payload would meet
     ReallyWrong,   ///< EXP13=2, of AlreadyRan: landed, or its payload would not meet
+    OtherRelease,  ///< EXP13=2: the newest release recorded is a puller or report one
     Count,
 };
 /// Front: an unmet readable acquire before its fence release.
@@ -113,7 +125,8 @@ void NoteAcquire(Coverage coverage);
 
 /// Front, EXP13=2: an unmet readable acquire of `operation` (Nx2SemaphoreWaiters' values) and
 /// `value` on the u32 at `device` (GPU `address`). `word` was read from guest memory BEFORE
-/// `done` (the back's position) was loaded; `gpu_dirty`: the word's page is GPU-written.
+/// `done` (the back's position) was loaded; `gpu_dirty`: the word's page is GPU-written;
+/// `pointer`: the word's host memory, for late re-reads (may be null).
 struct AcquireCheck {
     u64 device;
     u64 address;
@@ -122,13 +135,24 @@ struct AcquireCheck {
     u32 word;
     u64 done;
     bool gpu_dirty;
+    const u8* pointer;
 };
 /// The reduction lower bound computed for an acquire, for the safety check once it is met.
 struct Bound {
-    u32 value;
+    u32 value; ///< The bound
+    u32 word;  ///< The word it was folded from
     u64 device;
-    u32 landed_base; ///< Of the newest record folded: landed once the count passed base + sent
-    u32 landed_sent;
+    u64 address;
+    u64 done;
+    /// The newest folded record's place among the word's records: landed once that many landed.
+    u64 nth;
+    u64 payload_sum;
+    std::chrono::steady_clock::time_point since;
+    const u8* pointer;
+    u32 operation;
+    u32 acquire_value;
+    u32 folded;
+    std::array<u32, 16> payloads; ///< The folded records' payloads, in send order
 };
 /// Counts the acquire's coverage (NoteAcquire) and its reduction lower bound (6c): the bound
 /// when one was computed.
@@ -146,8 +170,12 @@ struct BackRelease {
     bool reduction;
 };
 [[nodiscard]] std::optional<BackRelease> BackReleaseSince(u64 device, u64 since);
+/// The newest release the back made for `device` (as far as its table remembers).
+[[nodiscard]] std::optional<BackRelease> BackReleaseLatest(u64 device);
 
-enum class MetBy : u32 { QmdRelease, QmdReduction, DmaRelease, Other, Unmet, Count };
+/// BeforeCheck counts on top: of the met ones, those whose release the back made before the
+/// check (it landed after it).
+enum class MetBy : u32 { QmdRelease, QmdReduction, DmaRelease, Other, Unmet, BeforeCheck, Count };
 /// Front: what met an acquire NoteAcquire counted, once its fences were released.
 void NoteMetBy(MetBy met_by);
 
