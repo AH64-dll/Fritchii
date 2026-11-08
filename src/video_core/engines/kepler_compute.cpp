@@ -265,7 +265,7 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
             // EXP13=2: marked before the word is written (nx2.h); counting only.
             if (Tegra::Nx2LandedHooked()) [[unlikely]] {
                 if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                    Tegra::Nx2NoteLanded(*device, value, Tegra::Nx2Landing::Reduction);
+                    Tegra::Nx2NoteLanded(*device, value, Tegra::Nx2Landing::ReportReduction);
                 }
             }
             memory_manager.Write<u32>(address, value);
@@ -557,7 +557,8 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         // EXP13=2: marked before the word is written (nx2.h); counting only.
                         if (Tegra::Nx2LandedHooked()) [[unlikely]] {
                             if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                                Tegra::Nx2NoteLanded(*device, value, Tegra::Nx2Landing::Reduction);
+                                Tegra::Nx2NoteLanded(*device, value,
+                                                     Tegra::Nx2Landing::QmdReduction);
                             }
                         }
                         memory_manager.Write<u32>(address, value);
@@ -590,7 +591,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         // EXP13=2: marked before the word is written (nx2.h); counting only.
                         if (Tegra::Nx2LandedHooked()) [[unlikely]] {
                             if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                                Tegra::Nx2NoteLanded(*device, value, Tegra::Nx2Landing::Max);
+                                Tegra::Nx2NoteLanded(*device, value, Tegra::Nx2Landing::QmdMax);
                             }
                         }
                         memory_manager.Write<u32>(address, value);

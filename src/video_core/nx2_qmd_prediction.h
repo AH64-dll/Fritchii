@@ -90,6 +90,13 @@ enum class Mirror : u32 {
     SessionStart, ///< The same at the first signal of a split session or of EXP13=2
     AutoOff,      ///< Turned off: too many reads waited or resynced (EDEN_NX2_QMD_AUTO_OFF)
     Patched,      ///< An inline QMD's overlay took an inline upload's words over it
+    Shadow,       ///< A QMD read from an upload shadow (a compute inline upload's bytes)
+    ShadowCreated,   ///< A known linear upload of 256 bytes to 4 KB got a shadow
+    ShadowEvicted,   ///< ... replacing the least recently used one
+    ShadowTooBig,    ///< A linear upload over 4 KB: no shadow
+    ShadowNotLinear, ///< An upload of 256 bytes or more not linear and back to back: no shadow
+    ShadowPatched,   ///< A shadow took a later upload's words over it
+    OverlayFromMemory, ///< A small upload patched a QMD guest memory held: overlay from both
     Count,
 };
 void NoteMirror(Mirror event);
@@ -98,11 +105,11 @@ void NoteWait(GuestWriterCause cause, const char* what);
 /// Front, EXP13=2: a QMD read waited on a writer range of `kind` (GpuSplit::WriterKind) that
 /// starts at byte `offset` of the QMD (negative: before it) and is `size` bytes long.
 void NoteRangeWait(u32 kind, s64 offset, u64 size);
-/// Any thread, EXP13=2: a GPU write of `value` is about to land in the u32 at `device` (called
-/// before the word is written): marks the record it belongs to, by kind (a reduction the oldest
-/// unlanded reduction, a plain write the oldest unlanded plain record of that payload, a max the
-/// oldest unlanded max release with a payload up to it).
-void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing kind);
+/// Any thread, EXP13=2: a GPU write of `value` is about to land in the u32 at `device` through
+/// `site` (called before the word is written): marks the record it belongs to, by kind (a
+/// reduction the oldest unlanded reduction, a plain write the oldest unlanded plain record of
+/// that payload, a max the oldest unlanded max release with a payload up to it).
+void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing site);
 /// Front, EXP13=2: the records are complete for the work sent from `position` on (the copy just
 /// started over), or not any more (`valid` false: it stopped).
 void SetRecordsValid(bool valid, u64 position);

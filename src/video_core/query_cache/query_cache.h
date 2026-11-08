@@ -387,7 +387,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         if (counter_type == QueryType::Payload) {
             // EXP13=2: marked before the word is written (nx2.h).
             Tegra::Nx2NoteLanded(cpu_addr, static_cast<u32>(query_base->value),
-                                 Tegra::Nx2Landing::Plain);
+                                 Tegra::Nx2Landing::QueryCompletion);
         }
         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
             u64 timestamp = impl->gpu.GetTicks();
@@ -419,7 +419,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     } else {
         if (!VideoCore::Nx2Debug::AccuratePart(1) && counter_type == QueryType::Payload) {
             // EXP13=2: marked before the word is written (nx2.h).
-            Tegra::Nx2NoteLanded(cpu_addr, payload, Tegra::Nx2Landing::Plain);
+            Tegra::Nx2NoteLanded(cpu_addr, payload, Tegra::Nx2Landing::QueryImmediate);
             if (has_timestamp) {
                 u64 timestamp = impl->gpu.GetTicks();
                 u64 value = static_cast<u64>(payload);
