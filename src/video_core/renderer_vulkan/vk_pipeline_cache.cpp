@@ -371,6 +371,27 @@ void AddRuntimeSpirvTime(size_t thread, std::chrono::steady_clock::time_point be
         std::memory_order::relaxed);
 }
 
+// The GPU thread's split of its own runtime graphics builds: environments (GetGraphicsEnvironments,
+// a native program's first lowering included) and translation (control flow, TranslateProgram and
+// the IR passes, with the environment's lazy reads). Written and read on the GPU thread only.
+struct RuntimeBuildSplit {
+    std::chrono::steady_clock::duration environments{};
+    std::chrono::steady_clock::duration translation{};
+};
+thread_local bool t_runtime_build{};
+thread_local RuntimeBuildSplit t_build_split{};
+
+// What the GPU thread spent on pipelines in the current frame, for the worst frame line
+// (ReportWorstFrame). GPU thread only.
+struct FrameTally {
+    std::chrono::steady_clock::duration builds{};
+    RuntimeBuildSplit split{};
+    u32 count{};
+};
+FrameTally frame_tally;
+/// Pipeline lookups skipped for unbuilt pipelines this session (BuiltPipeline).
+std::atomic<u64> skipped_lookups{};
+
 vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& profile,
                                  const Shader::RuntimeInfo& runtime_info,
                                  Shader::IR::Program& program, Shader::Backend::Bindings& binding,
@@ -3444,8 +3465,80 @@ PipelineCache::WarmResult PipelineCache::WarmGraphicsLibraries(
     return pipeline->Failed() ? WarmResult::DriverFailed : WarmResult::Built;
 }
 
+namespace {
+// The worst frame of the last 10 s (TickFrame runs once per presented frame, on the GPU thread)
+// and what the GPU thread spent on pipelines in it, so a hitch reads as "2 builds, 14 ms
+// translation, 0 held" without a profiler. Held draws are counted when the worker waited for them
+// (they belong to the frame being recorded, close enough). EDEN_NX2_PIPELINE_TIMING=1 also logs
+// every frame over 33 ms.
+void ReportWorstFrame() {
+    struct Frame {
+        std::chrono::steady_clock::duration time{};
+        FrameTally tally{};
+        std::chrono::nanoseconds held{};
+        u64 skipped{};
+    };
+    static const bool every_slow_frame = [] {
+        const char* value = std::getenv("EDEN_NX2_PIPELINE_TIMING");
+        return value != nullptr && value[0] == '1';
+    }();
+    static std::chrono::steady_clock::time_point last_tick{};
+    static std::chrono::steady_clock::time_point window{};
+    static std::chrono::nanoseconds last_held{};
+    static u64 last_skipped{};
+    static Frame worst{};
+    static u32 frames{};
+    static u32 slow_frames{};
+    static u32 logged_slow{};
+    const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+    const auto describe = [&](const Frame& frame) {
+        return fmt::format("{} pipelines built on the GPU thread in {:.1f} ms ({:.1f} ms "
+                           "environments, {:.1f} ms translation), {:.1f} ms of draws held, {} "
+                           "lookups skipped",
+                           frame.tally.count, ms(frame.tally.builds),
+                           ms(frame.tally.split.environments), ms(frame.tally.split.translation),
+                           ms(frame.held), frame.skipped);
+    };
+    const auto now = std::chrono::steady_clock::now();
+    const auto held_total = GraphicsPipeline::HoldTimeTotal();
+    const u64 skipped_total = skipped_lookups.load(std::memory_order_relaxed);
+    if (last_tick == std::chrono::steady_clock::time_point{}) {
+        window = now;
+    } else {
+        const Frame frame{now - last_tick, frame_tally, held_total - last_held,
+                          skipped_total - last_skipped};
+        ++frames;
+        if (frame.time > std::chrono::milliseconds{33}) {
+            ++slow_frames;
+            if (every_slow_frame && logged_slow < 2000) {
+                ++logged_slow;
+                LOG_INFO(Render_Vulkan, "Slow frame: {:.1f} ms; {}", ms(frame.time),
+                         describe(frame));
+            }
+        }
+        if (frame.time > worst.time) {
+            worst = frame;
+        }
+    }
+    last_tick = now;
+    last_held = held_total;
+    last_skipped = skipped_total;
+    frame_tally = {};
+    if (now - window >= std::chrono::seconds{10}) {
+        LOG_INFO(Render_Vulkan,
+                 "Worst frame in the last 10 s: {:.1f} ms ({} of {} frames over 33 ms); in it {}",
+                 ms(worst.time), slow_frames, frames, describe(worst));
+        worst = {};
+        frames = 0;
+        slow_frames = 0;
+        window = now;
+    }
+}
+} // Anonymous namespace
+
 void PipelineCache::TickFrame() {
     ++frame_count;
+    ReportWorstFrame();
     if (frame_count % 60 == 0) {
         static std::chrono::steady_clock::time_point last_memory_log{};
         const auto now = std::chrono::steady_clock::now();
@@ -3610,12 +3703,11 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
                                               draw_state.draw_element_count,
                                               draw_state.draw_element_count, discard_native);
     if (discard) {
-        static std::atomic<u64> skipped{};
-        if ((skipped.fetch_add(1, std::memory_order_relaxed) & 255) == 0) {
+        if ((skipped_lookups.fetch_add(1, std::memory_order_relaxed) & 255) == 0) {
             // Counts lookups, not draws: a draw state can look its pipeline up more than once.
             LOG_INFO(Render_Vulkan,
                      "Async shaders: {} pipeline lookups skipped for unbuilt pipelines",
-                     skipped.load(std::memory_order_relaxed));
+                     skipped_lookups.load(std::memory_order_relaxed));
         }
     }
     return discard ? nullptr : pipeline;
@@ -3706,6 +3798,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             return nullptr;
         }
 
+        const auto translate_begin = t_runtime_build ? std::chrono::steady_clock::now()
+                                                     : std::chrono::steady_clock::time_point{};
         const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
         Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
         if (!uses_vertex_a || index != 1) {
@@ -3716,6 +3810,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             auto& program_va{programs[0]};
             auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
             programs[index] = MergeDualVertexPrograms(program_va, program_vb, env, host_info);
+        }
+        if (t_runtime_build) {
+            t_build_split.translation += std::chrono::steady_clock::now() - translate_begin;
         }
 
         if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
@@ -3971,34 +4068,52 @@ namespace {
 // are logged, and the totals every 10 s, to tell how much of the stutter on new content is
 // translation.
 void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_point begin,
-                           const std::string& shaders) {
+                           const std::string& shaders, const RuntimeBuildSplit& split = {}) {
     static std::chrono::steady_clock::duration total{};
+    static RuntimeBuildSplit split_total{};
     static u32 count{}, logged{};
     static auto window = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     const auto elapsed = now - begin;
     total += elapsed;
+    split_total.environments += split.environments;
+    split_total.translation += split.translation;
     ++count;
+    frame_tally.builds += elapsed;
+    frame_tally.split.environments += split.environments;
+    frame_tally.split.translation += split.translation;
+    ++frame_tally.count;
     const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
     // Slow builds are always logged with their shaders, to find the programs that are slow to
     // translate.
     if (elapsed > std::chrono::milliseconds{100} ||
         (elapsed > std::chrono::milliseconds{2} && logged < 400)) {
         ++logged;
-        LOG_INFO(Render_Vulkan, "{} pipeline built on the GPU thread in {:.1f} ms: {}", kind,
-                 ms(elapsed), shaders);
+        // Graphics builds name their environments and translation time too, after the shaders
+        // so readers of the older line keep their fields.
+        const std::string parts =
+            split.environments.count() != 0 || split.translation.count() != 0
+                ? fmt::format(" ({:.1f} ms environments, {:.1f} ms translation)",
+                              ms(split.environments), ms(split.translation))
+                : std::string{};
+        LOG_INFO(Render_Vulkan, "{} pipeline built on the GPU thread in {:.1f} ms: {}{}", kind,
+                 ms(elapsed), shaders, parts);
     }
     if (now - window > std::chrono::seconds{10}) {
         const auto take = [](auto& counter) {
             return std::chrono::nanoseconds{counter.exchange(0, std::memory_order::relaxed)};
         };
+        // The split goes at the end, so readers of the older line keep their fields.
         LOG_INFO(Render_Vulkan,
                  "Runtime pipelines in the last 10 s: {} built, {:.1f} ms on the GPU thread "
                  "({:.1f} ms of it graphics SPIR-V), {:.1f} ms graphics SPIR-V on workers, "
-                 "{:.1f} ms of draws held for unbuilt pipelines",
+                 "{:.1f} ms of draws held for unbuilt pipelines; graphics on the GPU thread: "
+                 "{:.1f} ms environments, {:.1f} ms translation",
                  count, ms(total), ms(take(runtime_spirv_ns[0])), ms(take(runtime_spirv_ns[1])),
-                 ms(GraphicsPipeline::TakeHoldTime()));
+                 ms(GraphicsPipeline::TakeHoldTime()), ms(split_total.environments),
+                 ms(split_total.translation));
         total = {};
+        split_total = {};
         count = 0;
         window = now;
     }
@@ -4007,11 +4122,15 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     const auto begin = std::chrono::steady_clock::now();
+    t_runtime_build = true;
+    t_build_split = {};
     SCOPE_EXIT {
-        ReportRuntimePipeline("Graphics", begin, PipelineShaders(graphics_key));
+        t_runtime_build = false;
+        ReportRuntimePipeline("Graphics", begin, PipelineShaders(graphics_key), t_build_split);
     };
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
+    t_build_split.environments = std::chrono::steady_clock::now() - begin;
 
     std::shared_ptr<ShaderPools> emit_pools;
     auto reservation = emission_budget.TryAcquire(
