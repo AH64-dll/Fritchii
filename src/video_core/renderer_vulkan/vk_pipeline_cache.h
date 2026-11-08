@@ -126,6 +126,12 @@ struct ComputePipelineCacheEntry {
                                        const ComputePipelineCacheKey& key) const;
 };
 
+/// EDEN_NX2_ASYNC_DISCARD, read on first use: what a native draw does while its pipeline is
+/// missing. 0 waits for every pipeline, 1 (the default) skips by the legacy heuristic alone, 2
+/// skips only draws into render targets the frame clears and redraws (fable_answer_18 1b).
+/// Non-native draws keep the legacy heuristic in every mode.
+[[nodiscard]] int AsyncDiscardMode();
+
 class PipelineCache : public VideoCommon::ShaderCache {
 public:
     explicit PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, const Device& device,
@@ -204,8 +210,18 @@ private:
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
 
     /// Whether the current draw may be skipped while its pipeline is not ready (native draws
-    /// unless EDEN_NX2_ASYNC_DISCARD=0, and the legacy heuristic; full-screen passes never).
+    /// unless EDEN_NX2_ASYNC_DISCARD=0, and the legacy heuristic; full-screen passes never; with
+    /// EDEN_NX2_ASYNC_DISCARD=2 only into recurring render targets). The one test BuiltPipeline
+    /// and the translate queue both ask, answered once per lookup.
     [[nodiscard]] bool DrawMayBeSkipped() const;
+    /// Counts CurrentGraphicsPipeline calls, so DrawMayBeSkipped classifies the targets once per
+    /// lookup however often a lookup asks.
+    u64 lookup_serial{};
+    struct DiscardDecision {
+        u64 serial{~u64{0}};
+        bool skip{};
+    };
+    mutable DiscardDecision discard_decision;
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
 

@@ -2058,6 +2058,7 @@ void PipelineCache::RefreshGraphicsKey() {
 }
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
+    ++lookup_serial;
     if (const int clean_mode = PipelineCleanMode(); clean_mode != 0) {
         return CurrentGraphicsPipelineClean(clean_mode == 2);
     }
@@ -3773,22 +3774,54 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     return discard ? nullptr : pipeline;
 }
 
+int AsyncDiscardMode() {
+    // Read on first use (the first missing pipeline), after nx2_switches.txt was applied.
+    static const int mode = [] {
+        const char* value = std::getenv("EDEN_NX2_ASYNC_DISCARD");
+        const int parsed = value == nullptr ? 1 : value[0] == '0' ? 0 : value[0] == '2' ? 2 : 1;
+        static constexpr std::array<const char*, 3> what{
+            "wait for every unbuilt pipeline",
+            "skip unbuilt pipelines by the legacy heuristic",
+            "skip unbuilt pipelines only into render targets cleared every frame",
+        };
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_ASYNC_DISCARD={}: native draws {}", parsed,
+                 what[parsed]);
+        return parsed;
+    }();
+    return mode;
+}
+
 bool PipelineCache::DrawMayBeSkipped() const {
     // Native draws whose pipeline is still building are skipped instead of waited for (the
     // object is missing for a frame or more rather than the game freezing while the driver
     // compiles). Full-screen passes (no depth, few vertices) still wait, so a lighting or post
     // pass is never dropped. EDEN_NX2_ASYNC_DISCARD=0 waits for every pipeline.
-    static const bool discard_native = [] {
-        const char* value = std::getenv("EDEN_NX2_ASYNC_DISCARD");
-        const bool enabled = value == nullptr || value[0] != '0';
-        LOG_INFO(Render_Vulkan, "EDEN_NX2_ASYNC_DISCARD: native draws {} unbuilt pipelines",
-                 enabled ? "skip" : "wait for");
-        return enabled;
-    }();
+    //
+    // The legacy heuristic ignores the target, so a draw into a layer the game renders once
+    // (title screen text, a chat bubble, a probe) loses its only draw for good when its
+    // pipeline is missing (fable_answer_18 1a). EDEN_NX2_ASYNC_DISCARD=2 skips only into
+    // targets fully cleared in this render frame and in a recent earlier one; first-time and
+    // persistent targets wait by the paths that wait today (Configure's build wait, the
+    // translate queue's capped Wait and synchronous fallback). The frame is the texture cache's
+    // render frame, the one last_write_frame uses (the render-frame clock when live, frame_tick
+    // otherwise); a tick that lands mid-frame can only make a target look first-time, so it
+    // costs a wait and never a skip (ClassifyClearedTarget).
+    if (discard_decision.serial == lookup_serial) {
+        return discard_decision.skip;
+    }
+    const int mode = AsyncDiscardMode();
+    const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
-    return CanDiscardPendingDraw(maxwell3d->GetNativeMacroEngine().native_turing,
-                                 maxwell3d->regs.zeta_enable != 0, draw_state.draw_element_count,
-                                 draw_state.draw_element_count, discard_native);
+    bool recurring = true;
+    if (mode == 2 && native) {
+        recurring = texture_cache.ClassifyDrawTargets().kind ==
+                    VideoCommon::DrawTargetClass::Recurring;
+    }
+    const bool skip = CanDiscardPendingDraw(native, maxwell3d->regs.zeta_enable != 0,
+                                            draw_state.draw_element_count,
+                                            draw_state.draw_element_count, mode != 0, recurring);
+    discard_decision = DiscardDecision{.serial = lookup_serial, .skip = skip};
+    return skip;
 }
 
 namespace {
