@@ -2329,8 +2329,10 @@ void PipelineCache::TickFrame() {
     constexpr u64 EvictCheckFrames = 600;
     if (frame_count % EvictCheckFrames == 0) {
         EvictUnusedPipelines();
-        if (device.IsExtGraphicsPipelineLibrarySupported()) {
-            // A library goes unused once every pipeline linked from it is evicted and destroyed.
+        if (VideoCore::Nx2Debug::Experiment(23) == 1 &&
+            device.IsExtGraphicsPipelineLibrarySupported()) {
+            // EXP23 (off by default, unmeasured): a library goes unused once every pipeline
+            // linked from it is evicted and destroyed.
             constexpr size_t MaxLibraries = 4096;
             graphics_libraries.TrimUnused(MaxLibraries);
         }

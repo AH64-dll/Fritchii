@@ -121,6 +121,9 @@ inline std::atomic<int> g_host_pace{-1};
 /// (SKIP_SAME_DRAWREG, as EXP2), 8 = the back checks each delta and batch against the single
 /// writes and keeps theirs (logs "EXP22 check"). 7 = all three. #641's FRONT_CB_ENCODE is not
 /// ported (it holds constant buffer writes off the ring).
+/// EXP23 = 1: trim unused pipeline libraries every 600 frames past 4096 (#579 stage B;
+/// PipelineCache::TickFrame, GraphicsPipelineLibraryCache::TrimUnused). Off by default, not
+/// measured yet.
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 
