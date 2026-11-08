@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <windows.h>
 
 #include "common/windows/timer_resolution.h"
@@ -108,6 +109,46 @@ void SleepForOneTick() {
         .QuadPart{-1},
     };
     NtDelayExecution(FALSE, &DelayInterval);
+}
+
+} // namespace Common::Windows
+
+namespace Common::Windows {
+
+void* CreateHighResolutionTimer() {
+    constexpr DWORD HighResolution = 0x2; // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+    return CreateWaitableTimerExW(nullptr, nullptr, HighResolution, TIMER_ALL_ACCESS);
+}
+
+void* CreateWakeEvent() {
+    return CreateEventW(nullptr, FALSE, FALSE, nullptr);
+}
+
+void SignalWakeEvent(void* wake_event) {
+    if (wake_event != nullptr) {
+        SetEvent(static_cast<HANDLE>(wake_event));
+    }
+}
+
+bool WaitHighResolution(void* timer, void* wake_event, std::chrono::nanoseconds ns) {
+    if (timer == nullptr || wake_event == nullptr) {
+        return false;
+    }
+    // Relative due time in 100 ns units (negative = relative).
+    LARGE_INTEGER due{};
+    due.QuadPart = -(std::max<LONGLONG>)(1, static_cast<LONGLONG>(ns.count() / 100));
+    if (!SetWaitableTimerEx(static_cast<HANDLE>(timer), &due, 0, nullptr, nullptr, nullptr, 0)) {
+        return false;
+    }
+    const HANDLE handles[2]{static_cast<HANDLE>(wake_event), static_cast<HANDLE>(timer)};
+    WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+    return true;
+}
+
+void CloseWaitHandle(void* handle) {
+    if (handle != nullptr) {
+        CloseHandle(static_cast<HANDLE>(handle));
+    }
 }
 
 } // namespace Common::Windows

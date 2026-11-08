@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <tuple>
@@ -15,6 +16,7 @@
 #include "common/windows/timer_resolution.h"
 #endif
 
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core_timing.h"
 #include "core/hardware_properties.h"
@@ -63,6 +65,16 @@ struct CoreTiming::Event {
 CoreTiming::CoreTiming() = default;
 CoreTiming::~CoreTiming() {
     Reset();
+#ifdef _WIN32
+    Common::Windows::CloseWaitHandle(wake_handle);
+#endif
+}
+
+void CoreTiming::Wake() {
+    event.Set();
+#ifdef _WIN32
+    Common::Windows::SignalWakeEvent(wake_handle);
+#endif
 }
 
 void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
@@ -71,11 +83,26 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
     event_fifo_id = 0;
     cpu_ticks = 0;
     if (is_multicore) {
+#ifdef _WIN32
+        if (wake_handle == nullptr) {
+            wake_handle = Common::Windows::CreateWakeEvent();
+        }
+#endif
         timer_thread = std::jthread([this](std::stop_token stop_token) {
             Common::SetCurrentThreadName("HostTiming");
             Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
             Common::SetCurrentThreadToPerformanceCores();
             on_thread_init();
+#ifdef _WIN32
+            // EDEN_HIRES_CLOCK=0 keeps the plain timed wait.
+            const char* const hires_switch = std::getenv("EDEN_HIRES_CLOCK");
+            void* const hires_timer = (hires_switch != nullptr && hires_switch[0] == '0')
+                                          ? nullptr
+                                          : Common::Windows::CreateHighResolutionTimer();
+            SCOPE_EXIT {
+                Common::Windows::CloseWaitHandle(hires_timer);
+            };
+#endif
             has_started = true;
 
             // base frequency in MHz: 1ns (10^-9) = 1GHz (10^9)
@@ -86,7 +113,14 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
                         // There are more events left in the queue, wait until the next event.
                         auto const wait_time = *next_time - GetGlobalTimeNs().count();
                         if (wait_time > 0) {
-                            event.WaitFor(std::chrono::nanoseconds(wait_time));
+#ifdef _WIN32
+                            // A high resolution timer keeps the guest's events (vsync among them)
+                            // on time even where Windows doesn't honour our timer resolution
+                            // request (Windows 11: players gained ~30% fps from making it global).
+                            if (!Common::Windows::WaitHighResolution(
+                                    hires_timer, wake_handle, std::chrono::nanoseconds(wait_time)))
+#endif
+                                event.WaitFor(std::chrono::nanoseconds(wait_time));
                         }
                     } else {
                         // Queue is empty, wait until another event is scheduled and signals us to
@@ -106,7 +140,7 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
 void CoreTiming::ClearPendingEvents() {
     std::scoped_lock lock{advance_lock, basic_lock};
     event_queue.clear();
-    event.Set();
+    Wake();
 }
 
 void CoreTiming::Pause(bool is_paused) {
@@ -128,7 +162,7 @@ void CoreTiming::SyncPause(bool is_paused) {
         if (!is_paused) {
             pause_event.Set();
         }
-        event.Set();
+        Wake();
         while (paused_set != is_paused)
             ;
     }
@@ -157,7 +191,7 @@ void CoreTiming::ScheduleEvent(std::chrono::nanoseconds ns_into_future,
         (*h).handle = h;
     }
 
-    event.Set();
+    Wake();
 }
 
 void CoreTiming::ScheduleLoopingEvent(std::chrono::nanoseconds start_time,
@@ -173,7 +207,7 @@ void CoreTiming::ScheduleLoopingEvent(std::chrono::nanoseconds start_time,
         (*h).handle = h;
     }
 
-    event.Set();
+    Wake();
 }
 
 void CoreTiming::UnscheduleEvent(const std::shared_ptr<EventType>& event_type,
@@ -311,7 +345,7 @@ void CoreTiming::Reset() {
         timer_thread.request_stop();
     }
     pause_event.Set();
-    event.Set();
+    Wake();
     if (timer_thread.joinable()) {
         timer_thread.join();
     }

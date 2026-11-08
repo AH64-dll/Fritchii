@@ -147,7 +147,11 @@ public:
     s64 global_timer = 0;
 #ifdef _WIN32
     s64 timer_resolution_ns;
+    /// The timer thread's early wake-up for its high resolution wait (see Wake).
+    void* wake_handle{};
 #endif
+    /// Wakes the timer thread: `event`, and on Windows the high resolution wait's wake handle.
+    void Wake();
     u64 event_fifo_id = 0;
     s64 pause_end_time{};
     /// Cycle timing
