@@ -212,12 +212,9 @@ public:
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
     /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
-    /// EDEN_NX2_LIST_FAST: whether an entry of `size` bytes skips the wait for queued writers.
-    bool SkipWriterWait(u64 size);
-    u64 list_fast_marks{};
-    std::chrono::steady_clock::time_point list_fast_since{};
-    /// Copies the list's words from memory again, as of suspension count `now`.
-    void RefreshSnapshot(CommandList& list, u64 now);
+    /// Copies the list's words from memory again, as of suspension count `now`, from entry
+    /// `first_entry` on (the entries before it ran already).
+    void RefreshSnapshot(CommandList& list, u64 now, size_t first_entry = 0);
     /// Copies the list's deferred entries (CommandList::deferred_entries) from memory.
     void RefreshDeferredEntries(CommandList& list);
 
@@ -234,6 +231,9 @@ public:
     /// since. False when not all are current (or the list isn't GPU-written): the caller drains,
     /// flushes and reads guest memory.
     bool ReadGpuWrittenCommands(GPUVAddr address, u32 count);
+    /// EDEN_NX2_LIST_VERIFY: reads the list ReadGpuWrittenCommands just read again as before
+    /// EXP40 (Nx2ListVerify) and leaves the words read last in command_headers.
+    void VerifyGpuWrittenCommands(GPUVAddr address, u32 count);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
 

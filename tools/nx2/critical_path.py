@@ -66,7 +66,7 @@ DRAIN_SITES = (
     "other", "fetch drain", "acquire", "semaphore flush", "fence release", "list writers",
     "list sync", "list flush", "macro dma read", "macro dma writes", "macro dma flush",
     "gp sync fence", "map", "front start", "front verify", "macro dma check",
-    "macro dma dispatch", "fence writers", "qmd read",
+    "macro dma dispatch", "fence writers", "qmd read", "list copy writers",
 )
 
 # The waited-on table: span name -> (kind, stage waited on, resolver). Kinds: "wait" jumps to

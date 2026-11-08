@@ -203,7 +203,7 @@ void GpuSplit::Stop() {
     published_local = 0;
     consumed_cache = 0;
     publish_every = PublishEvery;
-    publish_idle = false;
+    publish_waiting = false;
     front_engine = nullptr;
     pairs_header = nullptr;
     pairs_count = 0;
@@ -215,7 +215,7 @@ void GpuSplit::Stop() {
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
-    back_idle.store(false, std::memory_order_relaxed);
+    back_idle_at.store(~u64{0}, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
     front_waiting.store(false, std::memory_order_relaxed);
 }
@@ -263,13 +263,9 @@ void GpuSplit::Publish() {
     }
     published_local = write_position;
     publish_every = std::min<size_t>(publish_every * 2, PublishEvery);
-    publish_idle = (VideoCore::Nx2Debug::Experiment(27) & 2) != 0;
+    publish_waiting = (VideoCore::Nx2Debug::Experiment(39) & 1) != 0;
     published.store(write_position, std::memory_order_seq_cst);
-    // With EXP27 & 2 the flag is taken back here (zortos293/Lichii#717): the per-entry publishes
-    // until the back runs again don't wake it once more each. The back's wait ends on the first
-    // wake bump either way.
-    if (back_waiting.load(std::memory_order_seq_cst) &&
-        (!publish_idle || back_waiting.exchange(false, std::memory_order_seq_cst))) {
+    if (back_waiting.load(std::memory_order_seq_cst)) {
         wake.fetch_add(1, std::memory_order_seq_cst);
         wake.notify_one();
     }
@@ -443,6 +439,10 @@ bool GpuSplit::OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words) {
 
 bool GpuSplit::WaitForSync() {
     return WaitFor(std::min(last_sync_position, write_position), DrainSite::ListSync);
+}
+
+bool GpuSplit::WaitForSyncedWriters(DrainSite site) {
+    return WaitFor(std::min({last_writer_position, last_sync_position, write_position}), site);
 }
 
 void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, size_t space) {
@@ -1268,8 +1268,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             Common::Nx2Timeline::ArgSpan timeline_span{
                 Nx2Profile::zone_names[static_cast<size_t>(Nx2Profile::Zone::SplitWait)],
                 {"phase", 0}};
-            // EXP27 & 2: the front publishes each entry while this is set.
-            back_idle.store(true, std::memory_order_relaxed);
+            // EXP39 & 1: the front publishes what it holds at its next commit (a few words) from
+            // now on. Published positions only grow, so the front never matches a stale one.
+            back_idle_at.store(read_position, std::memory_order_relaxed);
             // The front usually sends more within microseconds: spin briefly before sleeping.
             for (u32 spins = 0; spins < 8192 && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);
@@ -1302,9 +1303,6 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 back_waiting.store(false, std::memory_order_relaxed);
                 continue;
             }
-        }
-        if (back_idle.load(std::memory_order_relaxed)) {
-            back_idle.store(false, std::memory_order_relaxed);
         }
         u64 last_store = read_position;
         // EDEN_NX2_EXP27 & 4 (zortos293/Lichii#717 EDEN_NX2_RING_PREFETCH): prefetch the ring

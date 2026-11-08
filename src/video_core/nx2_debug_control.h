@@ -47,10 +47,10 @@ inline std::atomic<int> g_dma_wait_writers{-1};
 /// semaphore acquires without draining the back
 /// when the value is already met and no queued write overlaps it (puller.cpp).
 inline std::atomic<int> g_sem_fast{-1};
-/// EXPERIMENT (not for nx2): EDEN_NX2_LIST_FAST=1, command list entries skip the wait for queued
-/// compute and copies while no page was newly GPU-written for 2 s; =2 also checks each skipped
-/// entry on the back and logs misses (dma_pusher.cpp).
-inline std::atomic<int> g_list_fast{-1};
+/// TEST: EDEN_NX2_LIST_VERIFY=1 (live), each command list the split's front reads on GPU-written
+/// pages is read again as before EXP40 and compared (video_core/nx2_list_verify.h; "list
+/// verify" every 10 s). Changes timing: the front waits for every writer again for each list.
+inline std::atomic<int> g_list_verify{-1};
 /// EXPERIMENT (not for nx2): EDEN_NX2_LOOP_SKIP=1, the split's front does not send the instance
 /// loop writes the back would ignore (draw.end in an instance loop, unchanged vertex and index
 /// buffer firsts and counts) (maxwell_3d.cpp).
@@ -172,9 +172,8 @@ inline std::atomic<int> g_idle_pause{-1};
 /// short spin is answered with a flush request served by the back (GetFlushArea).
 /// EXP27 (keep the split's back fed, fewer submits; zortos293/Lichii#717), bits: 1 = the front
 /// publishes before it yields or sleeps polling suspended channels (PUBLISH_WAITS,
-/// GpuSplit::PublishBeforeWait), 2 = while the back found the ring empty, each entry is published
-/// at once (outside open Pairs and StateDelta blocks) and a publish takes back_waiting back so
-/// only the first wakes the back (PUBLISH_IDLE), 4 = the back prefetches the ring 128 words
+/// GpuSplit::PublishBeforeWait), 2 = retired (was PUBLISH_IDLE, each entry published at once
+/// while the back found the ring empty; EXP39 & 1 replaces it), 4 = the back prefetches the ring 128 words
 /// ahead (RING_PREFETCH), 8 = command list copies after a dispatch are submitted when the front
 /// waits for them, when the back goes idle or with the next submission, instead of at once
 /// (DISPATCH_BATCH, RasterizerVulkan::SubmitNx2ListCopies). Off by default; 1, 2 and 4 change
@@ -254,6 +253,39 @@ inline std::atomic<int> g_idle_pause{-1};
 /// answers into the path level 2 takes for a word below the value, never the other way, so it is
 /// a strict tightening; its cost is the drains it puts back (compare 0, 1 and 2 with
 /// profile_toggle and the AcquiresFast count).
+/// EXP39 (live; keep the split's back fed, zortos293/Lichii#805 62db242b34), bits: 1 = the back
+/// stores its position when it runs out of work (GpuSplit::back_idle_at) and, while that is the
+/// position last published, the front publishes at its next Commit once it holds 8 words, not
+/// after 256 (outside open Pairs and StateDelta blocks; replaces EXP27 & 2), 2 = when an acquire
+/// resumes, the snapshot refresh (DmaPusher::RefreshSnapshot) skips the current list's entries
+/// that ran already and the entry the acquire suspended inside, which reads memory anyway
+/// (CanUseSubmittedCommands); the lists behind it are copied as before. Default 3: both only
+/// change when the back sees work or which words nobody parses again are copied. Measure with
+/// profile_toggle (EXP39 0 vs 3): back "split wait", front "resume pending".
+/// EXP40 (live; command lists on GPU-written pages, zortos293/Lichii#805 34656e8225), bits:
+/// 1 = each command list page keeps the 4-byte words GPU work wrote that guest memory lacks
+/// (BufferCache::Nx2ListPage::gpu_words: set by every GPU write noted to the page, the whole range
+/// a dispatch or copy may write, cleared for words the host writes whole and for all of them when
+/// the front flushes the page); once the page was flushed, a list on none of those words reads
+/// guest memory and waits for no copy, and a list on some reads those from the copy and the rest
+/// from guest memory (the "list GPU wait" zone falls; a storage write mark that
+/// EDEN_NX2_WRITTEN_SSBO_MARK_KIB capped counts as written to the end of its last page, since
+/// the shader may write past the cap); 2 = a list on GPU-written pages waits
+/// only for the compute and copy work sent before the last host sync ("list copy writers"
+/// site), not for every one sent so far ("list writers"). Off by default: both read words
+/// earlier than before. Verify with EDEN_NX2_LIST_VERIFY=1 ("list verify ... 0 differ"). Always
+/// on (bug fixes): copy engine copies and clears tell the list pages what they write to guest
+/// memory (their copies went stale), DMAClear checks its whole range (it passed words as bytes),
+/// and a front waiting for a list copy publishes first.
+/// EXP41 (live; command entries on pages no GPU work wrote yet, DmaPusher::Step): 1 = the writer
+/// waits before the port of zortos293/Lichii#805 6229487c8c + d4e8d85d4d: EDEN_NX2_LIST_WAIT_SKIP=1
+/// (built in) skips every entry's wait, =0 waits for every queued dispatch and copy. 0 (default)
+/// = the new shape: an entry waits only for the compute and copy work sent before the last host
+/// sync (WaitForSyncedWriters), and with LIST_WAIT_SKIP=1 an entry that begins between methods
+/// (a command buffer the CPU writes) doesn't wait unless copy engine work is still queued;
+/// entries inside a method's data (the parameters GPU work writes) still wait. Against the
+/// built-in skip-everything this only adds waits. Entries that didn't wait for every writer are
+/// checked on the back ("EDEN_NX2_LIST_WAIT_SKIP: command list at ... was GPU-written": stays 0).
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 
@@ -298,6 +330,9 @@ inline void LoadExperiments() {
         // EXP35 = 2 (2026-11-08): every guest write collected (guest-core write lock spinning 0.7% ->
         // 0, standing 45.3 -> 46.5 fps, route flash reports 253 = camera noise).
         g_experiments[35].store(2, std::memory_order_relaxed);
+        // EXP39 = 3: publish to a back that waits after 8 words, no snapshot refresh of entries
+        // that ran (zortos293/Lichii#805 62db242b34; see the EXP39 notes above). Timing only.
+        g_experiments[39].store(3, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {
@@ -332,14 +367,14 @@ inline void LoadExperiments() {
         LoadExperiments();
         return &g_experiments[n];
     }
+    if (name == "EDEN_NX2_LIST_VERIFY") {
+        return &g_list_verify;
+    }
     if (name == "EDEN_NX2_DMA_WAIT_WRITERS") {
         return &g_dma_wait_writers;
     }
     if (name == "EDEN_NX2_SEM_FAST") {
         return &g_sem_fast;
-    }
-    if (name == "EDEN_NX2_LIST_FAST") {
-        return &g_list_fast;
     }
     if (name == "EDEN_NX2_DMA_SNAPSHOT") {
         return &g_dma_snapshot;
