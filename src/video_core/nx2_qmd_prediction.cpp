@@ -37,6 +37,7 @@ struct Prediction {
     bool landed;  ///< EXP13=2: its write landed (NoteLanded, marked before the word is written)
     bool matched; ///< EXP13=2: the back made it (Verify)
     Source source;
+    bool simple;      ///< Record::simple
     u32 landed_value; ///< The word it landed with
     u64 read_done;
     u64 overlay_position;
@@ -248,7 +249,15 @@ struct AuditKey {
     u64 position;
     bool has_made;
     u32 made;
+    /// An unpredicted back release at entry `position` (6g (b)): the decisions are judged by
+    /// where they stand against it, for unmatched records of `kind` before it.
+    Kind kind{Kind::Plain};
+    bool positional{};
 };
+
+[[nodiscard]] bool IsFeedMode(int mode) {
+    return mode == 3 || mode == 4;
+}
 
 template <typename Array>
 std::string Rates(const Array& counts, double window) {
@@ -357,6 +366,19 @@ struct State {
     std::string feed_off_detail;
     int last_mode{};
     u64 lost_seen{};
+    /// Record first, compare after (6g (a)): the back's releases of entries sent after the last
+    /// Settle that find no record wait here for the next one.
+    std::array<VerifyEvent, 64> deferred{};
+    size_t deferred_count{};
+    u64 horizon{};      ///< Settle's position: every release before it is recorded
+    u64 signal_start{}; ///< The signal the last Settle ended: [signal_start, signal_end)
+    u64 signal_end{};
+    Source last_read_source{};
+    QmdProbe probe{};
+    u32 unpredicted_detail_logged{};
+    u64 deferred_events{};
+    /// EXP13=3: acquires the narrow feed left for records of dependency-waiting QMDs.
+    u64 not_fed_nonsimple{};
     std::array<std::array<u64, 2>, static_cast<size_t>(Fed::Count)> fed{};
     u64 fed_checks_passed{};
     u64 fed_checks_violated{};
@@ -504,10 +526,18 @@ struct State {
                  mirrored(Mirror::Resync), mirrored(Mirror::SessionStart),
                  mirrored(Mirror::AutoOff), outcome(Outcome::GeqMet), outcome(Outcome::EqMet),
                  outcome(Outcome::MaskMet));
-        if (mode == 3) {
+        if (IsFeedMode(mode)) {
             const auto fed_rate = [&](Fed kind, size_t resume) {
                 return rate(fed[static_cast<size_t>(kind)][resume]);
             };
+            u64 fed_total = not_fed_nonsimple;
+            for (const auto& by_site : fed) {
+                fed_total += by_site[0] + by_site[1];
+            }
+            const double narrow_share =
+                fed_total != 0 ? 100.0 * static_cast<double>(not_fed_nonsimple) /
+                                     static_cast<double>(fed_total)
+                               : 0.0;
             constexpr std::array<const char*, static_cast<size_t>(FeedOff::Count)> off_names{
                 "on",
                 "off: a bound violated",
@@ -522,7 +552,10 @@ struct State {
                      "newest landing: {} passed, {} violated, {} unverified after 2 s, {} not fed "
                      "(check table full), {} waiting; not fed for their QMD source: {} from "
                      "memory, {} after a wait, {} overlays from memory; audit: {} checked, {} "
-                     "wrongly met, {} unknown (session {} checked, {} wrongly met); feed {}{}",
+                     "wrongly met, {} unknown (session {} checked, {} wrongly met); {} feed: "
+                     "{:.0f} acquires/s left for dependency-waiting QMDs' records ({:.0f}% of "
+                     "those the predictions met); {} back releases waited for their record; "
+                     "feed {}{}",
                      fed_rate(Fed::QueuedPlain, 0), fed_rate(Fed::QueuedPlain, 1),
                      fed_rate(Fed::LandedPending, 0), fed_rate(Fed::LandedPending, 1),
                      fed_rate(Fed::Bound, 0), fed_rate(Fed::Bound, 1), fed_checks_passed,
@@ -531,7 +564,9 @@ struct State {
                      not_fed_source[static_cast<size_t>(Source::Waited)],
                      not_fed_source[static_cast<size_t>(Source::OverlayFromMemory)],
                      audit_checked, audit_wrong, audit_unknown, session_audit_checked,
-                     session_audit_wrong, off_names[static_cast<size_t>(feed_off)],
+                     session_audit_wrong, mode == 3 ? "narrow" : "full",
+                     rate(not_fed_nonsimple), narrow_share, deferred_events,
+                     off_names[static_cast<size_t>(feed_off)],
                      feed_off_detail.empty() ? std::string{} : " (" + feed_off_detail + ")");
         }
         if (MirrorMode()) {
@@ -649,6 +684,8 @@ struct State {
         fed_checks_passed = fed_checks_violated = fed_checks_unverified = fed_checks_full = 0;
         not_fed_source = {};
         audit_checked = audit_wrong = audit_unknown = 0;
+        not_fed_nonsimple = 0;
+        deferred_events = 0;
         since = now;
     }
 
@@ -751,7 +788,7 @@ struct State {
 
     /// EXP13=3: the feed stops for the rest of the session (until EXP13 leaves 3).
     void TurnFeedOff(FeedOff reason, std::string detail, const AuditKey* key = nullptr) {
-        if (last_mode != 3 || feed_off != FeedOff::None) {
+        if (!IsFeedMode(last_mode) || feed_off != FeedOff::None) {
             return;
         }
         ScanAudit(key);
@@ -776,6 +813,10 @@ struct State {
                       "QMD release prediction feed (EXP13=3) audit: {} decisions in the ring, "
                       "the cause names no word",
                       stored);
+            return;
+        }
+        if (key->positional) {
+            ScanAuditPositional(*key, stored);
             return;
         }
         u32 matched = 0;
@@ -803,6 +844,57 @@ struct State {
                   "{:#x} (of {} decisions on it since the record){}",
                   wrong, key->has_made ? "wrongly" : "possibly wrongly", key->device, matched,
                   first);
+    }
+
+    /// An unpredicted back release of `key.kind` at entry E = key.position (6g (b)): a missed
+    /// monotonic release only makes the word higher, so the decisions stand by value; what can
+    /// be wrong is timing. With no unmatched record of that kind on the word before E the word
+    /// was under-modelled (safe). Otherwise a decision d with record.position <= d.position < E
+    /// that folded it (d.sequence >= record.sequence) met E - d.position ring words early.
+    void ScanAuditPositional(const AuditKey& key, u64 stored) {
+        std::array<const Prediction*, Ways> early_records{};
+        size_t early_count = 0;
+        for (const Prediction& way : predictions[Bucket(key.device)]) {
+            if (way.position != 0 && way.device == key.device && way.kind == key.kind &&
+                !way.matched && way.position < key.position) {
+                early_records[early_count++] = &way;
+            }
+        }
+        u32 on_word = 0;
+        u32 early = 0;
+        std::string first;
+        for (u64 i = 0; i < stored; ++i) {
+            const Decision& decision = audit[i];
+            if (decision.device != key.device) {
+                continue;
+            }
+            ++on_word;
+            for (size_t r = 0; r < early_count; ++r) {
+                const Prediction& record = *early_records[r];
+                if (record.position <= decision.position && decision.position < key.position &&
+                    decision.sequence >= record.sequence) {
+                    if (++early <= 4) {
+                        first += fmt::format(" (op {} value {:#x}, {} ring words early)",
+                                             decision.operation, decision.value,
+                                             key.position - decision.position);
+                    }
+                    break;
+                }
+            }
+        }
+        if (early_count == 0) {
+            LOG_ERROR(HW_GPU,
+                      "QMD release prediction feed (EXP13=3/4) audit: safe, the word was "
+                      "under-modelled (no unmatched record before entry {} on device {:#x}; {} "
+                      "decisions on it stand)",
+                      key.position, key.device, on_word);
+            return;
+        }
+        LOG_ERROR(HW_GPU,
+                  "QMD release prediction feed (EXP13=3/4) audit: {} acquires wrongly met (early) "
+                  "on device {:#x} against {} unmatched records before entry {} (of {} decisions "
+                  "on it){}",
+                  early, key.device, early_count, key.position, on_word, first);
     }
 
     /// EXP13=3, each report: the decisions whose record has landed since, against the value it
@@ -1132,7 +1224,9 @@ void ApplyLanded(State& state, u64 device, u32 value, Tegra::Nx2Landing site) {
     }
 }
 
-void ApplyVerify(State& state, const VerifyEvent& event) {
+/// `retry`: a deferred event applied again (its first pass counted it already); `last_try`: no
+/// more deferring.
+void ApplyVerify(State& state, const VerifyEvent& event, bool retry, bool last_try) {
     const Writer writer = event.writer;
     const u64 device = event.device;
     const u32 payload = event.payload;
@@ -1142,14 +1236,16 @@ void ApplyVerify(State& state, const VerifyEvent& event) {
     // Made by an entry sent after the records were complete: nothing predicted it is a
     // divergence (EXP13=3 turns the feed off).
     const bool covered = state.records_valid && entry_position >= state.records_valid_from;
-    state.releases[Hash(device) % Releases] = {device, ++state.sequence, payload, writer,
-                                                 reduction};
     const bool mirror = MirrorMode();
-    if (reduction) {
-        ++state.back_reductions;
-        if (!mirror) {
-            return;
+    if (!retry) {
+        state.releases[Hash(device) % Releases] = {device, ++state.sequence, payload, writer,
+                                                     reduction};
+        if (reduction) {
+            ++state.back_reductions;
         }
+    }
+    if (reduction && !mirror) {
+        return;
     }
     // The launch the back runs is the first one sent after the entry it runs starts. With
     // EXP13=2 each record is the prediction of one release (matched once).
@@ -1172,12 +1268,37 @@ void ApplyVerify(State& state, const VerifyEvent& event) {
             found = &way;
         }
     }
+    // The copy may not have recorded it yet (6g (a)): an entry after the last Settle waits for
+    // the next one.
+    if (found == nullptr && !last_try && state.records_valid && entry_position >= state.horizon &&
+        state.deferred_count < state.deferred.size()) {
+        state.deferred[state.deferred_count++] = event;
+        state.deferred_events += retry ? 0 : 1;
+        return;
+    }
+    const auto log_unpredicted = [&] {
+        if (state.unpredicted_detail_logged >= 16) {
+            return;
+        }
+        ++state.unpredicted_detail_logged;
+        const bool inside =
+            entry_position >= state.signal_start && entry_position < state.signal_end;
+        LOG_INFO(HW_GPU,
+                 "QMD release prediction (EXP13=2-4): unpredicted {} at entry {} (QMD {:#x}, "
+                 "device {:#x}, payload {:#x}): the copy's last read was from {}; inside the "
+                 "signal last recorded ({}..{}): {}; the copy's table for the QMD: {}",
+                 reduction ? "reduction" : "release", entry_position, qmd, device, payload,
+                 source_names[static_cast<size_t>(state.last_read_source)], state.signal_start,
+                 state.signal_end, inside ? "yes" : "no",
+                 state.probe != nullptr ? state.probe(qmd) : std::string{"?"});
+    };
     const size_t index = static_cast<size_t>(writer);
     if (reduction) {
         if (!found) {
             ++state.unpredicted_reductions;
+            log_unpredicted();
             if (covered) {
-                const AuditKey key{device, 0, entry_position, false, 0};
+                const AuditKey key{device, 0, entry_position, false, 0, Kind::Reduction, true};
                 state.TurnFeedOff(FeedOff::Unpredicted,
                                   fmt::format("reduction of QMD {:#x}, device {:#x}, payload {:#x}",
                                               qmd, device, payload),
@@ -1212,8 +1333,9 @@ void ApplyVerify(State& state, const VerifyEvent& event) {
     }
     if (!found) {
         ++state.unpredicted[index];
+        log_unpredicted();
         if (covered && (writer == Writer::Qmd || writer == Writer::Dma)) {
-            const AuditKey key{device, 0, entry_position, true, payload};
+            const AuditKey key{device, 0, entry_position, true, payload, Kind::Plain, true};
             state.TurnFeedOff(FeedOff::Unpredicted,
                               fmt::format("{} release, QMD {:#x}, device {:#x} = {:#x}",
                                           writer == Writer::Qmd ? "QMD" : "copy", qmd, device,
@@ -1268,7 +1390,8 @@ void ApplyVerify(State& state, const VerifyEvent& event) {
 /// The back's releases and the landings pushed since the last drain, applied in order.
 void Drain(State& state) {
     auto& rings = GetRings();
-    rings.verify.Drain([&state](const VerifyEvent& event) { ApplyVerify(state, event); });
+    rings.verify.Drain(
+        [&state](const VerifyEvent& event) { ApplyVerify(state, event, false, false); });
     const u32 threads =
         (std::min)(rings.landing_threads.load(std::memory_order_acquire), u32{LandingRings});
     for (u32 i = 0; i < threads; ++i) {
@@ -1304,7 +1427,8 @@ void NoteUnmappedRelease() {
 }
 
 void Predict(Writer writer, u64 device, u32 payload, u64 position, u64 qmd, bool stale) {
-    auto& state = Front();
+    // Record first: the back's release of it is compared at the next drain.
+    auto& state = Get();
     Prediction record{};
     record.device = device;
     record.position = position;
@@ -1320,9 +1444,8 @@ void Predict(Writer writer, u64 device, u32 payload, u64 position, u64 qmd, bool
 }
 
 void Note(u64 device, const Record& record, u32 before, u64 position, u64 qmd) {
-    // The back's position first: every release of the entries it ran is in the rings then.
-    const u64 consumed = GpuSplit::Get().ConsumedNow();
-    auto& state = Front();
+    // Record first, compare after (6g (a)): no drain here (Settle, after the signal).
+    auto& state = Get();
     Prediction stored{};
     stored.device = device;
     stored.position = position;
@@ -1337,13 +1460,13 @@ void Note(u64 device, const Record& record, u32 before, u64 position, u64 qmd) {
     stored.read_done = record.read_done;
     stored.overlay_position = record.overlay_position;
     stored.block_position = record.block_position;
+    stored.simple = record.simple;
     static const bool hooked = [] {
         Tegra::g_nx2_landed_hook.store(&NoteLanded, std::memory_order_release);
         return true;
     }();
     (void)hooked;
     state.Insert(stored);
-    state.Sweep(consumed);
     switch (record.kind) {
     case Kind::Reduction:
         if (record.writer == Writer::Report) {
@@ -1361,6 +1484,32 @@ void Note(u64 device, const Record& record, u32 before, u64 position, u64 qmd) {
         break;
     }
     state.Tick();
+}
+
+void Settle(u64 position) {
+    // The back's position first: every release of the entries it ran is in the rings then.
+    const u64 consumed = GpuSplit::Get().ConsumedNow();
+    auto& state = Front();
+    state.signal_start = state.horizon;
+    state.signal_end = position;
+    state.horizon = (std::max)(state.horizon, position);
+    if (state.deferred_count != 0) {
+        std::array<VerifyEvent, 64> events = state.deferred;
+        const size_t count = state.deferred_count;
+        state.deferred_count = 0;
+        for (size_t i = 0; i < count; ++i) {
+            ApplyVerify(state, events[i], true, events[i].entry_position < state.horizon);
+        }
+    }
+    state.Sweep(consumed);
+}
+
+void NoteReadSource(Source source) {
+    Get().last_read_source = source;
+}
+
+void SetQmdProbe(QmdProbe probe) {
+    Get().probe = probe;
 }
 
 void NoteMirror(Mirror event) {
@@ -1539,7 +1688,7 @@ bool Feed(const AcquireCheck& check, bool resume) {
     auto& state = Front();
     state.Tick();
     state.CheckLost();
-    if (state.last_mode != 3 || state.feed_off != FeedOff::None || !state.records_valid ||
+    if (!IsFeedMode(state.last_mode) || state.feed_off != FeedOff::None || !state.records_valid ||
         state.records_valid_from > check.done || check.gpu_dirty) {
         return false;
     }
@@ -1550,6 +1699,7 @@ bool Feed(const AcquireCheck& check, bool resume) {
     }
     const Compare compare = CompareOf(check.operation);
     const size_t resumed = resume ? 1 : 0;
+    const bool narrow = state.last_mode == 3;
     // A plain or max release, the word's newest record: queued, or run with its landing still to
     // come (the word holds what it held when it was sent), with no reduction or max release
     // still to land before it and nothing queued after it that may write the word (6b slice B,
@@ -1573,6 +1723,10 @@ bool Feed(const AcquireCheck& check, bool resume) {
                     ++state.not_fed_source[static_cast<size_t>(newest.source)];
                     return false;
                 }
+                if (narrow && newest.writer == Writer::Qmd && !newest.simple) {
+                    ++state.not_fed_nonsimple;
+                    return false;
+                }
                 const Fed kind = queued ? Fed::QueuedPlain : Fed::LandedPending;
                 ++state.fed[static_cast<size_t>(kind)][resumed];
                 state.Audit({check.device, newest.sequence, newest.position, Clock::now(),
@@ -1593,6 +1747,14 @@ bool Feed(const AcquireCheck& check, bool resume) {
     for (size_t i = 0; i < count; ++i) {
         if (!records[i]->landed && !FeedSource(records[i]->source)) {
             ++state.not_fed_source[static_cast<size_t>(records[i]->source)];
+            return false;
+        }
+    }
+    // The narrow feed: an unlanded record of a dependency-waiting QMD on the word, whose timing
+    // is the uncertain thing, means no feed.
+    for (size_t i = 0; narrow && i < count; ++i) {
+        if (!records[i]->landed && records[i]->writer == Writer::Qmd && !records[i]->simple) {
+            ++state.not_fed_nonsimple;
             return false;
         }
     }

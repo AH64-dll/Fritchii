@@ -246,12 +246,27 @@ struct FrontQmdMirror {
 };
 FrontQmdMirror g_front_qmd;
 
+// The copy's scheduler state for a QMD, for the unpredicted lines (6g (a) discriminator).
+std::string ProbeFrontQmd(u64 qmd) {
+    const auto& table = g_front_qmd.table;
+    const auto it = table.find(qmd);
+    if (it == table.end()) {
+        return "absent";
+    }
+    const NativeQmdScheduler::State& state = it->second;
+    return fmt::format("loaded {}, scheduled {}, completed {}, dependencies {}, deferred {}, base "
+                       "count {}",
+                       state.loaded, state.scheduled, state.completed, state.dependencies,
+                       state.deferred, (state.descriptor[4] >> 14) & 0xffff);
+}
+
 // The back runs everything sent (the signal being noted too), then the front copies its table.
 void ResyncFrontQmd(VideoCommon::GpuSplit& split, VideoCommon::QmdPrediction::Mirror why) {
     auto& mirror = g_front_qmd;
     split.Drain(VideoCommon::DrainSite::QmdRead);
     // Reads and patches compare write stamps (EnableWriteStamps counts what came before).
     split.EnableWriteStamps();
+    VideoCommon::QmdPrediction::SetQmdProbe(&ProbeFrontQmd);
     // The back is idle: nothing else touches its table now.
     mirror.table = NativeQmdScheduler::SharedStates();
     mirror.scheduler.table = &mirror.table;
@@ -2274,10 +2289,23 @@ void KeplerCompute::FrontQmdSignal(VideoCommon::GpuSplit& split, GPUVAddr qmd_ad
     bool unknown = false;
     u64 running_qmd = 0; // The QMD the releases below belong to (read last), as on the back
     Prediction::Record read_info{}; // Where that read came from
+    // Simple (6g (c)): a schedule of this QMD that loads it with no deferred decrements (action
+    // 3 always loads; 2 only when not loaded yet), and the QMD read at its run has no base
+    // dependency count; its releases then come from this very signal on the back too.
+    const u32 action = argument & 15;
+    bool schedule_simple = action == 3 || action == 2;
+    if (const auto entry = mirror.table.find(qmd_address); entry != mirror.table.end()) {
+        schedule_simple = schedule_simple && entry->second.deferred == 0 &&
+                          (action == 3 || !entry->second.loaded);
+    }
+    u32 read_base = ~0U;
     const auto read = [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
         running_qmd = address;
         read_info = {};
-        return FrontReadQmd(split, address, descriptor, unknown, read_info);
+        const bool ok = FrontReadQmd(split, address, descriptor, unknown, read_info);
+        read_base = ok ? (descriptor[4] >> 14) & 0xffff : ~0U;
+        Prediction::NoteReadSource(read_info.source);
+        return ok;
     };
     // As ProcessNativeMethod's release callback: a reduction (bit 26), else a four-word release
     // (payload and time stamp), a max (bit 19) or a plain write of the payload.
@@ -2299,7 +2327,9 @@ void KeplerCompute::FrontQmdSignal(VideoCommon::GpuSplit& split, GPUVAddr qmd_ad
                                   .source = read_info.source,
                                   .read_done = read_info.read_done,
                                   .overlay_position = read_info.overlay_position,
-                                  .block_position = read_info.block_position};
+                                  .block_position = read_info.block_position,
+                                  .simple = schedule_simple && running_qmd == qmd_address &&
+                                            read_base == 0};
         if ((flags & (1U << 26)) != 0) {
             record.kind = Prediction::Kind::Reduction;
             record.op = (flags >> 20) & 7;
@@ -2313,6 +2343,8 @@ void KeplerCompute::FrontQmdSignal(VideoCommon::GpuSplit& split, GPUVAddr qmd_ad
     };
     const auto dispatch = [](const NativeQmdScheduler::Descriptor&) { return true; };
     (void)mirror.scheduler.Signal(qmd_address, argument, read, release, dispatch);
+    // Every release of the signal is recorded: the back's ones are compared now.
+    Prediction::Settle(position);
     if (unknown) {
         // The back's run of this signal may differ from the copy's: take its table.
         ResyncFrontQmd(split, Prediction::Mirror::Resync);
