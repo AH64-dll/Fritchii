@@ -34,6 +34,7 @@
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/program_metadata.h"
 #include "core/file_sys/registered_cache.h"
+#include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
 #include "core/file_sys/savedata_factory.h"
 #include "core/file_sys/submission_package.h"
@@ -52,6 +53,7 @@
 #include "core/hle/service/am/process_creation.h"
 #include "core/hle/service/apm/apm_controller.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/service/filesystem/romfs_controller.h"
 #include "core/hle/service/glue/glue_manager.h"
 #include "core/hle/service/glue/time/static.h"
 #include "core/hle/service/psc/time/static.h"
@@ -73,6 +75,7 @@
 #include "hid_core/hid_core.h"
 #include "network/network.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_precompile.h"
 #include "video_core/renderer_base.h"
 #include "video_core/video_core.h"
 
@@ -457,6 +460,27 @@ struct System::Impl {
             cheat_engine->Initialize();
         }
 
+        // EDEN_NX2_PRECOMPILE: the game's files, for assembling a precompile recipe (#895) on the
+        // pipeline cache's preparation thread. The RomFS as the process reads it, update included.
+        if (VideoCommon::Nx2Precompile::Mode() != 0) {
+            const u64 process_id = process->GetHandle()->GetProcessId();
+            VideoCommon::Nx2Precompile::SetGameFiles(
+                params.program_id, [this, process_id]() -> std::vector<FileSys::VirtualDir> {
+                    Service::FileSystem::ProgramId program{};
+                    std::shared_ptr<Service::FileSystem::SaveDataController> save;
+                    std::shared_ptr<Service::FileSystem::RomFsController> romfs;
+                    if (fs_controller.OpenProcess(&program, &save, &romfs, process_id).IsError() ||
+                        !romfs) {
+                        return {};
+                    }
+                    auto dir = FileSys::ExtractRomFS(romfs->OpenRomFSCurrentProcess());
+                    if (!dir) {
+                        return {};
+                    }
+                    return {std::move(dir)};
+                });
+        }
+
         // Register with applet manager
         // All threads are started, begin main process execution, now that we're in the clear
         applet_manager.CreateAndInsertByFrontendAppletParameters(std::move(process), params);
@@ -498,6 +522,8 @@ struct System::Impl {
 
     void ShutdownMainProcess() {
         debug_service.reset();
+        // Waits for a call in progress (it opens the RomFS, a quick step).
+        VideoCommon::Nx2Precompile::SetGameFiles(0, {});
         SetShuttingDown(true);
         Common::ADPF::Shutdown();
 

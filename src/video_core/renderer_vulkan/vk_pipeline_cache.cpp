@@ -28,6 +28,7 @@
 #include <streambuf>
 #include "common/cityhash.h"
 #include "common/polyfill_thread.h"
+#include "common/scm_rev.h"
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
 #include "common/fs/fs_util.h"
@@ -52,6 +53,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_precompile.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/pipeline_cache_policy.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
@@ -1683,6 +1685,7 @@ PipelineCache::~PipelineCache() {
     background_stop.store(true, std::memory_order_relaxed);
     graphics_warm_threads.clear();
     compute_warm_threads.clear();
+    precompile_thread = {};
     // Its threads build with the members below (a translation in progress finishes).
     translate_queue.reset();
     StopBackgroundPipelines();
@@ -2257,6 +2260,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         warm_cancel = true;
         graphics_warm_threads.clear();
         compute_warm_threads.clear();
+        precompile_thread = {};
         warm_stop_callback.reset();
         compute_warm_done = true;
         // The earlier load's background builds too: its pipelines no draw took are dropped
@@ -2794,6 +2798,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             }});
         StartComputeWarm(title_id);
         StartGraphicsWarm(title_id);
+        StartPrecompiled(title_id, base_dir);
     }
 }
 
@@ -3394,6 +3399,416 @@ bool PipelineCache::WaitForWarmTurn(std::stop_token stop) {
     // Idle priority and off the cores pinned to the GPU threads, like the quiet prebuild.
     PlacePrebuildThread(true);
     return !stop.stop_requested() && !warm_cancel;
+}
+
+void PipelineCache::StartPrecompiled(u64 title_id, const std::filesystem::path& base_dir) {
+    precompile_thread = {};
+    shader_notify.SetPrecompileAvailable(false);
+    const int mode = VideoCommon::Nx2Precompile::Mode();
+    if (mode == 0) {
+        return;
+    }
+    // The prepared pipelines are kept by the driver's own cache. Without one they would go to the
+    // emulator's pipeline cache file, which is loaded whole at boot: only on request there.
+    if (!DriverCachesPipelines(device) && mode < 2) {
+        LOG_INFO(Render_Vulkan, "Precompiled pipelines skipped: the driver keeps no pipeline cache "
+                                "of its own (EDEN_NX2_PRECOMPILE=2 prepares them anyway)");
+        return;
+    }
+    // Taken here, before the GPU thread starts adding to it.
+    precompile_disk_keys = std::make_shared<const std::unordered_set<u64>>(disk_pipelines);
+    precompile_thread = std::jthread([this, title_id, base_dir](std::stop_token stop) {
+        Common::SetCurrentThreadName("VkPrecompile");
+        PlacePrebuildThread(true);
+        const auto file = VideoCommon::Nx2Precompile::EnsurePrecompiledFile(title_id, base_dir,
+                                                                            CACHE_VERSION, stop);
+        if (file.empty() || stop.stop_requested() || warm_cancel) {
+            return;
+        }
+        shader_notify.SetPrecompileAvailable(true);
+        bool force = false;
+        for (;;) {
+            shader_notify.PrecompileStarted();
+            PreparePrecompiled(base_dir, stop, {}, file, force);
+            shader_notify.SetWarmProgress(0, 0, 0);
+            shader_notify.PrecompileEnded();
+            // Prepare Shaders Now prepares the file once more, whatever the stamp says.
+            while (!stop.stop_requested() && !warm_cancel && !shader_notify.PrecompileRequested()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{250});
+            }
+            if (stop.stop_requested() || warm_cancel) {
+                break;
+            }
+            LOG_INFO(Render_Vulkan, "Precompiled pipelines: prepared again (Prepare Shaders Now)");
+            force = true;
+        }
+        if (shader_notify.PrecompileRequested()) {
+            // A request that came with the stop: it was counted as a warm-up.
+            shader_notify.PrecompileStarted();
+            shader_notify.PrecompileEnded();
+        }
+        shader_notify.SetPrecompileAvailable(false);
+    });
+}
+
+void PipelineCache::CanonicalizeNativeKey(
+    GraphicsPipelineCacheKey& key,
+    std::span<const Shader::Environment* const> envs) const noexcept {
+    if (envs.empty() || !std::ranges::all_of(envs, [](const Shader::Environment* env) {
+            return env->IsNativeProgram();
+        })) {
+        return;
+    }
+    u32 mask = ~0U;
+    for (const Shader::Environment* const env : envs) {
+        if (env->ShaderStage() == Shader::Stage::Task || env->ShaderStage() == Shader::Stage::Mesh) {
+            mask = 0;
+            break;
+        }
+        if (env->ShaderStage() == Shader::Stage::VertexB &&
+            !IsUnmaskedVertexProgram(key.unique_hashes[1])) {
+            mask = VideoCommon::GenericReadMask(env->SPH());
+        }
+    }
+    key.state.CanonicalizeNative(mask);
+}
+
+void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
+                                       std::stop_token stop_loading,
+                                       const VideoCore::DiskResourceLoadCallback& callback,
+                                       const std::filesystem::path& file, bool force) {
+    // Ported from #895 for Fritchii: it runs beside the game (precompile_thread) instead of
+    // before the first frame, on threads of its own at idle priority instead of the boot's
+    // pipeline workers, and reads each record from the file when it is built instead of
+    // holding all of them (Ocarina of Time: 132,606 records, ~140 MB of keys).
+    if (VideoCommon::Nx2Precompile::Mode() == 0) {
+        return;
+    }
+    // Layout (tools/nx2-precompile/README.md): "NX2PREP1", u32 cache version, u32 environment
+    // count, u32 record count, u32 reserved; per environment u64 offset and u64 size of a
+    // GenericEnvironment::Serialize blob; per record u8 kind (0 graphics, 1 compute), u8
+    // environment count, u16 reserved, u32 environment indices in stage order, then the key.
+    const auto path = file.empty() ? VideoCommon::Nx2Precompile::PrecompiledPath(base_dir,
+                                                                                 CACHE_VERSION)
+                                   : file;
+    const std::string path_text = Common::FS::PathToUTF8String(path);
+    std::error_code error;
+    const auto file_size = std::filesystem::file_size(path, error);
+    if (error) {
+        // A file built for an older cache version is not read: it has to be built again.
+        for (u32 version = CACHE_VERSION; version-- > 40;) {
+            const auto older = VideoCommon::Nx2Precompile::PrecompiledPath(base_dir, version);
+            if (std::filesystem::exists(older, error)) {
+                LOG_WARNING(Render_Vulkan,
+                            "Precompiled pipelines skipped: {} is for cache version {}, this "
+                            "build uses {}",
+                            older.filename().string(), version, CACHE_VERSION);
+                break;
+            }
+        }
+        return;
+    }
+    const auto modified = std::filesystem::last_write_time(path, error).time_since_epoch().count();
+    // The driver keeps what it compiled; the step runs again for another file, driver or build.
+    const auto stamp_path =
+        base_dir / fmt::format("precompiled_prepared.fork-v{}.txt", CACHE_VERSION);
+    const std::string stamp = fmt::format("{} {} {:#x} {} {}\n", file_size, modified,
+                                          device.GetDriverVersion(), Common::g_scm_rev,
+                                          device.GetModelName());
+    if (!force && !VideoCommon::Nx2Precompile::Forced()) {
+        std::ifstream stamp_file(stamp_path, std::ios::binary);
+        const std::string previous{std::istreambuf_iterator<char>(stamp_file), {}};
+        if (previous == stamp) {
+            LOG_INFO(Render_Vulkan, "Precompiled pipelines already prepared for this driver");
+            return;
+        }
+    }
+
+    // The environment index and where each record starts; records are read again when built.
+    std::vector<std::pair<u64, u64>> env_index;
+    std::vector<u64> record_offsets;
+    try {
+        std::ifstream in(path, std::ios::binary);
+        in.exceptions(std::ifstream::failbit);
+        std::array<char, 8> magic{};
+        u32 version{}, env_count{}, record_count{}, reserved{};
+        in.read(magic.data(), magic.size())
+            .read(reinterpret_cast<char*>(&version), sizeof(version))
+            .read(reinterpret_cast<char*>(&env_count), sizeof(env_count))
+            .read(reinterpret_cast<char*>(&record_count), sizeof(record_count))
+            .read(reinterpret_cast<char*>(&reserved), sizeof(reserved));
+        if (std::string_view{magic.data(), magic.size()} != "NX2PREP1" ||
+            version != CACHE_VERSION) {
+            LOG_WARNING(Render_Vulkan, "Precompiled pipeline file {} has another format or version",
+                        path_text);
+            return;
+        }
+        if (u64{env_count} * 16 > file_size || u64{record_count} * 8 > file_size) {
+            LOG_ERROR(Render_Vulkan, "Precompiled pipeline file {} is damaged", path_text);
+            return;
+        }
+        env_index.resize(env_count);
+        in.read(reinterpret_cast<char*>(env_index.data()),
+                static_cast<std::streamsize>(env_count * sizeof(env_index[0])));
+        if (std::ranges::any_of(env_index, [&](const auto& entry) {
+                return entry.first > file_size || entry.second > file_size - entry.first;
+            })) {
+            LOG_ERROR(Render_Vulkan, "Precompiled pipeline file {} is damaged", path_text);
+            return;
+        }
+        record_offsets.reserve(record_count);
+        std::array<u32, Maxwell::MaxShaderProgram> ids{};
+        for (u32 i = 0; i < record_count; ++i) {
+            record_offsets.push_back(static_cast<u64>(in.tellg()));
+            u8 kind{}, count{};
+            u16 pad{};
+            in.read(reinterpret_cast<char*>(&kind), 1)
+                .read(reinterpret_cast<char*>(&count), 1)
+                .read(reinterpret_cast<char*>(&pad), 2);
+            const bool compute = kind == 1;
+            if (count == 0 || count > ids.size() || kind > 1 || (compute && count != 1)) {
+                LOG_ERROR(Render_Vulkan, "Precompiled pipeline file {} is damaged", path_text);
+                return;
+            }
+            in.read(reinterpret_cast<char*>(ids.data()), count * sizeof(u32));
+            if (std::any_of(ids.begin(), ids.begin() + count,
+                            [&](u32 id) { return id >= env_count; })) {
+                LOG_ERROR(Render_Vulkan, "Precompiled pipeline file {} is damaged", path_text);
+                return;
+            }
+            in.seekg(compute ? sizeof(ComputePipelineCacheKey) : sizeof(GraphicsPipelineCacheKey),
+                     std::ios::cur);
+        }
+    } catch (const std::ios_base::failure& e) {
+        LOG_ERROR(Render_Vulkan, "Cannot read precompiled pipelines: {}", e.what());
+        return;
+    }
+
+    const size_t total = record_offsets.size();
+    // A checkpoint lets an interrupted step (closed, or a crash) continue where it stopped. A boot
+    // that starts twice from the same record without getting further skips past it.
+    const auto progress_path =
+        base_dir / fmt::format("precompiled_progress.fork-v{}.txt", CACHE_VERSION);
+    const size_t threads = VideoCommon::Nx2Precompile::Threads();
+    size_t start_index = 0;
+    u32 restarts = 0;
+    if (!force) {
+        std::ifstream progress_file(progress_path, std::ios::binary);
+        std::string line;
+        size_t next{};
+        u32 count{};
+        if (std::getline(progress_file, line) && line + '\n' == stamp &&
+            (progress_file >> next >> count)) {
+            start_index = std::min(next, total);
+            restarts = count + 1;
+        }
+    }
+    if (restarts >= 2) {
+        const size_t jump = std::min(total - start_index, threads * 8);
+        LOG_WARNING(Render_Vulkan,
+                    "Precompiled pipelines stopped twice near record {}: skipping {} records",
+                    start_index, jump);
+        start_index += jump;
+        restarts = 0;
+    }
+    const auto write_progress = [&](size_t next, u32 count) {
+        std::ofstream progress_file(progress_path, std::ios::binary | std::ios::trunc);
+        progress_file << stamp << next << ' ' << count << '\n';
+    };
+    write_progress(start_index, restarts);
+
+    struct State {
+        std::mutex mutex;
+        std::atomic<size_t> next{};
+        std::atomic<size_t> built{};
+        std::atomic<size_t> fast{};      ///< built in under FastBuild: most likely a driver cache hit
+        std::atomic<size_t> failed{};
+        std::atomic<size_t> other_device{};
+        std::atomic<size_t> known{};     ///< graphics keys the disk cache holds
+        std::atomic<size_t> finished{};
+        size_t low_water{};              ///< first record not finished yet (under mutex)
+        size_t checkpoint{};
+        std::vector<u8> done;
+        WarmProgressThrottle throttle;
+    } state;
+    state.done.assign(total, 0);
+    state.next = start_index;
+    state.finished = start_index;
+    state.low_water = state.checkpoint = start_index;
+    // A pipeline the driver finds in its cache builds in a few ms here (translation included);
+    // a compile takes tens to hundreds.
+    constexpr auto FastBuild = std::chrono::milliseconds{20};
+    const auto disk_keys = precompile_disk_keys;
+    const auto begin = std::chrono::steady_clock::now();
+    const auto complete = [&](size_t index) {
+        const size_t finished = state.finished.fetch_add(1) + 1;
+        {
+            std::scoped_lock lock{state.mutex};
+            state.done[index] = 1;
+            while (state.low_water < total && state.done[state.low_water]) {
+                ++state.low_water;
+            }
+            if (state.low_water >= state.checkpoint + 512) {
+                state.checkpoint = state.low_water;
+                write_progress(state.low_water, 0);
+            }
+        }
+        if (state.throttle.Due()) {
+            shader_notify.SetWarmProgress(3, finished, total);
+        }
+        if (callback && (finished % 64 == 0 || finished == total)) {
+            callback(VideoCore::LoadCallbackStage::Build, finished, total);
+        }
+        if (finished % 5000 == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled pipelines: {} of {} done, {} built ({} fast), {} failed, {:.0f} s",
+                     finished, total, state.built.load(), state.fast.load(), state.failed.load(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - begin)
+                         .count());
+        }
+    };
+    const auto work = [&](std::stop_token stop) {
+        Common::SetCurrentThreadName("VkPrecompile");
+        PlacePrebuildThread(true);
+        // Shader libraries built here go to the driver's cache only, like the graphics warm-up.
+        GraphicsPipelineLibraryCache::SetNoRetainOnThisThread(true);
+        std::ifstream in(path, std::ios::binary);
+        in.exceptions(std::ifstream::failbit);
+        while (!stop.stop_requested() && !stop_loading.stop_requested() && !warm_cancel) {
+            const size_t index = state.next.fetch_add(1);
+            if (index >= total) {
+                break;
+            }
+            bool ok = false;
+            bool skipped = false;
+            const auto build_begin = std::chrono::steady_clock::now();
+            try {
+                in.clear();
+                in.seekg(static_cast<std::streamoff>(record_offsets[index]));
+                u8 kind{}, count{};
+                u16 pad{};
+                std::array<u32, Maxwell::MaxShaderProgram> ids{};
+                in.read(reinterpret_cast<char*>(&kind), 1)
+                    .read(reinterpret_cast<char*>(&count), 1)
+                    .read(reinterpret_cast<char*>(&pad), 2)
+                    .read(reinterpret_cast<char*>(ids.data()), count * sizeof(u32));
+                const bool compute = kind == 1;
+                ComputePipelineCacheKey compute_key{};
+                GraphicsPipelineCacheKey graphics_key{};
+                if (compute) {
+                    in.read(reinterpret_cast<char*>(&compute_key), sizeof(compute_key));
+                } else {
+                    in.read(reinterpret_cast<char*>(&graphics_key), sizeof(graphics_key));
+                    auto& key_state = graphics_key.state;
+                    // The driver fields only tell cache generations apart; the pipeline does not
+                    // use them. Records made before a driver update are built for this driver,
+                    // as draws will key them.
+                    key_state.driver_id = dynamic_features.driver_id;
+                    key_state.driver_version = dynamic_features.driver_version;
+                    const bool other_device =
+                        (key_state.extended_dynamic_state != 0) !=
+                            dynamic_features.has_extended_dynamic_state ||
+                        (key_state.extended_dynamic_state_2 != 0) !=
+                            dynamic_features.has_extended_dynamic_state_2 ||
+                        (key_state.extended_dynamic_state_2_logic_op != 0) !=
+                            dynamic_features.has_extended_dynamic_state_2_logic_op ||
+                        (key_state.extended_dynamic_state_3_blend != 0) !=
+                            dynamic_features.has_extended_dynamic_state_3_blend ||
+                        (key_state.extended_dynamic_state_3_enables != 0) !=
+                            dynamic_features.has_extended_dynamic_state_3_enables ||
+                        (key_state.color_write_enable_dynamic != 0) !=
+                            dynamic_features.has_color_write_enable ||
+                        (key_state.dynamic_vertex_input != 0) !=
+                            dynamic_features.has_dynamic_vertex_input ||
+                        (key_state.provoking_vertex_last != 0 &&
+                         !dynamic_features.has_provoking_vertex_last_mode);
+                    // Made for a device with other dynamic state, or in the disk cache, which
+                    // builds it at boot or when a draw needs it (from the driver's cache then).
+                    if (other_device) {
+                        ++state.other_device;
+                        skipped = true;
+                    } else if (disk_keys && disk_keys->contains(graphics_key.Hash())) {
+                        ++state.known;
+                        skipped = true;
+                    }
+                }
+                // A compute record is built even when the disk cache holds its key: a key has a
+                // record for each storage pointer state the program can be translated in.
+                if (!skipped) {
+                    std::vector<FileEnvironment> envs(count);
+                    for (size_t i = 0; i < count; ++i) {
+                        const auto [offset, size] = env_index[ids[i]];
+                        in.clear();
+                        in.seekg(static_cast<std::streamoff>(offset));
+                        if (!FileEnvironment::RecordFits(in, size)) {
+                            throw std::ios_base::failure("environment larger than its entry");
+                        }
+                        envs[i].Deserialize(in);
+                    }
+                    ShaderPools pools;
+                    if (compute) {
+                        ok = CreateComputePipeline(pools, compute_key, envs.front(), nullptr,
+                                                   false, true)
+                                 .pipeline != nullptr;
+                    } else {
+                        boost::container::static_vector<Shader::Environment*,
+                                                        Maxwell::MaxShaderProgram>
+                            env_ptrs;
+                        for (auto& env : envs) {
+                            env_ptrs.push_back(&env);
+                        }
+                        const auto pipeline{CreateGraphicsPipeline(pools, graphics_key,
+                                                                   MakeSpan(env_ptrs), nullptr,
+                                                                   false)};
+                        ok = pipeline && !pipeline->Failed();
+                    }
+                }
+            } catch (const std::exception& e) {
+                LOG_DEBUG(Render_Vulkan, "Precompiled pipeline {} failed: {}", index, e.what());
+            }
+            if (!skipped) {
+                ++(ok ? state.built : state.failed);
+                if (ok && std::chrono::steady_clock::now() - build_begin < FastBuild) {
+                    ++state.fast;
+                }
+            }
+            complete(index);
+        }
+    };
+    LOG_INFO(Render_Vulkan,
+             "Preparing {} precompiled pipelines from {}, from record {}, on {} idle threads",
+             total, path_text, start_index, threads);
+    shader_notify.SetWarmProgress(3, start_index, total);
+    if (callback) {
+        callback(VideoCore::LoadCallbackStage::Build, start_index, total);
+    }
+    {
+        std::vector<std::jthread> pool;
+        for (size_t i = 0; i < threads; ++i) {
+            pool.emplace_back(work);
+        }
+        // Joined here: a jthread's destructor would ask it to stop first. They stop on their
+        // own with stop_loading (the precompile thread's) and warm_cancel.
+        for (auto& thread : pool) {
+            thread.join();
+        }
+    }
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+    const size_t reached = std::min(state.finished.load(), total);
+    LOG_INFO(Render_Vulkan,
+             "Precompiled pipelines: {} prepared ({} under {} ms each, most likely already in the "
+             "driver cache), {} failed, {} skipped ({} in the disk cache, {} for another device), "
+             "{} not reached, in {:.1f} s",
+             state.built.load(), state.fast.load(), FastBuild.count(), state.failed.load(),
+             state.known.load() + state.other_device.load(), state.known.load(),
+             state.other_device.load(), total - reached, seconds);
+    if (!stop_loading.stop_requested() && !warm_cancel && reached >= total) {
+        std::ofstream stamp_file(stamp_path, std::ios::binary | std::ios::trunc);
+        stamp_file << stamp;
+        stamp_file.close();
+        std::filesystem::remove(progress_path, error);
+    }
 }
 
 vk::PipelineCache& PipelineCache::WarmPipelineCache() {
