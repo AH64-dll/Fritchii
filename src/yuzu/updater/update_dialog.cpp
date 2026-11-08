@@ -26,6 +26,8 @@
 #endif
 #include "ui_update_dialog.h"
 #include "update_dialog.h"
+#include "yuzu/fritchii/fritchii_ui.h"
+#include "yuzu/fritchii/whats_new.h"
 
 #include "common/httplib.h"
 
@@ -119,6 +121,16 @@ UpdateDialog::UpdateDialog(const Common::Net::Release& release,
     }
 
     ui->body->setMarkdown(QString::fromStdString(text));
+    if (FritchiiUi::Enabled()) {
+        // The notes come first: no download instructions, roomier type.
+        setWindowTitle(tr("Update"));
+        ui->body->setObjectName(QStringLiteral("FritchiiNotes"));
+        FritchiiUi::SetNotes(ui->body, FritchiiUi::CleanReleaseNotes(
+                                           QString::fromStdString(release.body)));
+        ui->version->setObjectName(QStringLiteral("FritchiiDialogTitle"));
+        ui->version->setWordWrap(true);
+        resize(700, 640);
+    }
 
     ui->buttonBox->button(QDialogButtonBox::No)->setText(tr("Remind Me Later"));
     auto* skip = ui->buttonBox->addButton(tr("Skip This Version"), QDialogButtonBox::ActionRole);
@@ -127,9 +139,12 @@ UpdateDialog::UpdateDialog(const Common::Net::Release& release,
     if (m_fritchii) {
         m_asset = *fritchii_asset;
         ui->groupBox->setHidden(true);
-        ui->version->setText(tr("%1 is available. You have Fritchii v%2.")
-                                 .arg(QString::fromStdString(release.title),
-                                      QString::fromStdString(RunningVersionText())));
+        ui->version->setText(
+            FritchiiUi::Enabled()
+                ? tr("%1 is ready").arg(QString::fromStdString(release.title))
+                : tr("%1 is available. You have Fritchii v%2.")
+                      .arg(QString::fromStdString(release.title),
+                           QString::fromStdString(RunningVersionText())));
         auto* install = ui->buttonBox->button(QDialogButtonBox::Yes);
         if (m_asset.sha256.empty()) {
             // Without a published checksum there is nothing to verify the download against.

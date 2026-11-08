@@ -3,13 +3,16 @@
 // MainWindow's Fritchii setup, kept out of main_window.cpp so Lichii merges stay clean. It runs
 // once at the end of the constructor and does nothing in a Lichii build.
 
+#include <QApplication>
 #include <QStatusBar>
+#include <QTimer>
 
 #include "core/core.h"
 #include "qt_common/qt_common.h"
 #include "ui_main.h"
 #include "yuzu/fritchii/fritchii_ui.h"
 #include "yuzu/fritchii/home.h"
+#include "yuzu/fritchii/whats_new.h"
 #include "yuzu/game/game_list.h"
 #include "yuzu/main_window.h"
 #include "yuzu/multiplayer/state.h"
@@ -20,7 +23,33 @@ void MainWindow::SetUpFritchiiUi() {
         return;
     }
 
-    FritchiiUi::RestructureMenus(*ui, *this, {.export_log = [this] { OnExportLog(); }});
+    FritchiiUi::RestructureMenus(*ui, *this,
+                                 {.export_log = [this] { OnExportLog(); },
+                                  .whats_new = [this] { FritchiiUi::ShowWhatsNew(this); }});
+
+    // "What's new" once per version after an update, when nothing else is on screen: no other
+    // dialog (first-launch question, update offer, restart note) and no game running.
+    const bool used_before = Settings::values.oot_fps_asked.GetValue();
+    if (FritchiiUi::ShouldShowWhatsNew(used_before)) {
+        auto* timer = new QTimer(this);
+        timer->setInterval(1500);
+        connect(timer, &QTimer::timeout, this, [this, timer] {
+            const bool first_question_pending =
+                !launched_with_game && !Settings::values.oot_fps_asked.GetValue();
+            if (QApplication::activeModalWidget() != nullptr || first_question_pending ||
+                emulation_running || boot_in_progress) {
+                return;
+            }
+            timer->stop();
+            timer->deleteLater();
+            FritchiiUi::MarkWhatsNewSeen();
+            OnSaveConfig();
+            FritchiiUi::ShowWhatsNew(this);
+        });
+        timer->start();
+    } else if (!used_before) {
+        OnSaveConfig(); // a first install recorded its version
+    }
 
     // Status bar: the everyday controls stay (60/30 FPS, docked, volume); renderer, accuracy,
     // filter, anti-aliasing and effects move into one Graphics button. The old buttons stay
