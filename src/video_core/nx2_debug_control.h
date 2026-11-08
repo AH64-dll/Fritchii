@@ -163,6 +163,8 @@ inline std::atomic<int> g_idle_pause{-1};
 /// under both caches' mutexes. On by default (2026-11-08): Castle Town guest-core lock spinning
 /// 11.6% -> 7.6% of busy (writes 6.1% -> 0.7%), standing 43.0 -> 45.3 fps, route 45.0 fps with
 /// 175 flash reports (camera-motion noise ~270 either way).
+/// EXP36 (live): 1 = guest reads of cached memory always take GetFlushArea's locked path (turns
+/// off its lock-free answer for image-free, never-GPU-written pages). For the washed-out hunt.
 /// EXP27 (keep the split's back fed, fewer submits; zortos293/Lichii#717), bits: 1 = the front
 /// publishes before it yields or sleeps polling suspended channels (PUBLISH_WAITS,
 /// GpuSplit::PublishBeforeWait), 2 = while the back found the ring empty, each entry is published

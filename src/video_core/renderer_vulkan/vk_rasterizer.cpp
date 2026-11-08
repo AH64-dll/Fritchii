@@ -2018,7 +2018,8 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
     // and the locked path would answer this same preemptive page-aligned area.
     const DAddr page_begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE);
-    if (!texture_cache.page_filter.Any(addr, size) &&
+    // EDEN_NX2_EXP36=1 turns this off (live), for the washed-out scene hunt.
+    if (VideoCore::Nx2Debug::Experiment(36) == 0 && !texture_cache.page_filter.Any(addr, size) &&
         !MayBeGpuModified(page_begin, page_end - page_begin)) {
         CountGuestAccess(g_guest_access.read_fast);
         return VideoCore::RasterizerDownloadArea{
