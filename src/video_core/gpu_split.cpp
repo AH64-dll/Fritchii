@@ -142,6 +142,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     }();
     (void)switches_read;
     ring = std::make_unique<u64[]>(RingWords);
+    ++session;
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
@@ -183,6 +184,8 @@ void GpuSplit::Stop() {
     last_sync_position = 0;
     last_memory_write_position = 0;
     previous_memory_write_position = 0;
+    last_method_write_position = 0;
+    previous_method_write_position = 0;
     ranged_writes.clear();
     last_function_position = 0;
     writes.Reset();
@@ -442,6 +445,9 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
     const u32 method = last_memory_write_method;
     last_memory_write_position = previous_memory_write_position;
     last_memory_write_method = previous_memory_write_method;
+    if (last_method_write_position == write_position) {
+        last_method_write_position = previous_method_write_position;
+    }
     static const bool forward = [] {
         const char* const value = std::getenv("EDEN_NX2_FORWARD_READS");
         return value == nullptr || value[0] != '0';
@@ -474,6 +480,7 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
             last_memory_write_position = oldest.position;
             last_memory_write_method = oldest.method;
         }
+        last_method_write_position = (std::max)(last_method_write_position, oldest.position);
         ranged_writes.pop_front();
     }
     RangedWrite& write = ranged_writes.emplace_back(RangedWrite{write_position, begin, end, method, 0, {}});
@@ -536,6 +543,70 @@ size_t GpuSplit::MaxRangedWrites() {
         return value != nullptr ? (std::max<size_t>)(std::strtoull(value, nullptr, 10), 1) : 256;
     }();
     return max;
+}
+
+GpuSplit::GuestWriters GpuSplit::QueuedGuestWriters(u64 done, GPUVAddr address, u64 device,
+                                                     u64 size, std::span<const u64> skip) const {
+    GuestWriters found{};
+    found.unbounded = (std::max)({last_unbounded_writer_position, last_unranged_position,
+                                  last_function_position, last_method_write_position});
+    if (found.unbounded <= done) {
+        found.unbounded = 0;
+    }
+    const u64 end = device + size;
+    // NoteMemoryWrite and NoteMemoryWriteData (puller releases, 3D reports and uploads), newest
+    // first; an unknown range may write anything.
+    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+    u64 scanned = 0;
+    for (; scanned < remembered; ++scanned) {
+        const PendingWrite& write =
+            pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
+        if (write.position <= done) {
+            break;
+        }
+        if (write.end == ~u64{0}) {
+            found.unbounded = (std::max)(found.unbounded, write.position);
+        } else if (write.begin < end && device < write.end) {
+            found.noted = (std::max)(found.noted, write.position);
+            break;
+        }
+    }
+    if (scanned == pending_writes.size()) {
+        found.unbounded = write_position;
+    }
+    // NoteWriterRange and NoteReleaseWriter (compute and copy releases, uploads, copies).
+    const u64 oldest =
+        writer_range_count - (std::min<u64>)(writer_range_count, writer_ranges.size());
+    bool reached = false;
+    scanned = 0;
+    for (u64 index = writer_range_count; index > oldest && scanned < MaxWriterScan;
+         --index, ++scanned) {
+        const WriterRange& range = writer_ranges[(index - 1) % writer_ranges.size()];
+        if (range.position <= done) {
+            reached = true;
+            break;
+        }
+        if (range.begin < end && device < range.end &&
+            std::find(skip.begin(), skip.end(), range.position) == skip.end()) {
+            found.noted = (std::max)(found.noted, range.position);
+            reached = true;
+            break;
+        }
+    }
+    if (!reached && (scanned == MaxWriterScan || oldest != 0)) {
+        found.unbounded = write_position;
+    }
+    // RangeLastWrite (3D constant buffer uploads and the like), by GPU address.
+    for (auto it = ranged_writes.rbegin(); it != ranged_writes.rend() && it->position > done;
+         ++it) {
+        if (it->begin < address + size && address < it->end) {
+            found.noted = (std::max)(found.noted, it->position);
+            break;
+        }
+    }
+    found.noted = (std::min)(found.noted, write_position);
+    found.unbounded = (std::min)(found.unbounded, write_position);
+    return found;
 }
 
 bool GpuSplit::HasQueuedMemoryWriters(GPUVAddr begin, GPUVAddr end) {
