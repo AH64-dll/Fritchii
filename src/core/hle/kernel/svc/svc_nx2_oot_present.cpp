@@ -25,6 +25,7 @@
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/svc/svc_nx2_oot_present.h"
 #include "core/hle/kernel/svc_results.h"
+#include "core/loader/loader.h"
 #include "core/memory.h"
 #include "video_core/nx2_debug_control.h"
 
@@ -151,6 +152,38 @@ void OnGpuWrite(u64 device_address, u32 value) {
     thread->EndWait(*kernel, ResultSuccess);
 }
 
+/// The load address of the module called "main": from the loader's own list (the NSOs it loaded,
+/// by file name: rtld, main, subsdk*, sdk), else from the modules found in the process's memory
+/// by their path names. 0 when neither knows it. `out_modules` gets the list used, for the log.
+/// Core::FindMainModuleEntrypoint is not used: it took the code region start (0x8000000, not
+/// main) in Ocarina of Time.
+u64 FindMainModuleBase(Core::System& system, KProcess& process, std::string& out_modules) {
+    const auto describe = [&out_modules](const Loader::AppLoader::Modules& list,
+                                         const char* source) {
+        out_modules = source;
+        for (const auto& [base, module_name] : list) {
+            out_modules += fmt::format(" {}@{:#x}", module_name, base);
+        }
+    };
+    Loader::AppLoader::Modules modules;
+    if (system.GetAppLoader().ReadNSOModules(modules) == Loader::ResultStatus::Success) {
+        describe(modules, "loader:");
+        for (const auto& [base, module_name] : modules) {
+            if (module_name == "main") {
+                return base;
+            }
+        }
+    }
+    modules = Core::FindModules(std::addressof(process));
+    describe(modules, "memory:");
+    for (const auto& [base, module_name] : modules) {
+        if (module_name == "main" || module_name.starts_with("main.")) {
+            return base;
+        }
+    }
+    return 0;
+}
+
 /// main base + SleepReturn when this process runs the verified Ocarina of Time build, else 0.
 /// The module is searched once per process; later calls only read the two call words again.
 u64 SiteReturnAddress(Core::System& system, KProcess& process) {
@@ -179,7 +212,15 @@ u64 SiteReturnAddress(Core::System& system, KProcess& process) {
     state.checked_process_id = process.GetProcessId();
     state.site_return = 0;
 
-    const u64 main_base = GetInteger(Core::FindMainModuleEntrypoint(std::addressof(process)));
+    std::string module_list;
+    const u64 main_base = FindMainModuleBase(system, process, module_list);
+    if (main_base == 0) {
+        LOG_WARNING(Kernel_SVC, "OoT present poll (EXP24): no module called main ({}), off",
+                    module_list);
+        return 0;
+    }
+    LOG_INFO(Kernel_SVC, "OoT present poll (EXP24): using module main at {:#x} ({})", main_base,
+             module_list);
     if (!memory.IsValidVirtualAddressRange(main_base + DumpFirst, DumpWords * sizeof(u32))) {
         LOG_WARNING(Kernel_SVC, "OoT present poll (EXP24): main+{:#x} is not mapped (main {:#x}), off",
                     DumpFirst, main_base);
