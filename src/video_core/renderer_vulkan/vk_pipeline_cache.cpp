@@ -2149,18 +2149,31 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
             if (reader->running.fetch_sub(1) == 1) {
                 shader_notify.SetWarmProgress(0, 0, 0);
                 bool complete = false;
+                size_t entries_read = 0;
                 {
                     std::scoped_lock lock{reader->mutex};
-                    complete = !reader->failed && reader->end == reader->position &&
-                               reader->driver_failures == 0;
+                    complete = !reader->failed && reader->end == reader->position;
+                    entries_read = reader->read;
+                }
+                // A few builds the driver refuses every time (1% of the entries, at least 50)
+                // must not keep the warm-up pending forever; more is worth another warm-up.
+                const size_t driver_failures = reader->driver_failures.load();
+                const size_t allowed_failures = std::max<size_t>(50, entries_read / 100);
+                if (complete && driver_failures > allowed_failures) {
+                    complete = false;
+                    LOG_WARNING(Render_Vulkan,
+                                "Nx2Perf graphics_warm: the driver refused {} builds (over {}), "
+                                "the warm-up runs again next time",
+                                driver_failures, allowed_failures);
                 }
                 if (complete && !stop.stop_requested() && !warm_cancel) {
-                    WriteWarmMarker(warm_file, title_file, device, reader->read);
+                    WriteWarmMarker(warm_file, title_file, device, entries_read);
                 }
                 shader_notify.EndWarm();
                 LOG_INFO(Render_Vulkan,
-                         "Nx2Perf graphics_warm: finished, {} built, {} failed, {:.0f} s",
-                         reader->built.load(), reader->failed_builds.load(),
+                         "Nx2Perf graphics_warm: finished, {} built, {} failed ({} refused by the "
+                         "driver), {:.0f} s",
+                         reader->built.load(), reader->failed_builds.load(), driver_failures,
                          std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                                        reader->begin)
                              .count());
