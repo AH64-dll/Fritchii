@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -98,6 +99,18 @@ s64 g_qpc_frequency{};
 
 thread_local std::shared_ptr<ThreadBuffer> t_buffer;
 
+// The guest layer's names: guest threads (by kernel thread id, per recording) and kernel objects
+// (by address, kept across recordings while GuestEnabled()).
+struct GuestThreadName {
+    std::string name;
+    u32 tries{};
+};
+// A thread whose nn::os name is not set yet is asked for again this many times.
+constexpr u32 MaxGuestNameTries = 64;
+std::mutex g_names_mutex;
+std::unordered_map<u64, GuestThreadName> g_guest_thread_names;
+std::unordered_map<const void*, std::string> g_object_names;
+
 std::string CurrentThreadName() {
 #ifdef _WIN32
     using GetThreadDescriptionFn = HRESULT(WINAPI*)(HANDLE, PWSTR*);
@@ -174,6 +187,31 @@ void Write(const std::filesystem::path& path, double seconds) {
         }
         first = false;
     };
+    if (g_guest.load(std::memory_order_relaxed)) {
+        // The guest layer's names (tools/nx2/critical_path.py reads them; perfetto shows the
+        // guest threads' names as a second process).
+        std::scoped_lock lock{g_names_mutex};
+        comma();
+        json += R"({"name":"process_name","ph":"M","pid":2,"args":{"name":"guest threads"}})";
+        for (const auto& [thread_id, entry] : g_guest_thread_names) {
+            if (entry.name.empty()) {
+                continue;
+            }
+            comma();
+            json += fmt::format(R"({{"name":"thread_name","ph":"M","pid":2,"tid":{},"args":{{"name":")",
+                                thread_id);
+            AppendEscaped(json, entry.name);
+            json += "\"}}";
+        }
+        for (const auto& [object, name] : g_object_names) {
+            comma();
+            json += fmt::format(
+                R"({{"name":"object_name","ph":"M","pid":1,"tid":0,"args":{{"ptr":{},"name":")",
+                reinterpret_cast<uintptr_t>(object));
+            AppendEscaped(json, name);
+            json += "\"}}";
+        }
+    }
     for (const auto& buffer : buffers) {
         std::vector<std::vector<Event>> chunks;
         std::vector<std::vector<ArgSet>> arg_chunks;
@@ -335,9 +373,15 @@ bool Start(const std::filesystem::path& path, double seconds, bool detail) {
         g_qpc_frequency = static_cast<s64>(frequency.QuadPart);
     }
 #endif
+    {
+        std::scoped_lock lock{g_names_mutex};
+        g_guest_thread_names.clear();
+    }
+    g_guest.store(GuestEnabled(), std::memory_order_relaxed);
     g_detail.store(detail, std::memory_order_relaxed);
     g_active.store(true, std::memory_order_release);
-    LOG_INFO(Debug, "Timeline: recording {:.1f} s", seconds);
+    LOG_INFO(Debug, "Timeline: recording {:.1f} s{}", seconds,
+             g_guest.load(std::memory_order_relaxed) ? " with the guest layer" : "");
     std::thread([path, seconds] {
         std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
         g_active.store(false, std::memory_order_release);
@@ -352,6 +396,51 @@ bool Start(const std::filesystem::path& path, double seconds, bool detail) {
 std::string LastFile() {
     std::scoped_lock lock{g_last_mutex};
     return g_last_file;
+}
+
+bool GuestEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_TIMELINE_GUEST");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+bool WantsGuestThreadName(u64 thread_id) {
+    if (!Guest()) {
+        return false;
+    }
+    std::scoped_lock lock{g_names_mutex};
+    GuestThreadName& entry = g_guest_thread_names[thread_id];
+    if (!entry.name.empty() || entry.tries >= MaxGuestNameTries) {
+        return false;
+    }
+    ++entry.tries;
+    return true;
+}
+
+void NameGuestThread(u64 thread_id, std::string_view name) {
+    if (name.empty()) {
+        return;
+    }
+    std::scoped_lock lock{g_names_mutex};
+    g_guest_thread_names[thread_id].name = name;
+}
+
+void NameObject(const void* object, std::string_view name) {
+    if (!GuestEnabled() || object == nullptr) {
+        return;
+    }
+    std::scoped_lock lock{g_names_mutex};
+    g_object_names[object] = name;
+}
+
+void ForgetObject(const void* object) {
+    if (!GuestEnabled()) {
+        return;
+    }
+    std::scoped_lock lock{g_names_mutex};
+    g_object_names.erase(object);
 }
 
 void OnPresent() {

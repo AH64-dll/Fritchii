@@ -20,7 +20,9 @@ bool SleepNx2OotPresentPoll(Core::System& system, s64 ns);
 
 /// Whether this sleep is that poll's, whatever EXP24 is: the timeline marks those sleeps
 /// ("OoT: present poll sleep", a timer wait). Reads the caller's frames: call it only while a
-/// timeline records.
-bool IsNx2OotPresentPollSleep(Core::System& system, s64 ns);
+/// timeline records. With `event_object`, a poll's event object's guest address goes there (0
+/// if unreadable), and with the timeline's guest layer each of its address-like words is marked
+/// ("OoT: present poll word"), so tools/nx2/critical_path.py finds the GPU write that ends it.
+bool IsNx2OotPresentPollSleep(Core::System& system, s64 ns, u64* event_object = nullptr);
 
 } // namespace Kernel::Svc

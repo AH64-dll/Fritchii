@@ -10,6 +10,7 @@
 #include "common/bit_util.h"
 #include "common/fiber.h"
 #include "common/logging.h"
+#include "common/nx2_timeline.h"
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -373,6 +374,15 @@ void KScheduler::SwitchThread(KernelCore& kernel, KThread* next_thread) {
     // Set the new thread.
     SetCurrentThread(kernel, next_thread);
     m_current_thread = next_thread;
+
+    // The only place a core's guest thread changes: the timeline's guest layer (thread ids, 0 =
+    // the core's idle thread) follows a guest thread across cores from these.
+    if (Common::Nx2Timeline::Guest()) [[unlikely]] {
+        Common::Nx2Timeline::Instant(
+            "guest switch", {"core", m_core_id},
+            {"to", next_thread == m_idle_thread ? u64{0} : next_thread->GetThreadId()},
+            {"from", cur_thread == m_idle_thread ? u64{0} : cur_thread->GetThreadId()});
+    }
 
     // Set the new Thread Local region.
     // cpu::SwitchThreadLocalRegion(GetInteger(next_thread->GetThreadLocalRegionAddress()));

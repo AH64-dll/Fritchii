@@ -1408,6 +1408,37 @@ namespace Kernel {
         m_wait_queue = queue;
     }
 
+    void KThread::RecordWaitForTimeline(ThreadWaitReasonForDebugging reason,
+                                        const void* timeline_key) const {
+        // tools/nx2/critical_path.py: reason 1..6 as ThreadWaitReasonForDebugging, plus 7 for an
+        // ArbitrateLock wait (ConditionVar without a condition variable: a mutex). The key is the
+        // object (Synchronization), the condition variable key, the mutex or arbitration address
+        // (Sleep and IPC: 0).
+        constexpr u32 TimelineMutexWait = 7;
+        u32 code = static_cast<u32>(reason);
+        u64 key = 0;
+        switch (reason) {
+        case ThreadWaitReasonForDebugging::Synchronization:
+            key = reinterpret_cast<uintptr_t>(timeline_key);
+            break;
+        case ThreadWaitReasonForDebugging::ConditionVar:
+            if (m_condvar_tree != nullptr) {
+                key = m_condvar_key;
+            } else {
+                code = TimelineMutexWait;
+                key = GetInteger(m_address_key);
+            }
+            break;
+        case ThreadWaitReasonForDebugging::Arbitration:
+            key = m_condvar_key; // SetAddressArbiter's address
+            break;
+        default:
+            break;
+        }
+        Common::Nx2Timeline::Instant("guest wait", {"tid", m_thread_id}, {"reason", code},
+                                     {"key", key});
+    }
+
     void KThread::NotifyAvailable(KernelCore& kernel, KSynchronizationObject* signaled_object, Result wait_result) {
         // Lock the scheduler.
         KScopedSchedulerLock sl(kernel);

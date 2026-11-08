@@ -192,14 +192,16 @@ void SleepThread(Core::System& system, s64 ns) {
     if (ns > 0) {
         // The timeline marks Ocarina of Time's present poll sleeps: a timer wait for the GPU's
         // event, not guest work (tools/nx2/critical_path.py). Recorded on the host thread the
-        // guest thread resumes on.
-        const bool poll_span =
-            Common::Nx2Timeline::Active() && IsNx2OotPresentPollSleep(system, ns);
+        // guest thread resumes on. The span carries the poll's event object (its words are
+        // marked with the guest layer, for the GPU write that sets it).
+        u64 poll_object = 0;
+        const bool poll_span = Common::Nx2Timeline::Active() &&
+                               IsNx2OotPresentPollSleep(system, ns, &poll_object);
         const u64 poll_begin = poll_span ? Common::Nx2Timeline::Now() : 0;
         SCOPE_EXIT {
             if (poll_span) {
                 Common::Nx2Timeline::Record("OoT: present poll sleep", poll_begin,
-                                            Common::Nx2Timeline::Now());
+                                            Common::Nx2Timeline::Now(), {"object", poll_object});
             }
         };
         // Ocarina of Time's present poll waits for the GPU's write instead (EXP24, off by default).
