@@ -202,6 +202,9 @@ inline void Nx2ClearGpuWrittenPages() {
 /// OnCPUWrite's cache mutexes (EDEN_NX2_EXP35, Core::Memory::HandleRasterizerWrite); counted for
 /// RasterizerVulkan's guest access log.
 inline std::atomic<u64> g_nx2_guest_writes_collected{};
+/// Guest reads of cached memory sent to the split's back as flush requests because the cache
+/// mutexes stayed taken (EDEN_NX2_EXP60).
+inline std::atomic<u64> g_nx2_guest_reads_handed{};
 
 /// Whether any page of the range may have been written by the GPU (zortos293/Lichii#463).
 [[nodiscard]] inline bool Nx2MayBeGpuWritten(u64 device_address, u64 size) {

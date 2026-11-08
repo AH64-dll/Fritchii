@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <condition_variable>
 #include <memory>
@@ -2003,8 +2004,9 @@ void CountGuestAccess(std::atomic<u64>& counter) {
     }
     LOG_INFO(Render_Vulkan,
              "Guest access of cached memory (5 s): reads {} lock-free, {} locked ({} must "
-             "flush); writes {} locked, {} collected",
+             "flush, {} handed to the back); writes {} locked, {} collected",
              c.read_fast.exchange(0), c.read_locked.exchange(0), c.read_flush.exchange(0),
+             Tegra::g_nx2_guest_reads_handed.exchange(0, std::memory_order_relaxed),
              c.write_locked.exchange(0),
              Tegra::g_nx2_guest_writes_collected.exchange(0, std::memory_order_relaxed));
 }
@@ -2027,6 +2029,45 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
             .end_address = page_end,
             .preemtive = true,
         };
+    }
+    // EDEN_NX2_EXP60=1: the back holds both mutexes through bursts of draws and re-takes them right
+    // after each release, so a guest read waiting for them slept for milliseconds (Fable answer
+    // 11). Spin a little; if they stay taken, ask for a flush instead: the back serves sync
+    // requests before every draw (TickWork), and FlushRegion of a clean page does nothing.
+    if (VideoCore::Nx2Debug::Experiment(60) != 0) {
+        constexpr int Tries = 256;
+        bool texture_locked = false;
+        bool buffer_locked = false;
+        for (int attempt = 0; attempt < Tries && !(texture_locked && buffer_locked); ++attempt) {
+            texture_locked = texture_locked || texture_cache.mutex.try_lock();
+            buffer_locked = buffer_locked || buffer_cache.mutex.try_lock();
+            if (!(texture_locked && buffer_locked)) {
+                std::this_thread::yield();
+            }
+        }
+        if (!(texture_locked && buffer_locked)) {
+            if (texture_locked) {
+                texture_cache.mutex.unlock();
+            }
+            if (buffer_locked) {
+                buffer_cache.mutex.unlock();
+            }
+            Tegra::g_nx2_guest_reads_handed.fetch_add(1, std::memory_order_relaxed);
+            return VideoCore::RasterizerDownloadArea{
+                .start_address = page_begin,
+                .end_address = page_end,
+                .preemtive = false,
+            };
+        }
+        // Both held: the locked path takes them again recursively.
+        const auto area = GetFlushAreaLocked(addr, size);
+        buffer_cache.mutex.unlock();
+        texture_cache.mutex.unlock();
+        CountGuestAccess(g_guest_access.read_locked);
+        if (!area.preemtive) {
+            g_guest_access.read_flush.fetch_add(1, std::memory_order_relaxed);
+        }
+        return area;
     }
     const auto area = GetFlushAreaLocked(addr, size);
     CountGuestAccess(g_guest_access.read_locked);

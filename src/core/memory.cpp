@@ -1008,10 +1008,15 @@ struct Memory::Impl {
                 // caches' mutexes, which the split's back holds through each draw (4% of the
                 // guest cores' busy time at Castle Town). The back applies collected writes to
                 // both caches at its next FlushCaching, before each draw, dispatch and clear.
+                // EXP35=2: every page, GPU-written ones too (their writes are collected anyway
+                // when OnCPUWrite finds them GPU-modified; the clean ones' WriteMemory becomes the
+                // same marks at the back's next FlushCaching). The cache mutexes are held in bursts
+                // through the back's draws: guest threads slept 5-6 ms on them (Fable answer 11).
+                const int collect_mode = VideoCore::Nx2Debug::Experiment(35);
                 const bool collect_unasked =
-                    address != 0 && size != 0 && VideoCore::Nx2Debug::Experiment(35) != 0 &&
+                    address != 0 && size != 0 && collect_mode != 0 &&
                     Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
-                    !Tegra::Nx2MayBeGpuWritten(address, size);
+                    (collect_mode == 2 || !Tegra::Nx2MayBeGpuWritten(address, size));
                 if (collect_unasked) {
                     Tegra::g_nx2_guest_writes_collected.fetch_add(1, std::memory_order_relaxed);
                 }
