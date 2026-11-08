@@ -390,6 +390,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             std::memcpy(pointer, &value, sizeof(value));
         }
         Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, static_cast<u32>(query_base->value));
+        Common::Nx2GpuWrite::Notify(Common::Nx2GpuWrite::Path::QueryCompletion, cpu_addr, addr,
+                                    pointer, static_cast<u32>(query_base->value));
         if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
             const bool wide = True(query_base->flags & QueryFlagBits::HasTimestamp);
             LOG_INFO(HW_GPU,
@@ -418,6 +420,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                 std::memcpy(pointer, &payload, sizeof(payload));
             }
             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, payload);
+            Common::Nx2GpuWrite::Notify(Common::Nx2GpuWrite::Path::QueryImmediate, cpu_addr, addr,
+                                        pointer, payload);
             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
                 LOG_INFO(HW_GPU,
                          "DKB_QUERY write n={} path=immediate as={} gpu={:#x} device={:#x} type={} "
@@ -721,6 +725,9 @@ bool QueryCacheBase<Traits>::SemiFlushQueryDirty(QueryCacheBase<Traits>::QueryLo
             u32 value_l = static_cast<u32>(query_base->value);
             std::memcpy(ptr, &value_l, sizeof(value_l));
         }
+        Common::Nx2GpuWrite::Notify(Common::Nx2GpuWrite::Path::QuerySemiFlush,
+                                    query_base->guest_address, 0, ptr,
+                                    static_cast<u32>(query_base->value));
         if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
             const bool wide = True(query_base->flags & QueryFlagBits::HasTimestamp);
             LOG_INFO(HW_GPU,

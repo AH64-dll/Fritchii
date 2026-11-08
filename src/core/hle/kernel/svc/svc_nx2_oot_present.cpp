@@ -5,6 +5,8 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -42,9 +44,12 @@ namespace {
 //     while (nvnEventGetValue(e) != 1) nn::os::SleepThread(1 ms);
 // ~3.5 sleeps a frame, so each frame ends 0.5-1 ms after the GPU wrote the event. In the loop a
 // call to nn::os::SleepThread returns to the "sleep return" address, and nvnEventGetValue is
-// called through a pointer (blr) right after. Here that one sleep becomes a wait that the GPU's
-// next write of a 1 (a semaphore release or report, Tegra::Nx2SemaphoreWaiters::OnWrite) ends
-// early. It never lasts longer than the sleep it replaces, so the loop polls at least as often.
+// called through a pointer (blr) right after. With EXP24 = 1 that one sleep becomes a wait that a
+// GPU write ends early (Common::Nx2GpuWrite, from every semaphore/report write path): a write to
+// the event's word once it is learned (a written word that read 1 when the next poll found the
+// event set) or one the event object points at, and until then any write of a 1. It never lasts
+// longer than the sleep it replaces, so the loop polls at least as often. EXP24 = 3 only shortens
+// the sleep to EDEN_NX2_OOT_PRESENT_SLEEP_US (default 250 us, at most the time asked for).
 //
 // EXP24 = 2 finds the site for a build: it counts the short sleeps by call chain and logs the top
 // ones every 10 s. EDEN_NX2_OOT_PRESENT_SITE=<ret>[:<blr>] (hex main offsets: the sleep call's
@@ -94,6 +99,27 @@ constexpr size_t LocateMaxChains = 512;
 // Return addresses compared without any pointer authentication code above a 39-bit address.
 constexpr u64 ReturnAddressMask = (u64{1} << 39) - 1;
 
+// The poll's event object (from the code before the call: ldr w8, [x22, #0x164];
+// add x0, x23, x8, lsl #6): x23 + (u32 [x22 + 0x164] << 6), 64 bytes. x22 and x23 are
+// callee-saved, so the sleep SVC still sees the loop's values.
+constexpr size_t EventIndexOffset = 0x164;
+constexpr u32 EventStrideShift = 6;
+constexpr size_t EventObjectWords = 8;
+constexpr u64 MinAddressField = 0x10000; // smaller fields are not taken for addresses
+constexpr size_t MaxLoggedObjects = 8;
+
+// Learning the event's word: a GPU-written word that read 1 when a poll found the event set.
+constexpr size_t MaxSeenWrites = 64;  // distinct words written during one wait
+constexpr size_t MaxOnesPerWait = 4;  // more candidates than this in one wait teach nothing
+constexpr size_t MaxScores = 32;
+constexpr size_t MaxLearned = 8;
+constexpr u32 LearnSuccesses = 3;
+
+constexpr s64 DefaultShortSleepUs = 250; // EXP24 = 3
+
+using Common::Nx2GpuWrite::Path;
+constexpr size_t PathCount = static_cast<size_t>(Path::Count);
+
 /// LR, then the return addresses of the first FrameWalkDepth frame records; 0 = none.
 using ReturnChain = std::array<u64, 1 + FrameWalkDepth>;
 
@@ -104,6 +130,38 @@ constexpr bool IsBl(u32 word) {
 constexpr bool IsBlr(u32 word) {
     return (word & 0xFFFFFC1FU) == 0xD63F0000U;
 }
+
+/// A GPU write seen during a wait.
+struct SeenWrite {
+    const void* host;
+    u64 device;
+    Path path;
+};
+
+/// How a wait ended, settled at the next poll sleep: the poll after it found the event set when
+/// that sleep comes later than ResleepWindowNs (else the loop polled again at once).
+struct PendingOutcome {
+    bool valid = false;
+    bool short_sleep = false; // EXP24 = 3
+    bool woken = false;
+    bool matched = false;
+    const void* wake_host = nullptr;
+    u64 wake_device = 0;
+    s64 end_tick = 0;
+    std::array<SeenWrite, MaxOnesPerWait> ones{}; // words written during the wait that read 1
+    size_t one_count = 0;                         // (MaxOnesPerWait + 1 = too many)
+    u32 field_ones = 0;    // event object fields whose word read 1 (bit mask)
+    u32 field_written = 0; // event object fields whose word the GPU wrote during the wait
+};
+
+/// A word's record: polls that found the event set right after it read 1, and wakes on it
+/// that were followed by another poll at once.
+struct WordScore {
+    const void* host;
+    u64 device;
+    u32 ok;
+    u32 fail;
+};
 
 struct PresentPollState {
     // The process the site was checked in (process ids restart every session, so the pointer
@@ -122,16 +180,52 @@ struct PresentPollState {
     std::atomic<KernelCore*> kernel{};
     KThread* waiter{}; // the thread in the wait; guarded by the scheduler lock
     std::atomic<bool> has_waiter{};
+    // Set by the waker under the scheduler lock before it ends the wait; read by the woken thread.
+    Path wake_path{};
+    const void* wake_host{};
+    u64 wake_device{};
+    bool wake_matched{};
 
-    // Statistics, logged every 10 s while EXP24 is on.
+    // What the GPU side matches writes against, and the writes seen during the current wait;
+    // guarded by wake_mutex. Never held while taking the scheduler lock.
+    std::mutex wake_mutex;
+    std::array<const void*, EventObjectWords> object_hosts{}; // fields that are guest addresses
+    std::array<u64, EventObjectWords> object_values{};        // fields (GPU addresses?)
+    std::vector<SeenWrite> seen;
+    std::vector<const void*> learned;
+    std::vector<u64> learned_devices; // (for the log)
+
+    // The polling thread's bookkeeping between waits, guarded by poll_mutex (not held in a wait).
+    std::mutex poll_mutex;
+    PendingOutcome pending{};
+    std::vector<WordScore> scores;
+    std::vector<u64> logged_objects;
+
+    // Statistics, logged every 10 s while EXP24 is 1 or 3.
     std::atomic<u64> waits{};
     std::atomic<u64> woken{};
+    std::atomic<u64> woken_matched{};
+    std::atomic<u64> wake_ok{};
+    std::atomic<u64> wake_matched_ok{};
+    std::atomic<u64> early{};
     std::atomic<u64> timed_out{};
-    std::atomic<u64> resleeps{};
+    std::atomic<u64> timeout_ok{};
+    std::atomic<u64> short_sleeps{};
+    std::atomic<u64> short_ok{};
+    std::atomic<u64> no_object{};
     std::atomic<u64> last_waker{};
-    std::atomic<s64> last_end_tick{};
-    std::atomic<bool> last_woken{};
     std::atomic<s64> last_log_tick{};
+    std::array<std::atomic<u64>, PathCount> path_writes{};
+    std::array<std::atomic<u64>, PathCount> path_ones{};
+    std::array<std::atomic<u64>, PathCount> path_matched{};
+    std::array<std::atomic<u64>, PathCount> path_wakes{};
+    std::array<std::atomic<u64>, PathCount> path_last_device{};
+    std::array<std::atomic<u32>, PathCount> path_last_value{};
+    // Per event object field: polls that found the event set while the field's word read 1, and
+    // those of them with a GPU write to that word seen during the wait.
+    std::array<std::atomic<u64>, EventObjectWords> field_one_ok{};
+    std::array<std::atomic<u64>, EventObjectWords> field_written_ok{};
+    std::array<u64, EventObjectWords> field_addresses{}; // (for the log; poll_mutex)
 };
 
 PresentPollState& PollState() {
@@ -195,13 +289,56 @@ private:
     }
 };
 
-/// Common::Nx2GpuWrite listener, on the GPU thread that wrote the word.
-void OnGpuWrite(u64 device_address, u32 value) {
-    if (value != 1) {
-        return;
-    }
+template <typename Container, typename T>
+bool Contains(const Container& container, const T& item) {
+    return std::find(container.begin(), container.end(), item) != container.end();
+}
+
+/// Common::Nx2GpuWrite listener, on the GPU thread that wrote the word. While a poll waits, every
+/// write is counted by path and remembered; a write to a matched word (one learned, or one the
+/// event object points at) ends the wait, and until a word is learned so does any write of a 1.
+void OnGpuWrite(Path path, u64 device_address, u64 gpu_address, const void* host_pointer,
+                u32 value) {
     PresentPollState& state = PollState();
     if (!state.has_waiter.load(std::memory_order_acquire)) {
+        return;
+    }
+    const size_t index = static_cast<size_t>(path);
+    if (index >= PathCount) {
+        return;
+    }
+    state.path_writes[index].fetch_add(1, std::memory_order_relaxed);
+    state.path_last_device[index].store(device_address, std::memory_order_relaxed);
+    state.path_last_value[index].store(value, std::memory_order_relaxed);
+    if (value == 1) {
+        state.path_ones[index].fetch_add(1, std::memory_order_relaxed);
+    }
+    bool matched = false;
+    bool strict = false;
+    {
+        std::scoped_lock lk{state.wake_mutex};
+        if (host_pointer != nullptr) {
+            matched = Contains(state.learned, host_pointer) ||
+                      Contains(state.object_hosts, host_pointer);
+            const auto seen_it =
+                std::find_if(state.seen.begin(), state.seen.end(),
+                             [host_pointer](const SeenWrite& w) { return w.host == host_pointer; });
+            if (seen_it != state.seen.end()) {
+                seen_it->path = path;
+            } else if (state.seen.size() < MaxSeenWrites) {
+                state.seen.push_back(
+                    SeenWrite{.host = host_pointer, .device = device_address, .path = path});
+            }
+        }
+        if (!matched && gpu_address >= MinAddressField) {
+            matched = Contains(state.object_values, gpu_address);
+        }
+        strict = !state.learned.empty();
+    }
+    if (matched) {
+        state.path_matched[index].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!matched && (strict || value != 1)) {
         return;
     }
     KernelCore* const kernel = state.kernel.load(std::memory_order_acquire);
@@ -213,7 +350,12 @@ void OnGpuWrite(u64 device_address, u32 value) {
     if (thread == nullptr) {
         return;
     }
+    state.wake_path = path;
+    state.wake_host = host_pointer;
+    state.wake_device = device_address;
+    state.wake_matched = matched;
     state.last_waker.store(device_address, std::memory_order_relaxed);
+    state.path_wakes[index].fetch_add(1, std::memory_order_relaxed);
     thread->EndWait(*kernel, ResultSuccess);
 }
 
@@ -412,14 +554,18 @@ u64 SiteReturnAddress(Core::System& system, KProcess& process) {
 
 /// The current SVC's caller chain: LR, then the return addresses in the innermost frame records
 /// (nn::os::SleepThread's own frames sit between the svc and the game's call).
-ReturnChain ReturnAddresses(KernelCore& kernel, KProcess& process) {
-    ReturnChain chain{};
+/// The calling thread's registers at the SVC; false when they cannot be read.
+bool ReadContext(KernelCore& kernel, KProcess& process, Svc::ThreadContext& ctx) {
     Core::ArmInterface* const arm = process.GetArmInterface(kernel.CurrentPhysicalCoreIndex());
     if (arm == nullptr) {
-        return chain;
+        return false;
     }
-    Svc::ThreadContext ctx{};
     arm->GetContext(ctx);
+    return true;
+}
+
+ReturnChain ReturnAddresses(KProcess& process, const Svc::ThreadContext& ctx) {
+    ReturnChain chain{};
     chain[0] = ctx.lr & ReturnAddressMask;
     auto& memory = process.GetMemory();
     u64 fp = ctx.fp;
@@ -438,9 +584,8 @@ ReturnChain ReturnAddresses(KernelCore& kernel, KProcess& process) {
     return chain;
 }
 
-bool CalledFromSite(KernelCore& kernel, KProcess& process, u64 site_return) {
-    const ReturnChain chain = ReturnAddresses(kernel, process);
-    return std::find(chain.begin(), chain.end(), site_return) != chain.end();
+bool CalledFromSite(KProcess& process, const Svc::ThreadContext& ctx, u64 site_return) {
+    return Contains(ReturnAddresses(process, ctx), site_return);
 }
 
 /// The first address of the chain inside main (the game's call), else LR.
@@ -499,7 +644,11 @@ void LogLocate(LocateState& locate, KProcess& process, s64 elapsed) {
 
 /// EXP24 = 2: counts this short sleep by its call chain; logs the top chains every 10 s.
 void LocateCount(Core::System& system, KernelCore& kernel, KProcess& process, s64 ns) {
-    const ReturnChain chain = ReturnAddresses(kernel, process);
+    Svc::ThreadContext ctx{};
+    if (!ReadContext(kernel, process, ctx)) {
+        return;
+    }
+    const ReturnChain chain = ReturnAddresses(process, ctx);
     const s64 now = kernel.HardwareTimer().GetTick();
     LocateState& locate = Locate();
     std::scoped_lock lk{locate.mutex};
@@ -564,25 +713,285 @@ Result WaitForGpuWrite(KernelCore& kernel, s64 ns) {
     return thread.GetWaitResult();
 }
 
-void MaybeLog(PresentPollState& state, s64 now) {
+
+s64 ShortSleepUs() {
+    static const s64 us = [] {
+        const char* const text = std::getenv("EDEN_NX2_OOT_PRESENT_SLEEP_US");
+        if (text == nullptr || text[0] == 0) {
+            return DefaultShortSleepUs;
+        }
+        const long long parsed = std::strtoll(text, nullptr, 10);
+        return parsed > 0 ? static_cast<s64>(parsed) : DefaultShortSleepUs;
+    }();
+    return us;
+}
+
+/// Reads the poll's event object (from x22/x23) and hands its address-like fields to the GPU
+/// side; clears the writes seen. Logs each new object once (up to MaxLoggedObjects).
+/// Called with poll_mutex held.
+void ReadEventObject(PresentPollState& state, KProcess& process, const Svc::ThreadContext& ctx) {
+    auto& memory = process.GetMemory();
+    std::array<const void*, EventObjectWords> hosts{};
+    std::array<u64, EventObjectWords> values{};
+    std::array<u64, EventObjectWords> fields{};
+    const u64 x22 = ctx.r[22];
+    const u64 x23 = ctx.r[23];
+    u64 object = 0;
+    u32 object_index = 0;
+    if (memory.IsValidVirtualAddressRange(x22 + EventIndexOffset, sizeof(u32))) {
+        object_index = memory.Read32(x22 + EventIndexOffset);
+        object = x23 + (u64{object_index} << EventStrideShift);
+    }
+    if (object == 0 ||
+        !memory.IsValidVirtualAddressRange(object, EventObjectWords * sizeof(u64))) {
+        state.no_object.fetch_add(1, std::memory_order_relaxed);
+        object = 0;
+    } else {
+        for (size_t k = 0; k < EventObjectWords; ++k) {
+            fields[k] = memory.Read64(object + k * sizeof(u64));
+            if (fields[k] < MinAddressField) {
+                continue;
+            }
+            values[k] = fields[k];
+            if ((fields[k] & 3) == 0 && memory.IsValidVirtualAddressRange(fields[k], sizeof(u32))) {
+                hosts[k] = memory.GetPointerSilent(fields[k]);
+            }
+        }
+    }
+    for (size_t k = 0; k < EventObjectWords; ++k) {
+        state.field_addresses[k] = hosts[k] != nullptr ? fields[k] : 0;
+    }
+    {
+        std::scoped_lock lk{state.wake_mutex};
+        state.object_hosts = hosts;
+        state.object_values = values;
+        state.seen.clear();
+    }
+    if (object == 0 || Contains(state.logged_objects, object) ||
+        state.logged_objects.size() >= MaxLoggedObjects) {
+        return;
+    }
+    state.logged_objects.push_back(object);
+    std::string text;
+    std::string words;
+    for (size_t k = 0; k < EventObjectWords; ++k) {
+        text += fmt::format(" {:016x}", fields[k]);
+        if (hosts[k] != nullptr) {
+            u32 word;
+            std::memcpy(&word, hosts[k], sizeof(word));
+            words += fmt::format(" f{} [{:#x}] = {:#x}", k, fields[k], word);
+        }
+    }
+    LOG_INFO(Kernel_SVC,
+             "OoT present poll (EXP24): event object {:#x} (x23 {:#x} + {} << 6, x22 {:#x}):{}; "
+             "fields that are guest addresses:{}",
+             object, x23, object_index, x22, text, words.empty() ? " none" : words);
+}
+
+/// Records a word's outcome and learns or forgets it. Called with poll_mutex held.
+void Score(PresentPollState& state, const void* host, u64 device, bool ok) {
+    if (host == nullptr) {
+        return;
+    }
+    auto it = std::find_if(state.scores.begin(), state.scores.end(),
+                           [host](const WordScore& s) { return s.host == host; });
+    if (it == state.scores.end()) {
+        if (!ok || state.scores.size() >= MaxScores) {
+            return;
+        }
+        state.scores.push_back(WordScore{.host = host, .device = device, .ok = 0, .fail = 0});
+        it = std::prev(state.scores.end());
+    }
+    if (ok) {
+        ++it->ok;
+    } else {
+        ++it->fail;
+    }
+    const bool learn = it->ok >= LearnSuccesses && it->ok > 4 * it->fail;
+    std::scoped_lock lk{state.wake_mutex};
+    const auto learned_it = std::find(state.learned.begin(), state.learned.end(), host);
+    if (learn && learned_it == state.learned.end() && state.learned.size() < MaxLearned) {
+        state.learned.push_back(host);
+        state.learned_devices.push_back(it->device);
+        LOG_INFO(Kernel_SVC,
+                 "OoT present poll (EXP24): learned the event word at device {:#x} ({} polls found "
+                 "the event set right after it read 1, {} early wakes on it); waking on matched "
+                 "words only now",
+                 it->device, it->ok, it->fail);
+    } else if (!learn && learned_it != state.learned.end()) {
+        const auto position = learned_it - state.learned.begin();
+        state.learned.erase(learned_it);
+        state.learned_devices.erase(state.learned_devices.begin() + position);
+        LOG_INFO(Kernel_SVC,
+                 "OoT present poll (EXP24): forgot the word at device {:#x} ({} found set, {} "
+                 "early wakes)",
+                 it->device, it->ok, it->fail);
+    }
+}
+
+/// Settles the last wait's outcome now that the next poll sleep came. Called with poll_mutex held.
+void ResolvePending(PresentPollState& state, s64 start) {
+    PendingOutcome& pending = state.pending;
+    if (!pending.valid) {
+        return;
+    }
+    pending.valid = false;
+    const bool found_set = start - pending.end_tick >= ResleepWindowNs;
+    if (pending.short_sleep) {
+        if (found_set) {
+            state.short_ok.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    if (found_set) {
+        for (size_t k = 0; k < EventObjectWords; ++k) {
+            if ((pending.field_ones >> k) & 1) {
+                state.field_one_ok[k].fetch_add(1, std::memory_order_relaxed);
+                if ((pending.field_written >> k) & 1) {
+                    state.field_written_ok[k].fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+    if (pending.woken) {
+        if (found_set) {
+            state.wake_ok.fetch_add(1, std::memory_order_relaxed);
+            if (pending.matched) {
+                state.wake_matched_ok.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else {
+            state.early.fetch_add(1, std::memory_order_relaxed);
+        }
+        Score(state, pending.wake_host, pending.wake_device, found_set);
+    } else if (found_set) {
+        state.timeout_ok.fetch_add(1, std::memory_order_relaxed);
+        if (pending.one_count <= MaxOnesPerWait) {
+            for (size_t i = 0; i < pending.one_count; ++i) {
+                Score(state, pending.ones[i].host, pending.ones[i].device, true);
+            }
+        }
+    }
+}
+
+/// Notes how the wait just ended and which written words read 1 now. poll_mutex held.
+void CapturePending(PresentPollState& state, bool woken, s64 end_tick) {
+    PendingOutcome outcome{};
+    outcome.valid = true;
+    outcome.woken = woken;
+    outcome.end_tick = end_tick;
+    if (woken) {
+        outcome.matched = state.wake_matched;
+        outcome.wake_host = state.wake_host;
+        outcome.wake_device = state.wake_device;
+    }
+    std::scoped_lock lk{state.wake_mutex};
+    for (const SeenWrite& write : state.seen) {
+        for (size_t k = 0; k < EventObjectWords; ++k) {
+            if (state.object_hosts[k] == write.host) {
+                outcome.field_written |= 1U << k;
+            }
+        }
+        u32 word;
+        std::memcpy(&word, write.host, sizeof(word));
+        if (word == 1 && outcome.one_count <= MaxOnesPerWait) {
+            if (outcome.one_count < MaxOnesPerWait) {
+                outcome.ones[outcome.one_count] = write;
+            }
+            ++outcome.one_count;
+        }
+    }
+    for (size_t k = 0; k < EventObjectWords; ++k) {
+        if (state.object_hosts[k] != nullptr) {
+            u32 word;
+            std::memcpy(&word, state.object_hosts[k], sizeof(word));
+            if (word == 1) {
+                outcome.field_ones |= 1U << k;
+            }
+        }
+    }
+    state.pending = outcome;
+}
+
+/// Every 10 s: the wait outcomes, the writes by path, the event object fields. poll_mutex held.
+void MaybeLog(PresentPollState& state, s64 now, int mode) {
     s64 last = state.last_log_tick.load(std::memory_order_relaxed);
     if (last == 0) {
-        state.last_log_tick.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        state.last_log_tick.store(now, std::memory_order_relaxed);
         return;
     }
-    if (now - last < LogPeriodNs ||
-        !state.last_log_tick.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+    if (now - last < LogPeriodNs) {
         return;
     }
-    const u64 waits = state.waits.exchange(0, std::memory_order_relaxed);
-    const u64 woken = state.woken.exchange(0, std::memory_order_relaxed);
-    const u64 timed_out = state.timed_out.exchange(0, std::memory_order_relaxed);
-    const u64 resleeps = state.resleeps.exchange(0, std::memory_order_relaxed);
+    state.last_log_tick.store(now, std::memory_order_relaxed);
+    const double seconds = static_cast<double>(now - last) / 1e9;
+    const auto take = [](std::atomic<u64>& counter) {
+        return counter.exchange(0, std::memory_order_relaxed);
+    };
+    if (mode == 3) {
+        LOG_INFO(Kernel_SVC,
+                 "OoT present poll (EXP24=3): {} sleeps of {} us in {:.1f} s; {} polls then "
+                 "found the event set",
+                 take(state.short_sleeps), ShortSleepUs(), seconds, take(state.short_ok));
+        return;
+    }
+    std::string learned_text;
+    size_t learned_count = 0;
+    {
+        std::scoped_lock lk{state.wake_mutex};
+        learned_count = state.learned_devices.size();
+        for (const u64 device : state.learned_devices) {
+            learned_text += fmt::format(" {:#x}", device);
+        }
+    }
+    const u64 waits = take(state.waits);
+    const u64 woken = take(state.woken);
+    const u64 woken_matched = take(state.woken_matched);
+    const u64 wake_ok = take(state.wake_ok);
+    const u64 wake_matched_ok = take(state.wake_matched_ok);
+    const u64 early = take(state.early);
+    const u64 timed_out = take(state.timed_out);
+    const u64 timeout_ok = take(state.timeout_ok);
+    const u64 no_object = take(state.no_object);
     LOG_INFO(Kernel_SVC,
-             "OoT present poll (EXP24): {} waits in {:.1f} s, {} ended by a GPU write of 1 ({} "
-             "polled again within 200 us: early), {} timed out (1 ms), last waking write {:#x}",
-             waits, static_cast<double>(now - last) / 1e9, woken, resleeps, timed_out,
-             state.last_waker.load(std::memory_order_relaxed));
+             "OoT present poll (EXP24=1): {} waits in {:.1f} s; {} woken by a GPU write ({} on a "
+             "matched word): {} polls then found the event set ({} after a matched wake), {} "
+             "polled again at once; {} timed out (1 ms): {} polls then found it set; {} without "
+             "an event object; learned {} word(s):{}",
+             waits, seconds, woken, woken_matched, wake_ok, wake_matched_ok, early, timed_out,
+             timeout_ok, no_object, learned_count, learned_count == 0 ? " none" : learned_text);
+    std::string paths;
+    for (size_t p = 0; p < PathCount; ++p) {
+        const u64 writes = take(state.path_writes[p]);
+        const u64 ones = take(state.path_ones[p]);
+        const u64 matched = take(state.path_matched[p]);
+        const u64 wakes = take(state.path_wakes[p]);
+        if (writes == 0) {
+            continue;
+        }
+        paths += fmt::format(" {} {}/{}/{}/{} last {:#x}={:#x};",
+                             Common::Nx2GpuWrite::PathName(static_cast<Path>(p)), writes, ones,
+                             matched, wakes,
+                             state.path_last_device[p].load(std::memory_order_relaxed),
+                             state.path_last_value[p].load(std::memory_order_relaxed));
+    }
+    LOG_INFO(Kernel_SVC,
+             "OoT present poll writes during waits (path writes/of 1/matched/woke, last "
+             "device=value):{}",
+             paths.empty() ? " none" : paths);
+    std::string fields;
+    for (size_t k = 0; k < EventObjectWords; ++k) {
+        const u64 one_ok = take(state.field_one_ok[k]);
+        const u64 written_ok = take(state.field_written_ok[k]);
+        if (state.field_addresses[k] == 0 && one_ok == 0) {
+            continue;
+        }
+        fields += fmt::format(" f{} {:#x}: {}/{};", k, state.field_addresses[k], one_ok,
+                              written_ok);
+    }
+    LOG_INFO(Kernel_SVC,
+             "OoT present poll event object fields (polls that found the event set with the "
+             "field's word 1 / of them with a GPU write to it seen):{}",
+             fields.empty() ? " none" : fields);
 }
 
 } // Anonymous namespace
@@ -591,8 +1000,9 @@ bool SleepNx2OotPresentPoll(Core::System& system, s64 ns) {
     if (ns <= 0 || ns > MaxPollSleepNs) {
         return false;
     }
+    // 1 = wait for the GPU's write, 2 = locate the site, 3 = a shorter plain sleep.
     const int mode = VideoCore::Nx2Debug::Experiment(24);
-    if (mode != 1 && mode != 2) {
+    if (mode < 1 || mode > 3) {
         return false;
     }
     auto& kernel = system.Kernel();
@@ -606,29 +1016,52 @@ bool SleepNx2OotPresentPoll(Core::System& system, s64 ns) {
         return false;
     }
     const u64 site_return = SiteReturnAddress(system, process);
-    if (site_return == 0 || !CalledFromSite(kernel, process, site_return)) {
+    if (site_return == 0) {
+        return false;
+    }
+    Svc::ThreadContext ctx{};
+    if (!ReadContext(kernel, process, ctx) || !CalledFromSite(process, ctx, site_return)) {
         return false;
     }
 
     PresentPollState& state = PollState();
-    const s64 start = kernel.HardwareTimer().GetTick();
-    if (state.last_woken.load(std::memory_order_relaxed) &&
-        start - state.last_end_tick.load(std::memory_order_relaxed) < ResleepWindowNs) {
-        // The last wait ended at a GPU write, and the game found its event not yet 1.
-        state.resleeps.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::scoped_lock lk{state.poll_mutex};
+        const s64 start = kernel.HardwareTimer().GetTick();
+        ResolvePending(state, start);
+        MaybeLog(state, start, mode);
+        if (mode == 1) {
+            ReadEventObject(state, process, ctx);
+        }
     }
-    state.waits.fetch_add(1, std::memory_order_relaxed);
-    MaybeLog(state, start);
 
+    if (mode == 3) {
+        // No GPU wake: just a shorter sleep, at most the one asked for.
+        state.short_sleeps.fetch_add(1, std::memory_order_relaxed);
+        const s64 sleep_ns = (std::min)(ns, ShortSleepUs() * 1000);
+        static_cast<void>(GetCurrentThread(kernel).Sleep(
+            kernel, kernel.HardwareTimer().GetTick() + sleep_ns + 2));
+        std::scoped_lock lk{state.poll_mutex};
+        state.pending = PendingOutcome{};
+        state.pending.valid = true;
+        state.pending.short_sleep = true;
+        state.pending.end_tick = kernel.HardwareTimer().GetTick();
+        return true;
+    }
+
+    state.waits.fetch_add(1, std::memory_order_relaxed);
     const Result result = WaitForGpuWrite(kernel, (std::min)(ns, MaxWaitNs));
     const bool woken = result == ResultSuccess;
     if (woken) {
         state.woken.fetch_add(1, std::memory_order_relaxed);
+        if (state.wake_matched) {
+            state.woken_matched.fetch_add(1, std::memory_order_relaxed);
+        }
     } else if (result == ResultTimedOut) {
         state.timed_out.fetch_add(1, std::memory_order_relaxed);
     }
-    state.last_woken.store(woken, std::memory_order_relaxed);
-    state.last_end_tick.store(kernel.HardwareTimer().GetTick(), std::memory_order_relaxed);
+    std::scoped_lock lk{state.poll_mutex};
+    CapturePending(state, woken, kernel.HardwareTimer().GetTick());
     return true;
 }
 
