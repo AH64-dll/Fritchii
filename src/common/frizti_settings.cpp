@@ -40,7 +40,6 @@ std::vector<BasicSetting*> TunedSettings(Values& values) {
         &values.cpu_accuracy,             // Auto
         &values.use_disk_shader_cache,    // On: no shader rebuild every boot
         &values.use_vulkan_driver_pipeline_cache, // On
-        &values.use_reactive_flushing,    // On
     };
 }
 
