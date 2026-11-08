@@ -20,8 +20,8 @@ def span(tid, name, begin, end, **args):
     return event
 
 
-def mark(tid, name, ts, **args):
-    event = {"name": name, "ph": "i", "pid": 1, "tid": tid, "ts": ts, "s": "t"}
+def mark(thread, name, ts, **args):
+    event = {"name": name, "ph": "i", "pid": 1, "tid": thread, "ts": ts, "s": "t"}
     if args:
         event["args"] = args
     return event
@@ -162,6 +162,113 @@ class PendingWaitTest(unittest.TestCase):
         self.assertFalse([k for k in by if k[0] == "present"], by)
         self.assertAlmostEqual(by[("back", "busy", "draw")], 7.0)
         self.assertAlmostEqual(result["frames"][1]["path_ms"], 10.0)
+
+
+CORE1, TIMER = 11, 70
+MAIN, RENDER = 100, 101
+VSYNC = 0xABC0
+
+
+def guest_events():
+    """Frames on the guest thread MAIN, which moves nothing but waits for RENDER (on another
+    core), which polls OoT's present word until the back's GPU write; then a vsync wait."""
+    names = {GUEST: "CPUCore_0", CORE1: "CPUCore_1", BACK: "GPUBack", TIMER: "HostTiming"}
+    out = [{"name": "thread_name", "ph": "M", "pid": 1, "tid": tid, "args": {"name": name}}
+           for tid, name in names.items()]
+    out += [{"name": "thread_name", "ph": "M", "pid": 2, "tid": MAIN, "args": {"name": "MainThread"}},
+            {"name": "thread_name", "ph": "M", "pid": 2, "tid": RENDER,
+             "args": {"name": "RenderThread"}},
+            {"name": "object_name", "ph": "M", "pid": 1, "tid": 0,
+             "args": {"ptr": VSYNC, "name": "vsync slot 0"}}]
+    for at in (0, 20000, 40000, 60000):
+        out.append(span(GUEST, "guest present", at, at + 50))
+    out += [
+        # Core 0: MAIN, idle while it waits for RENDER, MAIN again.
+        mark(GUEST, "guest switch", 0, core=0, to=MAIN, **{"from": 0}),
+        mark(GUEST, "guest wait", 25000, tid=MAIN, reason=4, key=0x5000),
+        mark(GUEST, "guest switch", 25001, core=0, to=0, **{"from": MAIN}),
+        mark(CORE1, "guest wake", 35500, tid=MAIN, result=0, by=RENDER),
+        mark(GUEST, "guest switch", 36000, core=0, to=MAIN, **{"from": 0}),
+        span(GUEST, "present: composite", 38000, 38500),
+        # Core 1: RENDER runs, polls (its sleep times out after the GPU's write), runs again.
+        mark(CORE1, "guest switch", 21000, core=1, to=RENDER, **{"from": 0}),
+        mark(CORE1, POLL_WORD, 29980, field=0, gpu=0x9000, host=0x7000),
+        span(CORE1, "OoT: present poll sleep", 29990, 34000, object=0x1234),
+        mark(CORE1, "guest wait", 30000, tid=RENDER, reason=1, key=0),
+        mark(CORE1, "guest switch", 30001, core=1, to=0, **{"from": RENDER}),
+        mark(BACK, "GPU write: query-completion", 32000, host=0x7000, gpu=0x9000, value=1),
+        mark(TIMER, "guest wake", 33900, tid=RENDER, result=1, by=0),
+        mark(CORE1, "guest switch", 34000, core=1, to=RENDER, **{"from": 0}),
+        mark(CORE1, "guest switch", 39000, core=1, to=0, **{"from": RENDER}),
+        span(BACK, "draw", 20000, 32000),
+        # Frame 3: MAIN waits for vblank on the vsync slot, woken by the timer thread.
+        mark(GUEST, "guest wait", 41000, tid=MAIN, reason=3, key=VSYNC),
+        mark(GUEST, "guest switch", 41001, core=0, to=0, **{"from": MAIN}),
+        mark(TIMER, "guest wake object", 58000, tid=MAIN, object=VSYNC),
+        mark(TIMER, "guest wake", 58000, tid=MAIN, result=0, by=0),
+        mark(GUEST, "guest switch", 58200, core=0, to=MAIN, **{"from": 0}),
+    ]
+    return out
+
+
+POLL_WORD = critical_path.POLL_WORDS
+
+
+class GuestLayerTest(unittest.TestCase):
+    def setUp(self):
+        path = os.path.join(tempfile.mkdtemp(), "timeline.json")
+        write_trace(path, guest_events())
+        self.trace = critical_path.load(path)
+        self.result = critical_path.analyse(self.trace, critical_path.Walker(self.trace))
+
+    def test_frame_thread_and_names(self):
+        self.assertEqual(self.result["present_tid"], ("guest", MAIN))
+        self.assertEqual(self.trace.label(("guest", RENDER)), "guest RenderThread")
+        self.assertNotIn(MAIN, self.trace.names)  # pid 2 names stay out of the host threads
+
+    def test_paths_add_up(self):
+        for frame in self.result["frames"]:
+            self.assertAlmostEqual(frame["path_ms"], frame["frame_ms"], places=6)
+
+    def test_wait_jumps_to_the_waker_and_the_poll_to_the_gpu_write(self):
+        by = self.result["frames"][1]["by"]
+        self.assertAlmostEqual(by[("guest", "busy", "guest: MainThread running")], 3.5)
+        self.assertAlmostEqual(by[("guest", "busy", "present: composite")], 0.5)
+        self.assertAlmostEqual(
+            by[("guest", "latency", "guest: MainThread ready, not running (woken by guest RenderThread)")],
+            0.5)
+        self.assertAlmostEqual(by[("guest", "busy", "guest: RenderThread running")], 1.5)
+        self.assertAlmostEqual(
+            by[("guest", "latency", "guest: RenderThread ready, not running (woken by HostTiming (timer))")],
+            0.1)
+        self.assertAlmostEqual(by[("guest", "timer", "OoT: present poll sleep (after the GPU's write)")], 1.9)
+        self.assertAlmostEqual(by[("back", "busy", "draw")], 12.0)
+        frame = self.result["frames"][1]
+        self.assertGreater(1 - frame["unexplained_ms"] / frame["frame_ms"], 0.9)
+        threads = frame["threads"]
+        self.assertAlmostEqual(threads[("guest RenderThread", "timer")], 1.9)
+        self.assertAlmostEqual(threads[("GPUBack", "busy")], 12.0)
+
+    def test_who_the_frame_thread_waited_for(self):
+        edges = [e for e in self.result["frames"][1]["edges"] if e[0] == MAIN]
+        self.assertEqual(len(edges), 1)
+        _waiter, label, begin, until, waker, state = edges[0]
+        self.assertEqual(label, "MainThread: condvar on 0x5000")
+        self.assertEqual(waker, "guest RenderThread")
+        self.assertEqual(state, "running after sleep (timed out, by HostTiming (timer))")
+        self.assertAlmostEqual((until - begin) / 1000.0, 10.5)
+
+    def test_vsync_wait_is_display(self):
+        by = self.result["frames"][2]["by"]
+        self.assertAlmostEqual(by[("display", "display", "MainThread: sync on vsync slot 0 (vblank)")], 17.0)
+        self.assertAlmostEqual(by[("guest", "busy", "guest: MainThread running")], 2.75)
+        self.assertAlmostEqual(by[("guest", "busy", "guest present")], 0.05)
+
+    def test_report_runs(self):
+        text = critical_path.report(self.result)
+        self.assertIn("Who the frame thread waited for", text)
+        self.assertIn("median frame's", text)
+        json.dumps(critical_path.to_json(self.result))
 
 
 if __name__ == "__main__":
