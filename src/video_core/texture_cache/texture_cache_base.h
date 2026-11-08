@@ -632,6 +632,45 @@ private:
     u32 render_clock_live_frames{};    ///< Since the last report
     u32 render_clock_switches{};
 
+    /// EXP43=4 (fable_answer_16 1c): relocation as 3, under the render-frame clock, and each
+    /// relocated image's old range kept for 2 render frames. A read that lands on it (an image
+    /// made at the old address and then sampled or rendered to without a clear, or a CPU read of
+    /// the old range while the image there was GPU-written) is what relocation would have gotten
+    /// wrong: counted and its first few logged. Must stay 0.
+    struct RelocationTombstone {
+        GPUVAddr gpu_addr;
+        DAddr cpu_addr;
+        u64 size;
+        u64 shape_key;
+        u64 render_frame;
+        GPUVAddr moved_to;
+        bool gpu_modified;
+    };
+    enum TombstoneRead : u8 { TombstoneSampled, TombstoneLoaded, TombstoneCpuRead, TombstoneReads };
+    void AddRelocationTombstone(const ImageBase& old_image, GPUVAddr moved_to);
+    /// JoinImages: a new image at a tombstoned address waits for its first PrepareImage.
+    void CheckTombstoneCreation(ImageId image_id, const ImageBase& image, bool overwritten);
+    void CheckTombstonePrepare(ImageId image_id, const ImageBase& image, bool is_modification,
+                               bool invalidate);
+    void CheckTombstoneCpuRead(DAddr cpu_addr, u64 size);
+    void NoteTombstoneHit(const RelocationTombstone& tombstone, TombstoneRead reason,
+                          GPUVAddr gpu_addr, const ImageInfo* info);
+    /// TickFrame: drops tombstones older than 2 render frames; logs every 600 frames.
+    void TickRelocationTombstones();
+    std::vector<RelocationTombstone> relocation_tombstones;
+    DAddr tombstone_cpu_begin{~DAddr{0}}; ///< Bounds of all tombstones (quick reject)
+    DAddr tombstone_cpu_end{};
+    struct TombstoneBorn {
+        ImageId image_id;
+        GPUVAddr gpu_addr;
+        RelocationTombstone tombstone;
+    };
+    boost::container::small_vector<TombstoneBorn, 4> tombstone_born;
+    std::array<u64, TombstoneReads> tombstone_hits{}; ///< Since the last report
+    u64 tombstones_made{};
+    u64 tombstone_overlap_reads{}; ///< New images read over one, not at its address
+    u32 tombstone_hits_logged{};
+
     [[nodiscard]] static bool RelocationShaped(const ImageInfo& info) noexcept {
         return info.type == ImageType::e2D && info.resources.levels == 1 &&
                info.resources.layers == 1 && info.num_samples == 1;

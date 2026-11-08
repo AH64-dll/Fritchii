@@ -704,6 +704,7 @@ void TextureCache<P>::TickFrame() {
             relocation_crowded = 0;
     }
     TickRenderClock();
+    TickRelocationTombstones();
 
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
         for (auto& buffer : async_buffers_death_ring) {
@@ -719,7 +720,8 @@ void TextureCache<P>::TickRenderClock() {
         const char* value = std::getenv("EDEN_NX2_RENDER_CLOCK");
         return value != nullptr && value[0] == '1';
     }();
-    const bool enabled = clock_env;
+    // EXP43=4 relocates under this clock (with tombstones).
+    const bool enabled = clock_env || VideoCore::Nx2Debug::Experiment(43) == 4;
     Tegra::g_nx2_render_clock_wanted.store(enabled, std::memory_order_relaxed);
     const u64 counter = Tegra::g_nx2_render_frame.load(std::memory_order_relaxed);
     render_clock_idle = counter != render_clock_last_counter ? 0 : render_clock_idle + 1;
@@ -1561,6 +1563,9 @@ bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
 
 template <class P>
 void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
+    if (!relocation_tombstones.empty()) {
+        CheckTombstoneCpuRead(cpu_addr, size); // EXP43=4
+    }
     boost::container::small_vector<ImageId, 16> images;
     ForEachImageInRegion(cpu_addr, size, [this, &images](ImageId image_id, ImageBase& image) {
         if (!IsDownloadable(image)) {
@@ -1623,6 +1628,9 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
 template <class P>
 std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(DAddr cpu_addr,
                                                                                u64 size) {
+    if (!relocation_tombstones.empty()) {
+        CheckTombstoneCpuRead(cpu_addr, size); // EXP43=4
+    }
     std::optional<VideoCore::RasterizerDownloadArea> area{};
     ForEachImageInRegion(cpu_addr, size, [&](ImageId, ImageBase& image) {
         if (False(image.flags & ImageFlagBits::GpuModified)) {
@@ -3434,7 +3442,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                              mode, static_cast<u32>(new_info.format), new_info.size.width,
                              new_info.size.height, gpu_addr, drift, old_gpu_addr);
                 }
-                const bool relocate = mode == 2 || mode == 3;
+                const bool relocate = mode == 2 || mode == 3 || mode == 4;
                 if ((relocate || mode == 1) && !shape.relocated_logged) {
                     shape.relocated_logged = true;
                     LOG_INFO(HW_GPU,
@@ -3446,6 +3454,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 if (relocate) {
                     ++relocation_relocated;
                     ++rt_stats.relocated_images;
+                    if (mode == 4) {
+                        AddRelocationTombstone(slot_images[old_id], gpu_addr);
+                    }
                     RelocateImage(old_id, gpu_addr, cpu_addr);
                     // The other bad overlaps are linked to it as to a new image (below).
                     Image& moved = slot_images[old_id];
@@ -3658,6 +3669,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         RefreshContents(new_image, new_image_id);
     }
     rt_stats.refresh_ns += NsSince(refresh_start);
+    if (!relocation_tombstones.empty()) {
+        CheckTombstoneCreation(new_image_id, new_image, clear_skip); // EXP43=4
+    }
 
     if (can_rescale) {
         ScaleUp(new_image);
@@ -4708,7 +4722,7 @@ ImageId TextureCache<P>::RelocationCandidate(const ImageInfo& new_info, GPUVAddr
         // need exactly one.
         ++relocation_crowded;
         relocation_seen = true;
-        if (VideoCore::Nx2Debug::Experiment(43) != 3) {
+        if (VideoCore::Nx2Debug::Experiment(43) < 3) {
             return ImageId{};
         }
     }
@@ -4792,6 +4806,143 @@ void TextureCache<P>::NoteRelocationGuard(ImageBase& image, RelocationGuard reas
 }
 
 template <class P>
+void TextureCache<P>::AddRelocationTombstone(const ImageBase& old_image, GPUVAddr moved_to) {
+    relocation_tombstones.push_back(RelocationTombstone{
+        .gpu_addr = old_image.gpu_addr,
+        .cpu_addr = old_image.cpu_addr,
+        .size = old_image.guest_size_bytes,
+        .shape_key = RelocationShapeKey(old_image.info),
+        .render_frame = RenderFrame(),
+        .moved_to = moved_to,
+        .gpu_modified = True(old_image.flags & ImageFlagBits::GpuModified),
+    });
+    tombstone_cpu_begin = (std::min)(tombstone_cpu_begin, old_image.cpu_addr);
+    tombstone_cpu_end = (std::max)(tombstone_cpu_end, old_image.cpu_addr + old_image.guest_size_bytes);
+    ++tombstones_made;
+}
+
+template <class P>
+void TextureCache<P>::CheckTombstoneCreation(ImageId image_id, const ImageBase& image,
+                                             bool overwritten) {
+    for (const RelocationTombstone& tombstone : relocation_tombstones) {
+        if (image.gpu_addr == tombstone.gpu_addr) {
+            // A lookup that, without the relocation, would have found the old image. A clear
+            // that overwrites it whole reads nothing; anything else is settled by its first use.
+            if (!overwritten) {
+                tombstone_born.push_back(TombstoneBorn{
+                    .image_id = image_id, .gpu_addr = image.gpu_addr, .tombstone = tombstone});
+            }
+            return;
+        }
+    }
+    if (!overwritten && image.cpu_addr < tombstone_cpu_end &&
+        tombstone_cpu_begin < image.cpu_addr_end) {
+        for (const RelocationTombstone& tombstone : relocation_tombstones) {
+            if (image.cpu_addr < tombstone.cpu_addr + tombstone.size &&
+                tombstone.cpu_addr < image.cpu_addr_end) {
+                // Not at the old address: it read guest memory with or without the relocation
+                // (a bad overlap gets no copies). Counted only.
+                ++tombstone_overlap_reads;
+                return;
+            }
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::CheckTombstonePrepare(ImageId image_id, const ImageBase& image,
+                                            bool is_modification, bool invalidate) {
+    const auto it = std::ranges::find_if(tombstone_born, [&](const TombstoneBorn& born) {
+        return born.image_id == image_id && born.gpu_addr == image.gpu_addr;
+    });
+    if (it == tombstone_born.end()) {
+        return;
+    }
+    const TombstoneBorn born = *it;
+    tombstone_born.erase(it);
+    if (invalidate) {
+        return; // overwritten whole: nothing read
+    }
+    NoteTombstoneHit(born.tombstone, is_modification ? TombstoneLoaded : TombstoneSampled,
+                     image.gpu_addr, &image.info);
+}
+
+template <class P>
+void TextureCache<P>::CheckTombstoneCpuRead(DAddr cpu_addr, u64 size) {
+    if (cpu_addr >= tombstone_cpu_end || cpu_addr + size <= tombstone_cpu_begin) {
+        return;
+    }
+    for (const RelocationTombstone& tombstone : relocation_tombstones) {
+        if (tombstone.gpu_modified && cpu_addr < tombstone.cpu_addr + tombstone.size &&
+            tombstone.cpu_addr < cpu_addr + size) {
+            NoteTombstoneHit(tombstone, TombstoneCpuRead, cpu_addr, nullptr);
+            return;
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::NoteTombstoneHit(const RelocationTombstone& tombstone, TombstoneRead reason,
+                                       GPUVAddr address, const ImageInfo* info) {
+    ++tombstone_hits[reason];
+    if (tombstone_hits_logged >= 8) {
+        return;
+    }
+    ++tombstone_hits_logged;
+    const u64 key = tombstone.shape_key;
+    LOG_WARNING(HW_GPU,
+                "Relocation tombstone hit (EXP43=4): {} at {:#x}{}; the image at {:#x} (format {} "
+                "{}x{}, {}GPU-written) moved to {:#x} {} render frame(s) ago",
+                reason == TombstoneSampled  ? "sampled"
+                : reason == TombstoneLoaded ? "rendered to without a clear"
+                                            : "read by the CPU",
+                address,
+                info != nullptr ? fmt::format(" (format {} {}x{})", static_cast<u32>(info->format),
+                                              info->size.width, info->size.height)
+                                : std::string{},
+                tombstone.gpu_addr, key >> 56, (key >> 18) & 0x3FFFF, key & 0x3FFFF,
+                tombstone.gpu_modified ? "" : "not ", tombstone.moved_to,
+                RenderFrame() - tombstone.render_frame);
+}
+
+template <class P>
+void TextureCache<P>::TickRelocationTombstones() {
+    if (!relocation_tombstones.empty()) {
+        const u64 render_frame = RenderFrame();
+        const auto expired = [render_frame](const RelocationTombstone& tombstone) {
+            return render_frame > tombstone.render_frame + 2;
+        };
+        std::erase_if(relocation_tombstones, expired);
+        tombstone_born.erase(std::remove_if(tombstone_born.begin(), tombstone_born.end(),
+                                            [&](const TombstoneBorn& born) {
+                                                return expired(born.tombstone);
+                                            }),
+                             tombstone_born.end());
+        tombstone_cpu_begin = ~DAddr{0};
+        tombstone_cpu_end = 0;
+        for (const RelocationTombstone& tombstone : relocation_tombstones) {
+            tombstone_cpu_begin = (std::min)(tombstone_cpu_begin, tombstone.cpu_addr);
+            tombstone_cpu_end = (std::max)(tombstone_cpu_end, tombstone.cpu_addr + tombstone.size);
+        }
+    }
+    if (frame_tick % 600 != 0 || (tombstones_made == 0 && VideoCore::Nx2Debug::Experiment(43) != 4)) {
+        return;
+    }
+    const u64 hits = tombstone_hits[TombstoneSampled] + tombstone_hits[TombstoneLoaded] +
+                     tombstone_hits[TombstoneCpuRead];
+    LOG_INFO(HW_GPU,
+             "Relocation tombstones (EXP43=4) last 600 frames: {} hits ({} sampled, {} rendered to "
+             "without a clear, {} CPU read); {} tombstones made, {} live; {} new images read over "
+             "one, not at its address",
+             hits, tombstone_hits[TombstoneSampled], tombstone_hits[TombstoneLoaded],
+             tombstone_hits[TombstoneCpuRead], tombstones_made, relocation_tombstones.size(),
+             tombstone_overlap_reads);
+    tombstone_hits = {};
+    tombstones_made = 0;
+    tombstone_overlap_reads = 0;
+}
+
+template <class P>
 void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     boost::container::small_vector<const AliasedImage*, 8> aliased_images;
     Image& image = slot_images[image_id];
@@ -4848,6 +4999,9 @@ template <class P>
 void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
     Image& image = slot_images[image_id];
     CheckCrossFrameUse(image, is_modification, invalidate);
+    if (!tombstone_born.empty()) {
+        CheckTombstonePrepare(image_id, image, is_modification, invalidate); // EXP43=4
+    }
     if (invalidate) {
         image.flags &= ~(ImageFlagBits::CpuModified | ImageFlagBits::GpuModified);
         if (False(image.flags & ImageFlagBits::Tracked)) {
