@@ -703,6 +703,7 @@ void TextureCache<P>::TickFrame() {
         relocation_candidates = relocation_guarded = relocation_relocated = relocation_retired =
             relocation_crowded = 0;
     }
+    TickRenderClock();
 
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
         for (auto& buffer : async_buffers_death_ring) {
@@ -710,6 +711,90 @@ void TextureCache<P>::TickFrame() {
         }
         async_buffers_death_ring.clear();
     }
+}
+
+template <class P>
+void TextureCache<P>::TickRenderClock() {
+    static const bool clock_env = [] {
+        const char* value = std::getenv("EDEN_NX2_RENDER_CLOCK");
+        return value != nullptr && value[0] == '1';
+    }();
+    const bool enabled = clock_env;
+    Tegra::g_nx2_render_clock_wanted.store(enabled, std::memory_order_relaxed);
+    const u64 counter = Tegra::g_nx2_render_frame.load(std::memory_order_relaxed);
+    render_clock_idle = counter != render_clock_last_counter ? 0 : render_clock_idle + 1;
+    render_clock_last_counter = counter;
+    // Live while the counter advanced in this host frame or the one before (a count may land in
+    // the next tick); two host frames without one and frame_tick takes over again.
+    const bool live = enabled && counter != 0 && render_clock_idle < 2;
+    if (live != render_clock_live) {
+        // Continue from the current value, so the clock never goes back across a switch.
+        render_clock_base = RenderFrame() + 1;
+        render_clock_source_base = live ? counter : frame_tick;
+        render_clock_live = live;
+        ++render_clock_switches;
+        if (live && !render_clock_logged) {
+            render_clock_logged = true;
+            LOG_INFO(HW_GPU,
+                     "Render frame clock (EDEN_NX2_RENDER_CLOCK): live at host frame {} ({}); "
+                     "last_write_frame, cross-frame reads and the same-frame rule follow it",
+                     frame_tick,
+                     Tegra::g_nx2_render_clock_syncpt >= 0
+                         ? fmt::format("syncpoint {}", Tegra::g_nx2_render_clock_syncpt)
+                         : std::string{"the present poll's learned word"});
+        }
+    }
+    render_clock_live_frames += render_clock_live ? 1 : 0;
+    if (frame_tick % 600 != 0 || (!enabled && !relocation_seen)) {
+        return;
+    }
+    // The shapes refused most often as written this frame.
+    std::vector<std::pair<u32, u64>> refused;
+    for (auto& [key, shape] : relocation_shapes) {
+        if (shape.same_frame_refused != 0) {
+            refused.emplace_back(shape.same_frame_refused, key);
+            shape.same_frame_refused = 0;
+        }
+    }
+    const size_t top = (std::min)(refused.size(), size_t{3});
+    std::partial_sort(refused.begin(), refused.begin() + top, refused.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string refused_text;
+    for (size_t i = 0; i < top; ++i) {
+        const u64 key = refused[i].second;
+        refused_text += fmt::format("{}format {} {}x{} {}", i == 0 ? "" : ", ", key >> 56,
+                                    (key >> 18) & 0x3FFFF, key & 0x3FFFF, refused[i].first);
+    }
+    // Syncpoints signalled in these frames, most first: one at about 1 per host frame may end
+    // each frame (EDEN_NX2_RENDER_CLOCK_SYNCPT).
+    std::string syncpt_text;
+    if (enabled) {
+        std::vector<std::pair<u32, u32>> signals;
+        for (u32 id = 0; id < Tegra::Nx2SyncpointSignalSlots; ++id) {
+            const u32 count =
+                Tegra::g_nx2_syncpoint_signals[id].exchange(0, std::memory_order_relaxed);
+            if (count != 0) {
+                signals.emplace_back(count, id);
+            }
+        }
+        std::sort(signals.rbegin(), signals.rend());
+        for (size_t i = 0; i < (std::min)(signals.size(), size_t{4}); ++i) {
+            syncpt_text += fmt::format(" {}:{:.2f}", signals[i].second, signals[i].first / 600.0);
+        }
+    }
+    const u64 counted = counter - render_clock_window_counter;
+    render_clock_window_counter = counter;
+    LOG_INFO(HW_GPU,
+             "Render frame clock (EDEN_NX2_RENDER_CLOCK={}) last 600 frames: {} render frames "
+             "({:.2f} per host frame), live {} of 600 frames, {} switches; {} relocation "
+             "candidates refused as written this frame{}{}; syncpoint signals per host frame:{}",
+             enabled ? 1 : 0, counted, counted / 600.0, render_clock_live_frames,
+             render_clock_switches, relocation_same_frame, top != 0 ? " (" : "",
+             top != 0 ? refused_text + ")" : std::string{},
+             syncpt_text.empty() ? std::string{" none"} : syncpt_text);
+    render_clock_live_frames = 0;
+    render_clock_switches = 0;
+    relocation_same_frame = 0;
 }
 
 template <class P>
@@ -4564,7 +4649,7 @@ template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
-    image.last_write_frame = frame_tick;
+    image.last_write_frame = RenderFrame();
 }
 
 template <class P>
@@ -4592,9 +4677,15 @@ ImageId TextureCache<P>::RelocationCandidate(const ImageInfo& new_info, GPUVAddr
     // still be read in this frame; it is never taken, and not counted).
     ImageId old_id{};
     u32 predecessors = 0;
+    u32 same_frame = 0;
+    const u64 render_frame = RenderFrame();
     for (const ImageId overlap_id : join_bad_overlap_ids) {
         const ImageBase& overlap = slot_images[overlap_id];
-        if (!same_shape(overlap.info) || overlap.last_write_frame == frame_tick) {
+        if (!same_shape(overlap.info)) {
+            continue;
+        }
+        if (overlap.last_write_frame == render_frame) {
+            ++same_frame;
             continue;
         }
         ++predecessors;
@@ -4604,6 +4695,12 @@ ImageId TextureCache<P>::RelocationCandidate(const ImageInfo& new_info, GPUVAddr
         }
     }
     if (predecessors == 0) {
+        if (same_frame != 0) {
+            // Refused as written this frame (the render-frame clock line counts them by shape).
+            ++relocation_same_frame;
+            ++relocation_shapes[RelocationShapeKey(new_info)].same_frame_refused;
+            relocation_seen = true;
+        }
         return ImageId{};
     }
     if (predecessors > 1) {
@@ -4691,7 +4788,7 @@ void TextureCache<P>::NoteRelocationGuard(ImageBase& image, RelocationGuard reas
                                      : "read by the CPU",
              image.gpu_addr,
              image.last_write_frame == ~u64{0} ? s64{-1} : static_cast<s64>(image.last_write_frame),
-             frame_tick);
+             RenderFrame());
 }
 
 template <class P>

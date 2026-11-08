@@ -40,6 +40,7 @@
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/game_dlss_status.h"
+#include "video_core/nx2.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/descriptor_table.h"
 #include "video_core/texture_cache/image_base.h"
@@ -593,6 +594,7 @@ private:
         u8 guard{};
         bool candidate_logged{};
         bool relocated_logged{};
+        u32 same_frame_refused{}; ///< Since the last report (render-frame clock line)
     };
     ::Common::unordered_map<u64, RelocationShape> relocation_shapes;
     /// Since the last report (TickFrame, every 600 frames once a candidate was seen).
@@ -601,7 +603,34 @@ private:
     u64 relocation_relocated{};
     u64 relocation_retired{};
     u64 relocation_crowded{}; ///< Cleared targets over two or more images of their shape
+    u64 relocation_same_frame{}; ///< Candidates whose only predecessors were written this frame
     bool relocation_seen{};
+
+    /// The frame last_write_frame, CheckCrossFrameUse and RelocationCandidate's same-frame rule
+    /// count in. frame_tick advances at the composite, a sync request the back serves wherever it
+    /// is, so one host tick holds the end of one guest frame and the start of the next
+    /// (fable_answer_16 1a). With EDEN_NX2_RENDER_CLOCK=1 it follows Tegra::g_nx2_render_frame
+    /// instead (bumped where the frame's last GPU work is), falling back to frame_tick while that
+    /// does not advance (no word learned yet, other titles). Monotonic across the switches; the
+    /// LRU, the collector and the logs keep frame_tick.
+    [[nodiscard]] u64 RenderFrame() const noexcept {
+        const u64 source = render_clock_live
+                               ? Tegra::g_nx2_render_frame.load(std::memory_order_relaxed)
+                               : frame_tick;
+        return render_clock_base + (source - render_clock_source_base);
+    }
+    /// TickFrame: follows the counter, or falls back to frame_tick after two host frames
+    /// without a count; logs the rate next to the relocation line.
+    void TickRenderClock();
+    bool render_clock_live{};
+    bool render_clock_logged{};
+    u64 render_clock_base{};
+    u64 render_clock_source_base{};
+    u64 render_clock_last_counter{};
+    u64 render_clock_window_counter{}; ///< The counter at the last report
+    u32 render_clock_idle{};           ///< Host frames since the counter last advanced
+    u32 render_clock_live_frames{};    ///< Since the last report
+    u32 render_clock_switches{};
 
     [[nodiscard]] static bool RelocationShaped(const ImageInfo& info) noexcept {
         return info.type == ImageType::e2D && info.resources.levels == 1 &&
@@ -629,8 +658,8 @@ private:
     void NoteRelocationGuard(ImageBase& image, RelocationGuard reason);
     /// The cross-frame read checks of PrepareImage and the texture memo's touch.
     void CheckCrossFrameUse(ImageBase& image, bool is_modification, bool invalidate) {
-        if (image.last_write_frame == frame_tick || image.last_write_frame == ~u64{0} ||
-            invalidate) {
+        if (image.last_write_frame == ~u64{0} || invalidate ||
+            image.last_write_frame == RenderFrame()) {
             return;
         }
         const RelocationGuard reason = is_modification ? GuardLoaded : GuardSampled;

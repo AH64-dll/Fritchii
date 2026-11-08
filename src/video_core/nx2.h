@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -567,5 +568,34 @@ private:
     std::vector<Waiter> waiters;
     std::atomic<size_t> count{};
 };
+
+// Render-frame clock (EDEN_NX2_RENDER_CLOCK=1, fable_answer_16 1b): one count per guest frame,
+// bumped where the frame's last GPU work is, so the texture cache's relocation rules can tell
+// frames apart where the host present tick (mid-stream) cannot. Two sources: a write to the
+// present poll's learned word (core/hle/kernel/svc/svc_nx2_oot_present.cpp OnGpuWrite, needs
+// EXP24=1 to learn the word), or with EDEN_NX2_RENDER_CLOCK_SYNCPT=<id> the split's back
+// signalling that syncpoint (FenceManager::SignalSyncPoint, in stream order). Nothing counts
+// while the texture cache does not want the clock.
+inline std::atomic<bool> g_nx2_render_clock_wanted{false};
+inline std::atomic<u64> g_nx2_render_frame{};
+inline const int g_nx2_render_clock_syncpt = [] {
+    const char* value = std::getenv("EDEN_NX2_RENDER_CLOCK_SYNCPT");
+    return value != nullptr && value[0] != '\0' ? std::atoi(value) : -1;
+}();
+// Syncpoint signals by id while the clock is wanted (logged with the clock, to find the one
+// signalled once a frame).
+inline constexpr size_t Nx2SyncpointSignalSlots = 192;
+inline std::array<std::atomic<u32>, Nx2SyncpointSignalSlots> g_nx2_syncpoint_signals{};
+
+inline void Nx2NoteSyncpointSignal(u32 id) {
+    if (!g_nx2_render_clock_wanted.load(std::memory_order_relaxed) ||
+        id >= Nx2SyncpointSignalSlots) {
+        return;
+    }
+    g_nx2_syncpoint_signals[id].fetch_add(1, std::memory_order_relaxed);
+    if (static_cast<int>(id) == g_nx2_render_clock_syncpt) {
+        g_nx2_render_frame.fetch_add(1, std::memory_order_relaxed);
+    }
+}
 
 } // namespace Tegra
