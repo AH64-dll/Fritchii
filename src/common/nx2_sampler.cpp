@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "common/nx2_sampler.h"
+#include "common/jit_symbols.h"
 
 #ifdef _WIN32
 
@@ -194,6 +195,11 @@ struct Symbolizer {
             GetModuleFileNameA(module, path, sizeof(path));
             const char* base = std::strrchr(path, '\\');
             it->second = std::string{base != nullptr ? base + 1 : path} + "!?";
+        } else if (auto block = Common::JitSymbols::Lookup(reinterpret_cast<const void*>(address))) {
+            // JIT code is reused for other blocks after a cache clear: don't keep the name.
+            jit_name = std::move(*block);
+            cache.erase(it);
+            return jit_name;
         } else {
             it->second = "(jit)";
         }
@@ -202,11 +208,13 @@ struct Symbolizer {
 
     SymFromAddrFn from_address{};
     std::unordered_map<DWORD64, std::string> cache;
+    std::string jit_name;
 };
 
 std::string Report(const std::vector<Target>& targets, const std::vector<Sample>& samples,
                    const char* path) {
-    Symbolizer symbolizer;
+    // SymInitialize fails on a second call without SymCleanup, so keep one symbolizer.
+    static Symbolizer symbolizer;
     std::string text;
     for (unsigned thread = 0; thread < targets.size(); ++thread) {
         std::map<std::string, unsigned> self;

@@ -45,6 +45,8 @@ add_library(
     div_ceil.h
     dkb_cpu_trace.cpp
     dkb_cpu_trace.h
+    jit_symbols.cpp
+    jit_symbols.h
     nx2_sampler.cpp
     nx2_sampler.h
     nx2_gpu_write_listener.h
