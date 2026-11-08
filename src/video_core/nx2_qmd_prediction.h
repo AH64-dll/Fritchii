@@ -22,6 +22,9 @@
 ///    (bit 26) and compute report reductions are recorded for the reduction lower bound
 ///    (fable_answer_6 6c), which is counted too.
 /// One log line every 5 s (HW_GPU, Info), three with 2.
+namespace Tegra {
+enum class Nx2Landing : u32; // nx2.h
+}
 namespace VideoCommon {
 enum class GuestWriterCause : u8; // gpu_split.h
 }
@@ -86,14 +89,20 @@ enum class Mirror : u32 {
     Resync,       ///< A drain and a copy of the back's table (GPU-written page, all-zero QMD)
     SessionStart, ///< The same at the first signal of a split session or of EXP13=2
     AutoOff,      ///< Turned off: too many reads waited or resynced (EDEN_NX2_QMD_AUTO_OFF)
+    Patched,      ///< An inline QMD's overlay took an inline upload's words over it
     Count,
 };
 void NoteMirror(Mirror event);
 /// Front, EXP13=2: a QMD read waited; `cause` set its target (`what`: an unknown noted write's).
 void NoteWait(GuestWriterCause cause, const char* what);
-/// Any thread, EXP13=2: a GPU write of `value` landed in the u32 at `device` (OnWrite, compute
-/// report reductions): marks the word's oldest unlanded record landed.
-void NoteLanded(u64 device, u32 value);
+/// Front, EXP13=2: a QMD read waited on a writer range of `kind` (GpuSplit::WriterKind) that
+/// starts at byte `offset` of the QMD (negative: before it) and is `size` bytes long.
+void NoteRangeWait(u32 kind, s64 offset, u64 size);
+/// Any thread, EXP13=2: a GPU write of `value` is about to land in the u32 at `device` (called
+/// before the word is written): marks the record it belongs to, by kind (a reduction the oldest
+/// unlanded reduction, a plain write the oldest unlanded plain record of that payload, a max the
+/// oldest unlanded max release with a payload up to it).
+void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing kind);
 /// Front, EXP13=2: the records are complete for the work sent from `position` on (the copy just
 /// started over), or not any more (`valid` false: it stopped).
 void SetRecordsValid(bool valid, u64 position);
@@ -144,8 +153,7 @@ struct Bound {
     u64 device;
     u64 address;
     u64 done;
-    /// The newest folded record's place among the word's records: landed once that many landed.
-    u64 nth;
+    std::array<u64, 16> sequences; ///< The folded records (all landed: the check is meaningful)
     u64 payload_sum;
     std::chrono::steady_clock::time_point since;
     const u8* pointer;

@@ -79,10 +79,13 @@ struct FrontQmdMirror {
     /// The newest position of an overlay replaced by another QMD's: reads of a QMD without an
     /// overlay wait for it while it is queued.
     u64 evicted{};
-    /// Reads in the current window, those that waited for queued writes, and resyncs.
+    /// Reads in the current window, those that waited for queued writes, and resyncs; the
+    /// reads of the session and the windows in a row over the auto-off limit.
     u32 window_reads{};
     u32 window_waits{};
     u32 window_resyncs{};
+    u64 session_reads{};
+    u32 strikes{};
 
     const Overlay* FindOverlay(const void* space, GPUVAddr address) const {
         for (const Overlay& overlay : overlays) {
@@ -120,7 +123,12 @@ struct FrontQmdMirror {
     void Clear() {
         overlays = {};
         evicted = 0;
+    }
+
+    void ResetWindow() {
         window_reads = window_waits = window_resyncs = 0;
+        session_reads = 0;
+        strikes = 0;
     }
 };
 FrontQmdMirror g_front_qmd;
@@ -136,6 +144,7 @@ void ResyncFrontQmd(VideoCommon::GpuSplit& split, VideoCommon::QmdPrediction::Mi
     mirror.session = split.Session();
     mirror.synced = true;
     if (why == VideoCommon::QmdPrediction::Mirror::SessionStart) {
+        mirror.ResetWindow();
         // Records from before (another split session's ring positions, or EXP13=1's) go.
         VideoCommon::QmdPrediction::SetRecordsValid(false, 0);
     }
@@ -149,6 +158,7 @@ void StopFrontQmd(bool disable) {
     mirror.synced = false;
     mirror.disabled = disable;
     mirror.Clear();
+    mirror.ResetWindow();
     VideoCommon::QmdPrediction::SetRecordsValid(false, 0);
 }
 
@@ -252,13 +262,13 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
         rasterizer->SignalFence([this, address, payload, reduction] {
             const u32 value = ReduceSemaphore(reduction, false, memory_manager.Read<u32>(address),
                                               payload);
-            memory_manager.Write<u32>(address, value);
-            // EXP13=2: counted as landed for the reduction bound's records (nothing else).
-            if (VideoCommon::QmdPrediction::MirrorMode()) {
+            // EXP13=2: marked before the word is written (nx2.h); counting only.
+            if (Tegra::Nx2LandedHooked()) [[unlikely]] {
                 if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                    Tegra::Nx2NoteLanded(*device, value);
+                    Tegra::Nx2NoteLanded(*device, value, Tegra::Nx2Landing::Reduction);
                 }
             }
+            memory_manager.Write<u32>(address, value);
             if (Common::Nx2GpuWrite::g_listener.load(std::memory_order_relaxed) != nullptr) {
                 Common::Nx2GpuWrite::Notify(Common::Nx2GpuWrite::Path::ComputeReduce,
                                             memory_manager.GpuToCpuAddress(address).value_or(0),
@@ -544,6 +554,12 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     rasterizer->SignalFence([this, address, payload, flags] {
                         const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
                                                           memory_manager.Read<u32>(address), payload);
+                        // EXP13=2: marked before the word is written (nx2.h); counting only.
+                        if (Tegra::Nx2LandedHooked()) [[unlikely]] {
+                            if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                                Tegra::Nx2NoteLanded(*device, value, Tegra::Nx2Landing::Reduction);
+                            }
+                        }
                         memory_manager.Write<u32>(address, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
@@ -571,6 +587,12 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // GEQ acquires waiting forever.
                     rasterizer->SignalFence([this, address, payload] {
                         const u32 value = (std::max)(memory_manager.Read<u32>(address), payload);
+                        // EXP13=2: marked before the word is written (nx2.h); counting only.
+                        if (Tegra::Nx2LandedHooked()) [[unlikely]] {
+                            if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                                Tegra::Nx2NoteLanded(*device, value, Tegra::Nx2Landing::Max);
+                            }
+                        }
                         memory_manager.Write<u32>(address, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
@@ -1490,6 +1512,10 @@ struct KeplerCompute::FrontState {
     GPUVAddr upload_address{};
     u64 upload_size{};
     bool upload_known{};
+    /// EXP13=2 (FrontPatchOverlays): the bytes of the upload its data words filled so far, and
+    /// whether it is linear and one line (its bytes land at upload_address as they are).
+    u64 upload_offset{};
+    bool upload_contiguous{};
 };
 
 namespace {
@@ -1628,6 +1654,10 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     split.Method(this, method, argument, is_last_call, segment, FrontEffect(method));
     FrontNoteWrites(split, fs, method);
     FrontNoteWriter(split, fs, method, argument);
+    if (method == KEPLER_COMPUTE_REG_INDEX(data_upload) &&
+        VideoCommon::QmdPrediction::MirrorMode()) {
+        FrontPatchOverlays(split, fs, &argument, 1);
+    }
     if (method == 0x6c3) {
         FrontNoteRelease(split, fs, argument);
     }
@@ -1931,12 +1961,18 @@ void KeplerCompute::FrontQmdSignal(VideoCommon::GpuSplit& split, GPUVAddr qmd_ad
         const char* const value = std::getenv("EDEN_NX2_QMD_AUTO_OFF");
         return value == nullptr || value[0] != '0';
     }();
-    if (mirror.window_reads >= 256 || mirror.window_resyncs > 8) {
-        if ((auto_off && mirror.window_waits * 8 > mirror.window_reads) ||
-            mirror.window_resyncs > 8) {
+    // A grace window (fable_answer_6 6e): no decision in the session's first 4096 reads (boot
+    // schedules QMDs before any has an overlay), then two 1024-read windows in a row over 1 in 8.
+    if (mirror.window_reads >= 1024 || mirror.window_resyncs > 8) {
+        const bool over = (auto_off && mirror.window_waits * 8 > mirror.window_reads) ||
+                          mirror.window_resyncs > 8;
+        mirror.session_reads += mirror.window_reads;
+        mirror.strikes = over ? mirror.strikes + 1 : 0;
+        if (over && mirror.strikes >= 2 && mirror.session_reads >= 4096) {
             LOG_WARNING(HW_GPU,
                         "QMD release prediction (EXP13=2): {} of {} QMD reads waited for queued "
-                        "writes, {} resyncs; the QMD scheduler copy is off until EXP13 changes",
+                        "writes, {} resyncs, the second window in a row; the QMD scheduler copy "
+                        "is off until EXP13 changes",
                         mirror.window_waits, mirror.window_reads, mirror.window_resyncs);
             Prediction::NoteMirror(Prediction::Mirror::AutoOff);
             StopFrontQmd(true);
@@ -1988,6 +2024,27 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
             cause = Cause::OverlayEvicted;
             what = nullptr;
         }
+        if (cause == Cause::WriterRange) {
+            const s64 offset = static_cast<s64>(writers.range_begin) - static_cast<s64>(*device);
+            const u64 range_size = writers.range_end - writers.range_begin;
+            const u32 kind = static_cast<u32>(writers.range_kind);
+            Prediction::NoteRangeWait(kind, offset, range_size);
+            static u32 logged{};
+            if (logged < 16) {
+                ++logged;
+                constexpr std::array<const char*, 5> kinds{"upload", "release", "compute",
+                                                           "copy", "other"};
+                LOG_INFO(HW_GPU,
+                         "QMD release prediction (EXP13=2): QMD {:#x} read waits on a writer "
+                         "range: {} at byte {} of the QMD, {} bytes, {} ring words ahead of the "
+                         "back; overlay {}",
+                         address, kind < kinds.size() ? kinds[kind] : "?", offset, range_size,
+                         target - done,
+                         overlay == nullptr               ? "none"
+                         : overlay->position > done       ? "queued"
+                                                          : "already run");
+            }
+        }
         ++mirror.window_waits;
         split.WaitUntil(target, VideoCommon::DrainSite::QmdRead);
         Prediction::NoteMirror(Prediction::Mirror::Waited);
@@ -2004,6 +2061,50 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
     return true;
 }
 
+void KeplerCompute::FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState& fs,
+                                       const u32* words, u32 count) const {
+    // As Upload::State::ProcessData: the data words fill the upload's bytes in order, four each
+    // (the last one partly); a linear one-line upload writes them at its destination as they are.
+    const u64 begin = fs.upload_offset;
+    const u64 end = (std::min)(fs.upload_size, begin + u64{count} * sizeof(u32));
+    fs.upload_offset = (std::max)(begin, end);
+    auto& mirror = g_front_qmd;
+    if (!fs.upload_known || !fs.upload_contiguous || begin >= end || !mirror.synced) {
+        return;
+    }
+    // The game patches the release words of QMDs a 0x107 already wrote (native_qmd.h: "The SDK
+    // patches release payloads while a scheduled QMD is waiting"): an overlay that still holds
+    // its QMD (its 0x107 queued, nothing else queued writing it) takes the words, and counts as
+    // written by this upload, so a read takes it instead of waiting.
+    const GPUVAddr first = fs.upload_address + begin;
+    const GPUVAddr last = fs.upload_address + end;
+    const u64 done = split.ConsumedNow();
+    const u64 position = split.SentPosition();
+    constexpr u64 size = sizeof(NativeQmdScheduler::Descriptor);
+    for (FrontQmdMirror::Overlay& overlay : mirror.overlays) {
+        if (overlay.position == 0 || overlay.space != &memory_manager ||
+            last <= overlay.address || overlay.address + size <= first ||
+            overlay.position <= done) {
+            continue;
+        }
+        const auto device = memory_manager.GpuToCpuAddress(overlay.address);
+        if (!device) {
+            continue;
+        }
+        const auto writers = split.QueuedGuestWriters(done, overlay.address, *device, size,
+                                                      std::span<const u64>{&position, 1});
+        if ((std::max)(writers.noted, writers.unbounded) > overlay.position) {
+            continue; // Something else wrote it since: the read waits
+        }
+        const GPUVAddr from = (std::max)(first, overlay.address);
+        const GPUVAddr to = (std::min)(last, overlay.address + size);
+        std::memcpy(reinterpret_cast<u8*>(overlay.words.data()) + (from - overlay.address),
+                    reinterpret_cast<const u8*>(words) + (from - first), to - from);
+        overlay.position = position;
+        VideoCommon::QmdPrediction::NoteMirror(VideoCommon::QmdPrediction::Mirror::Patched);
+    }
+}
+
 void KeplerCompute::FrontNoteUpload(FrontState& fs, u32 exec) {
     // What Upload::State writes for the data after this exec_upload, from the same registers
     // (the upload block is shared with the older class).
@@ -2014,6 +2115,8 @@ void KeplerCompute::FrontNoteUpload(FrontState& fs, u32 exec) {
     fs.upload_address = (GPUVAddr{reg(2)} << 32) | reg(3);
     fs.upload_size = 0;
     fs.upload_known = true;
+    fs.upload_offset = 0;
+    fs.upload_contiguous = (exec & 1) != 0 && lines == 1;
     if (line_length == 0 || lines == 0) {
         return; // Writes nothing (copy_size 0)
     }
@@ -2104,6 +2207,10 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
     for (u32 i = 0; i < notes; ++i) {
         FrontNoteWriter(split, fs, method, base_start[i]);
     }
+    if (method == KEPLER_COMPUTE_REG_INDEX(data_upload) &&
+        VideoCommon::QmdPrediction::MirrorMode()) {
+        FrontPatchOverlays(split, fs, base_start, amount);
+    }
 }
 
 void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -2149,6 +2256,10 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         split.MacroWrite(this, address, value, FrontEffect(address));
         FrontNoteWrites(split, fs, address);
         FrontNoteWriter(split, fs, address, value);
+        if (address == KEPLER_COMPUTE_REG_INDEX(data_upload) &&
+            VideoCommon::QmdPrediction::MirrorMode()) {
+            FrontPatchOverlays(split, fs, &value, 1);
+        }
         if (address == 0x6c3) {
             FrontNoteRelease(split, fs, value);
         }

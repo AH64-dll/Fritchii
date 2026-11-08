@@ -766,6 +766,10 @@ public:
         GuestWriterCause noted_cause;
         GuestWriterCause unbounded_cause;
         const char* what; ///< UnknownPending: the noted write's `what`
+        /// WriterRange: the range's kind and device bytes [range_begin, range_end).
+        WriterKind range_kind;
+        u64 range_begin;
+        u64 range_end;
     };
     [[nodiscard]] GuestWriters QueuedGuestWriters(u64 done, GPUVAddr address, u64 device, u64 size,
                                                   std::span<const u64> skip = {}) const;
@@ -926,6 +930,7 @@ private:
         u64 position;
         u64 begin;
         u64 end;
+        WriterKind kind; ///< For EXP13=2's wait histogram
     };
     std::array<WriterRange, 1024> writer_ranges{};
     static constexpr u64 MaxWriterScan = 512;
@@ -935,7 +940,7 @@ private:
     std::array<u64, static_cast<size_t>(ReleaseNote::Count)> release_notes{};
     /// NoteWriterRange's translation: noted, or why not (a ReleaseNote past Ranged).
     ReleaseNote TryNoteWriterRange(const Tegra::MemoryManager& memory, GPUVAddr address,
-                                   u64 size);
+                                   u64 size, WriterKind kind);
     /// NoteWriterRange's last range and the function position its translation holds for: the
     /// same range again (an inline upload's data words) only moves the newest range's position,
     /// unless a check may have kept what it found for it (below writer_range_sealed).

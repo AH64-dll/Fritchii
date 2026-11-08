@@ -305,6 +305,9 @@ private:
                       NativeQmdScheduler::Descriptor& descriptor, bool& unknown) const;
     /// An exec_upload with `exec` was sent: the range its data writes.
     void FrontNoteUpload(FrontState& state, u32 exec);
+    /// EXP13=2: data_upload words just sent: the inline QMD overlays they fall in take them.
+    void FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState& state, const u32* words,
+                            u32 count) const;
     std::unique_ptr<FrontState> front;
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
 
