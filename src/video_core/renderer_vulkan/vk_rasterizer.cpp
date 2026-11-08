@@ -1392,8 +1392,45 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                  regs.clear_color[1], regs.clear_color[2], regs.clear_color[3]);
     }
     TraceWindowTarget(*maxwell3d, *gpu_memory, "clear", layer_count);
+    // Slow clears (over 300 us) are logged with where the time went, at most 40 per 5 s: at the
+    // Castle Town route start the back's clear zone went 0.7 -> 4.6 ms a frame while an NPC walked
+    // past, at about the same number of clears.
+    const auto clear_start = std::chrono::steady_clock::now();
     FlushWork();
     gpu_memory->FlushCaching();
+    const auto clear_flushed = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point clear_targets_ready{};
+    SCOPE_EXIT {
+        const auto end = std::chrono::steady_clock::now();
+        const auto us = [](auto d) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(d).count();
+        };
+        if (end - clear_start < std::chrono::microseconds{300}) {
+            return;
+        }
+        static std::atomic<s64> window_start{};
+        static std::atomic<u32> logged{};
+        const s64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               end.time_since_epoch()).count();
+        if (now_ms - window_start.load(std::memory_order_relaxed) > 5000) {
+            window_start.store(now_ms, std::memory_order_relaxed);
+            logged.store(0, std::memory_order_relaxed);
+        }
+        if (logged.fetch_add(1, std::memory_order_relaxed) >= 40) {
+            return;
+        }
+        const auto& r = maxwell3d->regs;
+        const s64 targets_us = clear_targets_ready.time_since_epoch().count() != 0
+                                   ? us(clear_targets_ready - clear_flushed)
+                                   : -1;
+        LOG_INFO(Render_Vulkan,
+                 "Slow clear {} us (flush work {} us, render targets {} us): rt0 {:#x} {}x{} fmt "
+                 "{:#x}, zeta {:#x} {} fmt {:#x}, surface {:#x}, layers {}",
+                 us(end - clear_start), us(clear_flushed - clear_start), targets_us,
+                 r.rt[0].Address(), r.rt[0].width, r.rt[0].height, static_cast<u32>(r.rt[0].format),
+                 r.zeta.Address(), r.zeta_enable ? "on" : "off", static_cast<u32>(r.zeta.format),
+                 r.clear_surface.raw, layer_count);
+    };
 
     auto& regs = maxwell3d->regs;
     const bool use_color = regs.clear_surface.R || regs.clear_surface.G || regs.clear_surface.B ||
@@ -1406,6 +1443,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 
     std::scoped_lock lock{texture_cache.mutex};
     texture_cache.UpdateRenderTargets(true);
+    clear_targets_ready = std::chrono::steady_clock::now();
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     if (frame_dump.Capturing() || flash_watch.WatchesPasses()) {
         FrameDumpPass(framebuffer);
