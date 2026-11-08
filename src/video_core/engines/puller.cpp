@@ -150,6 +150,10 @@ const char* NotedWriterName(const VideoCommon::GpuSplit::GuestWriters& writers) 
 //   that too, so this one is a hint).
 // The first 8 of the first two are logged, and one line every 5 s (HW_GPU, Info). Front thread
 // only, as the GpuSplit tables it reads.
+// EDEN_NX2_EXP34 (live, default 1, nx2_debug_control.h): 1 = an acquire over a queued writer
+// (lower releases included) takes the normal path instead (the drain or the readable fence
+// release, as when guest memory is below the value), 2 = only one over a queued lower release
+// does, 0 = count only. It only turns met answers into the normal path, never the other way.
 class PrecheckAudit {
 public:
     static PrecheckAudit& Get() {
@@ -159,7 +163,7 @@ public:
 
     /// Level 2 would answer met: guest memory holds `word` (>= `value`) at GPU `address`
     /// (device `device`); `readable_word`: what SemaphoreReadableNow read, when it read the word
-    /// current. Returns whether the answer stands.
+    /// current. Returns whether the answer stands (EXP34).
     bool Allow(GPUVAddr address, u64 device, u32 word, u32 value,
                std::optional<u32> readable_word) {
         auto& split = VideoCommon::GpuSplit::Get();
@@ -206,17 +210,23 @@ public:
         if (readable_word && *readable_word < value) {
             ++readable_below;
         }
+        // EXP34: 1 = over a queued writer (the lower releases among them) the normal path
+        // answers, 2 = only over a queued lower release; anything else counts only.
+        const int guard = VideoCore::Nx2Debug::Experiment(34);
+        const bool refuse = (guard == 1 && writer) || (guard == 2 && lower);
+        refused += refuse ? 1 : 0;
         const auto now = std::chrono::steady_clock::now();
         if (now - last_report >= std::chrono::seconds{5}) {
             const double window = std::chrono::duration<double>(now - last_report).count();
             last_report = now;
             LOG_INFO(HW_GPU,
                      "Acquire precheck (level 2): {} met, {} over a queued lower release, {} over "
-                     "a queued writer, {} readable below the value ({:.1f} s)",
-                     met, over_lower, over_writer, readable_below, window);
-            met = over_lower = over_writer = readable_below = 0;
+                     "a queued writer, {} readable below the value; {} sent the normal way "
+                     "(EXP34={}) ({:.1f} s)",
+                     met, over_lower, over_writer, readable_below, refused, guard, window);
+            met = over_lower = over_writer = readable_below = refused = 0;
         }
-        return true;
+        return !refuse;
     }
 
 private:
@@ -224,6 +234,7 @@ private:
     u64 over_lower{};
     u64 over_writer{};
     u64 readable_below{};
+    u64 refused{};
     u32 logged_lower{};
     u32 logged_writer{};
     std::chrono::steady_clock::time_point last_report = std::chrono::steady_clock::now();

@@ -228,6 +228,17 @@ inline std::atomic<int> g_idle_pause{-1};
 /// walls at low accuracy; ours already has #215's FlushQueryResults wait (EXP30 trims it), so
 /// off by default, not measured yet: white flash watch, and the front's semaphore waits (the
 /// reports land later than with the fence skipped).
+/// EXP34 (EDEN_NX2_ACQUIRE_PRECHECK=2's reset hole, fable_answer_6 6i (b); puller.cpp
+/// PrecheckAudit): where level 2 would answer a GEQ acquire met from guest memory alone,
+/// 1 = it takes the normal path instead when the front knows a write to the word is still queued
+/// for the back: a plain release (puller, SEM_EXECUTE, 3D or compute 0x6c3) with any payload, a
+/// noted write over the word (puller semaphores, 3D reports, compute 0x6c3 releases and
+/// reductions, copies, uploads) or, with EXP13 on, a QMD prediction record; 2 = only when that
+/// queued plain release writes less than the word read (a reset); 0 = count only. The counts
+/// are logged either way ("Acquire precheck (level 2)", every 5 s). Default 1: it only turns met
+/// answers into the path level 2 takes for a word below the value, never the other way, so it is
+/// a strict tightening; its cost is the drains it puts back (compare 0, 1 and 2 with
+/// profile_toggle and the AcquiresFast count).
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 
@@ -259,6 +270,10 @@ inline void LoadExperiments() {
         // compute inline uploads not recorded); 1 (memory usage reuse) changes what the caches'
         // GC sees and stays off.
         g_experiments[29].store(6, std::memory_order_relaxed);
+        // EXP34 = 1: ACQUIRE_PRECHECK=2 no longer answers met over a write to the word still
+        // queued for the back (a reset there let a channel run before its producer). A strict
+        // tightening: only met answers become the normal path.
+        g_experiments[34].store(1, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {
