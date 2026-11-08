@@ -484,6 +484,25 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
 
 namespace {
 
+// NVN keeps the draw's base vertex, base instance and draw ID in c0 0x640/0x644/0x648 (the HLE
+// draw macros map the same slots). Read them from the draw instead: the c0 copy a shader sees can
+// lag the macro's writes, which dropped Ocarina of Time's instanced vegetation.
+std::optional<Shader::ReplaceConstant> ForcedDrawParameter(u32 bank, u32 offset) {
+    if (bank != 0) {
+        return std::nullopt;
+    }
+    switch (offset) {
+    case 0x640:
+        return Shader::ReplaceConstant::BaseVertex;
+    case 0x644:
+        return Shader::ReplaceConstant::BaseInstance;
+    case 0x648:
+        return Shader::ReplaceConstant::DrawID;
+    default:
+        return std::nullopt;
+    }
+}
+
 // Reads a native program a 4 KiB page at a time instead of one 16-byte instruction at a time.
 // Each page is read with ReadBlock, so GPU-written code is flushed first, once per page instead
 // of once per instruction. An instruction that is not inside a fully mapped page is left to the
@@ -942,6 +961,9 @@ u32 GraphicsEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
 
 std::optional<Shader::ReplaceConstant> GraphicsEnvironment::GetReplaceConstBuffer(u32 bank,
                                                                                   u32 offset) {
+    if (const auto forced = ForcedDrawParameter(bank, offset)) {
+        return forced;
+    }
     if (!has_hle_engine_state) {
         return std::nullopt;
     }
@@ -1339,6 +1361,9 @@ std::array<u32, 3> FileEnvironment::WorkgroupSize() const {
 
 std::optional<Shader::ReplaceConstant> FileEnvironment::GetReplaceConstBuffer(u32 bank,
                                                                               u32 offset) {
+    if (const auto forced = ForcedDrawParameter(bank, offset)) {
+        return forced;
+    }
     const u64 key = (static_cast<u64>(bank) << 32) | static_cast<u64>(offset);
     auto it = cbuf_replacements.find(key);
     if (it == cbuf_replacements.end()) {
