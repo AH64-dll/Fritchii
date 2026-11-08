@@ -20,6 +20,7 @@
 
 #include "common/logging.h"
 #include "common/nx2_gpu_write_listener.h"
+#include "common/nx2_timeline.h"
 #include "core/arm/arm_interface.h"
 #include "core/arm/debug.h"
 #include "core/core.h"
@@ -994,9 +995,43 @@ void MaybeLog(PresentPollState& state, s64 now, int mode) {
              fields.empty() ? " none" : fields);
 }
 
+/// The poll's event object's guest address (as ReadEventObject finds it; 0 if unreadable). With
+/// the timeline's guest layer, one "OoT: present poll word" marker per address-like word of it:
+/// its value (a GPU address, compared with the GPU write's) and the host pointer it maps to
+/// (compared with the host pointer of Common::Nx2GpuWrite::Notify's "GPU write"). Reads only.
+u64 MarkEventObjectForTimeline(KProcess& process, const Svc::ThreadContext& ctx) {
+    auto& memory = process.GetMemory();
+    const u64 x22 = ctx.r[22];
+    const u64 x23 = ctx.r[23];
+    if (!memory.IsValidVirtualAddressRange(x22 + EventIndexOffset, sizeof(u32))) {
+        return 0;
+    }
+    const u64 object = x23 + (u64{memory.Read32(x22 + EventIndexOffset)} << EventStrideShift);
+    if (object == 0 ||
+        !memory.IsValidVirtualAddressRange(object, EventObjectWords * sizeof(u64))) {
+        return 0;
+    }
+    if (!Common::Nx2Timeline::Guest()) {
+        return object;
+    }
+    for (size_t k = 0; k < EventObjectWords; ++k) {
+        const u64 field = memory.Read64(object + k * sizeof(u64));
+        if (field < MinAddressField) {
+            continue;
+        }
+        const void* host = nullptr;
+        if ((field & 3) == 0 && memory.IsValidVirtualAddressRange(field, sizeof(u32))) {
+            host = memory.GetPointerSilent(field);
+        }
+        Common::Nx2Timeline::Instant("OoT: present poll word", {"field", k}, {"gpu", field},
+                                     {"host", reinterpret_cast<uintptr_t>(host)});
+    }
+    return object;
+}
+
 } // Anonymous namespace
 
-bool IsNx2OotPresentPollSleep(Core::System& system, s64 ns) {
+bool IsNx2OotPresentPollSleep(Core::System& system, s64 ns, u64* event_object) {
     if (ns <= 0 || ns > MaxPollSleepNs) {
         return false;
     }
@@ -1010,7 +1045,13 @@ bool IsNx2OotPresentPollSleep(Core::System& system, s64 ns) {
         return false;
     }
     Svc::ThreadContext ctx{};
-    return ReadContext(kernel, process, ctx) && CalledFromSite(process, ctx, site_return);
+    if (!ReadContext(kernel, process, ctx) || !CalledFromSite(process, ctx, site_return)) {
+        return false;
+    }
+    if (event_object != nullptr) {
+        *event_object = MarkEventObjectForTimeline(process, ctx);
+    }
+    return true;
 }
 
 bool SleepNx2OotPresentPoll(Core::System& system, s64 ns) {

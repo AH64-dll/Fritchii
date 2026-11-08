@@ -16,6 +16,7 @@
 #include "common/nx2_timeline.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "core/arm/debug.h"
 #include "core/core.h"
 #include "core/debugger/debugger.h"
 #include "core/hle/kernel/k_process.h"
@@ -69,6 +70,18 @@ bool CoreLockEnabled() {
         return value != nullptr && value[0] != '\0' && value[0] != '0';
     }();
     return enabled;
+}
+
+/// The guest thread's nn::os name for the timeline (Common::Nx2Timeline::NameGuestThread), once
+/// it has one; threads the SDK did not create keep their id.
+void NameGuestThreadForTimeline(const KThread* thread) {
+    const u64 thread_id = thread->GetThreadId();
+    if (!Common::Nx2Timeline::WantsGuestThreadName(thread_id)) {
+        return;
+    }
+    if (const auto name = Core::GetThreadName(thread)) {
+        Common::Nx2Timeline::NameGuestThread(thread_id, *name);
+    }
 }
 
 } // Anonymous namespace
@@ -165,6 +178,12 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
             system.GetDebugger().NotifyThreadStopped(thread);
             thread->RequestSuspend(kernel, SuspendType::Debug);
             return;
+        }
+
+        // The timeline's guest layer names the guest threads (nn::os names, read from guest
+        // memory here, outside the scheduler lock).
+        if (Common::Nx2Timeline::Guest()) [[unlikely]] {
+            NameGuestThreadForTimeline(thread);
         }
 
         // Otherwise, run the thread.

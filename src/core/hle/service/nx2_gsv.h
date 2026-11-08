@@ -2520,6 +2520,13 @@ private:
 
     void SetVsyncSlot(u32 index, bool on) {
         auto* event = m_native_events[index];
+        if (event != nullptr && Common::Nx2Timeline::GuestEnabled()) {
+            // A guest wait on a vsync slot is a wait for the display (critical_path.py's
+            // "display"); an unbound slot fires on a change notification only.
+            Common::Nx2Timeline::NameObject(
+                static_cast<const Kernel::KSynchronizationObject*>(&event->GetReadableEvent()),
+                fmt::format("{} {}", on ? "vsync slot" : "display slot", index));
+        }
         std::scoped_lock lk{m_vsync->mutex};
         auto& list = m_vsync->events;
         const auto it = std::find(list.begin(), list.end(), event);

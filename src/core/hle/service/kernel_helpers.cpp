@@ -7,6 +7,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "common/nx2_timeline.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_event.h"
@@ -88,6 +89,10 @@ Kernel::KEvent* ServiceContext::CreateEvent(std::string&& name) {
         std::scoped_lock lk{debug_names_mutex};
         debug_names[&event->GetReadableEvent()] = name;
     }
+    // What a guest thread's wait on this event waits on, in the timeline (the guest layer's
+    // "guest wait" carries the KSynchronizationObject pointer).
+    Common::Nx2Timeline::NameObject(
+        static_cast<const Kernel::KSynchronizationObject*>(&event->GetReadableEvent()), name);
     {
         std::scoped_lock lk{event_names_mutex};
         event_names[event] = std::move(name);
@@ -105,6 +110,8 @@ void ServiceContext::CloseEvent(Kernel::KEvent* event) {
             std::scoped_lock lk{debug_names_mutex};
             debug_names.erase(&event->GetReadableEvent());
         }
+        Common::Nx2Timeline::ForgetObject(
+            static_cast<const Kernel::KSynchronizationObject*>(&event->GetReadableEvent()));
         event->GetReadableEvent().Close(kernel);
         event->Close(kernel);
     }

@@ -343,6 +343,12 @@ void nvhost_ctrl::CreateNvEvent(u32 event_id) {
     ASSERT(!event.registered);
     ASSERT(!event.IsBeingUsed());
     event.kevent = events_interface.CreateEvent(fmt::format("NVCTRL::NvEvent_{}", event_id));
+    if (event.kevent != nullptr && Common::Nx2Timeline::GuestEnabled()) {
+        // A guest wait on it is a GPU fence wait (tools/nx2/critical_path.py's object kinds).
+        Common::Nx2Timeline::NameObject(
+            static_cast<const Kernel::KSynchronizationObject*>(&event.kevent->GetReadableEvent()),
+            fmt::format("nvhost event {}", event_id));
+    }
     event.status = EventState::Available;
     event.registered = true;
     const u64 mask = 1ULL << event_id;
