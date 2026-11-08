@@ -628,6 +628,13 @@ public:
     /// Work that writes the device range [begin, begin + size) was just sent (an inline upload, a
     /// report, a semaphore release). size ~0 means an unknown range.
     void NoteMemoryWrite(u64 begin, u64 size, const char* what = "unknown") {
+        if (write_stamps) [[unlikely]] {
+            if (size == ~u64{0}) {
+                unknown_write_position = write_position;
+            } else {
+                StampWrite(begin, begin + size, false);
+            }
+        }
         PendingWrite& write = pending_writes[pending_write_count++ % pending_writes.size()];
         write.what = what;
         write.begin = begin;
@@ -638,6 +645,9 @@ public:
     /// As NoteMemoryWrite, for a write whose words the front knows (a fence release payload,
     /// linear inline upload data): reads overlay them instead of waiting.
     void NoteMemoryWriteData(u64 begin, const u32* data, u32 words) {
+        if (write_stamps) [[unlikely]] {
+            StampWrite(begin, begin + u64{words} * sizeof(u32), false);
+        }
         while (words != 0) {
             const u32 count = (std::min<u32>)(words, PendingWriteWords);
             PendingWrite& write = pending_writes[pending_write_count++ % pending_writes.size()];
@@ -773,6 +783,20 @@ public:
     };
     [[nodiscard]] GuestWriters QueuedGuestWriters(u64 done, GPUVAddr address, u64 device, u64 size,
                                                   std::span<const u64> skip = {}) const;
+    /// EXP13=2/3, the inverse of QueuedGuestWriters (fable_answer_6 6f (c) a): once enabled,
+    /// every write the front notes stamps the 256-byte blocks it covers (4 KB pages for ranges
+    /// over 16 KB, everything for ranges over 1 MB) with its position, in hashed tables whose
+    /// collisions only make stamps newer. WriteStamp is the newest position that may have
+    /// written [device, device + size) or GPU [address, address + size) since: noted writes,
+    /// writer ranges, 3D ranged writes, and the writers QueuedGuestWriters counts as unbounded.
+    /// Everything sent before EnableWriteStamps counts as a write. Writes noted while a tag is
+    /// set (SetWriteStampTag) are not counted by a WriteStamp asking with that tag (one inline
+    /// upload patching what it already wrote), unless another writer stamped the block since.
+    void EnableWriteStamps();
+    void SetWriteStampTag(u64 tag) {
+        write_stamp_tag = tag;
+    }
+    [[nodiscard]] u64 WriteStamp(u64 device, u64 size, GPUVAddr address, u64 skip_tag = 0) const;
     /// For a semaphore acquire of `device`: the payload a release still queued for the back writes
     /// there, if nothing sent after it may write the word. The back runs the acquire's channel
     /// after that release, so an acquire it meets needs no drain. EDEN_NX2_ACQUIRE_QUEUED=0 off.
@@ -984,6 +1008,23 @@ private:
     u64 last_method_write_position{};
     u64 previous_method_write_position{};
     u64 session{};
+    /// EnableWriteStamps' tables: a slot keeps its newest stamp, the tag that made it, and the
+    /// newest stamp of any other tag before it.
+    struct StampSlot {
+        u64 last;
+        u64 last_tag;
+        u64 before;
+    };
+    static constexpr size_t BlockStamps = size_t{1} << 16;
+    static constexpr size_t PageStamps = size_t{1} << 14;
+    std::unique_ptr<StampSlot[]> block_stamps;
+    std::unique_ptr<StampSlot[]> page_stamps;
+    bool write_stamps{};
+    u64 write_stamp_tag{};
+    u64 write_stamp_floor{};
+    u64 unknown_write_position{};
+    void StampWrite(u64 begin, u64 end, bool gpu_address);
+    [[nodiscard]] u64 StampOf(u64 begin, u64 end, bool gpu_address, u64 skip_tag) const;
     /// Writes with a known range (RangeLastWrite) the back may not have run yet, oldest first.
     struct RangedWrite {
         u64 position;
