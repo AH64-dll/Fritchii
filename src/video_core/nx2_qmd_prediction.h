@@ -212,14 +212,14 @@ struct Bound {
     u64 device;
     u64 address;
     u64 done;
-    std::array<u64, 16> sequences; ///< The folded records (all landed: the check is meaningful)
+    std::array<u64, 32> sequences; ///< The folded records (all landed: the check is meaningful)
     u64 payload_sum;
     std::chrono::steady_clock::time_point since;
     const u8* pointer;
     u32 operation;
     u32 acquire_value;
     u32 folded;
-    std::array<u32, 16> payloads; ///< The folded records' payloads, in send order
+    std::array<u32, 32> payloads; ///< The folded records' payloads, in send order
 };
 /// Counts the acquire's coverage (NoteAcquire) and its reduction lower bound (6c): the bound
 /// when one was computed.

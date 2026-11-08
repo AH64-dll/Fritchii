@@ -53,7 +53,10 @@ struct Release {
 };
 
 constexpr size_t Buckets = 512;
-constexpr size_t Ways = 16;
+/// 32 ways (16 before): a counter word many QMDs add to (Ocarina's 0x86010) can have more
+/// records queued than 16 while the feed lets the front run a frame ahead, and an evicted
+/// record looked like a back release nothing predicted.
+constexpr size_t Ways = 32;
 constexpr size_t Releases = 1024;
 constexpr size_t Writers = static_cast<size_t>(Writer::Count);
 
@@ -316,6 +319,17 @@ struct State {
     /// The newest plain record evicted before it landed, per bucket (its device; 0 for none):
     /// the word gets no bound until a plain landing there is attributed to it.
     std::array<u64, Buckets> evicted_plain{};
+    /// Records of a back-checked writer evicted before the back made them, per bucket: (device,
+    /// reduction or not, how many). A back release then finding no record is that one, not a
+    /// divergence.
+    struct EvictedUnmatched {
+        u64 device;
+        bool reduction;
+        u32 count;
+    };
+    std::array<std::array<EvictedUnmatched, 4>, Buckets> evicted_unmatched{};
+    u64 unpredicted_evicted{};
+    u64 evicted_unmatched_lost{};
     u64 evicted_unlanded{};
     /// Back: reductions the copy predicted (Verify matches them too).
     u64 matched_reductions{};
@@ -584,7 +598,8 @@ struct State {
                      "down/landings missing/other); {} landings of unrecorded writes (all "
                      "landed/no value fits/none of the kind, by site query completion {}, query "
                      "immediate {}, QMD max {}, QMD reduction {}, report reduction {}), {} "
-                     "phantom records swept, {} records evicted before landing; session totals: "
+                     "phantom records swept, {} records evicted before landing ({} back "
+                     "releases met an evicted record, {} evictions untracked); session totals: "
                      "{} checked, {} violated, {} not landed yet, {} landings of unrecorded "
                      "writes, {} phantoms; records/s "
                      "by op add/min/max/inc/dec/and/or/xor: QMD {}, QMD signed {}, compute report "
@@ -605,7 +620,8 @@ struct State {
                      never_recovered[0], never_recovered[1], never_recovered[2],
                      foreign_landings, Rates(foreign_by[0], 1.0), Rates(foreign_by[1], 1.0),
                      Rates(foreign_by[2], 1.0), Rates(foreign_by[3], 1.0),
-                     Rates(foreign_by[4], 1.0), phantoms, evicted_unlanded, session_checked,
+                     Rates(foreign_by[4], 1.0), phantoms, evicted_unlanded,
+                     unpredicted_evicted, evicted_unmatched_lost, session_checked,
                      session_violated, session_unlanded, session_foreign, session_phantoms,
                      Rates(reduction_ops[0], window),
                      Rates(reduction_ops[1], window), Rates(reduction_ops[2], window));
@@ -686,10 +702,19 @@ struct State {
         audit_checked = audit_wrong = audit_unknown = 0;
         not_fed_nonsimple = 0;
         deferred_events = 0;
+        unpredicted_evicted = 0;
         since = now;
     }
 
-    /// Stores a record (not landed, not matched yet).
+    /// Whether a record has served its purpose: landed and (for the writers the back checks)
+    /// matched.
+    [[nodiscard]] static bool Done(const Prediction& record) {
+        const bool checked = record.writer == Writer::Qmd || record.writer == Writer::Dma;
+        return record.landed && (record.matched || !checked);
+    }
+
+    /// Stores a record (not landed, not matched yet), in a free way, else in the oldest done
+    /// one, else in the oldest.
     void Insert(const Prediction& record) {
         const size_t bucket = Bucket(record.device);
         auto& ways = predictions[bucket];
@@ -697,17 +722,74 @@ struct State {
         stored.sequence = ++record_sequence;
         stored.landed = false;
         stored.matched = false;
-        Prediction& slot = ways[next[bucket]++ % Ways];
-        if (slot.position != 0) {
-            evicted[bucket] = (std::max)(evicted[bucket], slot.position);
-            if (!slot.landed) {
-                ++evicted_unlanded;
-                if (slot.kind == Kind::Plain) {
-                    evicted_plain[bucket] = slot.device;
-                }
+        Prediction* slot = nullptr;
+        Prediction* oldest_done = nullptr;
+        Prediction* oldest = nullptr;
+        for (Prediction& way : ways) {
+            if (way.position == 0) {
+                slot = &way;
+                break;
+            }
+            if (Done(way) && (oldest_done == nullptr || way.sequence < oldest_done->sequence)) {
+                oldest_done = &way;
+            }
+            if (oldest == nullptr || way.sequence < oldest->sequence) {
+                oldest = &way;
             }
         }
-        slot = stored;
+        if (slot == nullptr) {
+            slot = oldest_done != nullptr ? oldest_done : oldest;
+        }
+        if (slot->position != 0 && !Done(*slot)) {
+            if (!slot->landed) {
+                evicted[bucket] = (std::max)(evicted[bucket], slot->position);
+                ++evicted_unlanded;
+                if (slot->kind == Kind::Plain) {
+                    evicted_plain[bucket] = slot->device;
+                }
+            }
+            if (!slot->matched && (slot->writer == Writer::Qmd || slot->writer == Writer::Dma)) {
+                NoteEvictedUnmatched(bucket, slot->device, slot->kind == Kind::Reduction);
+            }
+        }
+        *slot = stored;
+    }
+
+    void NoteEvictedUnmatched(size_t bucket, u64 device, bool reduction) {
+        EvictedUnmatched* free_entry = nullptr;
+        for (EvictedUnmatched& entry : evicted_unmatched[bucket]) {
+            if (entry.count != 0 && entry.device == device && entry.reduction == reduction) {
+                ++entry.count;
+                return;
+            }
+            if (entry.count == 0 && free_entry == nullptr) {
+                free_entry = &entry;
+            }
+        }
+        if (free_entry == nullptr) {
+            ++evicted_unmatched_lost; // Then a later miss counts as unpredicted
+            return;
+        }
+        *free_entry = {device, reduction, 1};
+    }
+
+    /// A back release found no record: one evicted before the back made it, if any.
+    bool TakeEvictedUnmatched(u64 device, bool reduction) {
+        for (EvictedUnmatched& entry : evicted_unmatched[Bucket(device)]) {
+            if (entry.count != 0 && entry.device == device && entry.reduction == reduction) {
+                --entry.count;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    [[nodiscard]] u32 EvictedUnmatchedOf(u64 device) const {
+        u32 count = 0;
+        for (const EvictedUnmatched& entry : evicted_unmatched[Bucket(device)]) {
+            count += entry.device == device ? entry.count : 0;
+        }
+        return count;
     }
 
     [[nodiscard]] static bool Landed(const Prediction& record) {
@@ -778,10 +860,16 @@ struct State {
 
     /// Drops the records.
     void Clear() {
-        predictions = {};
+        // In place: the table is large (a temporary would be on the stack).
+        for (auto& ways : predictions) {
+            ways.fill(Prediction{});
+        }
         next = {};
         evicted = {};
         evicted_plain = {};
+        for (auto& entries : evicted_unmatched) {
+            entries.fill(EvictedUnmatched{});
+        }
         pending_count = 0;
         feed_check_count = 0;
     }
@@ -1286,12 +1374,28 @@ void ApplyVerify(State& state, const VerifyEvent& event, bool retry, bool last_t
         LOG_INFO(HW_GPU,
                  "QMD release prediction (EXP13=2-4): unpredicted {} at entry {} (QMD {:#x}, "
                  "device {:#x}, payload {:#x}): the copy's last read was from {}; inside the "
-                 "signal last recorded ({}..{}): {}; the copy's table for the QMD: {}",
+                 "signal last recorded ({}..{}): {}; the back's release slots at run "
+                 "(flags/payload): {}; records of the device evicted unmade: {}; the copy: {}",
                  reduction ? "reduction" : "release", entry_position, qmd, device, payload,
                  source_names[static_cast<size_t>(state.last_read_source)], state.signal_start,
                  state.signal_end, inside ? "yes" : "no",
+                 event.has_slots
+                     ? fmt::format("{:#x}/{:#x} {:#x}/{:#x} {:#x}/{:#x}", event.slots[0],
+                                   event.slots[1], event.slots[2], event.slots[3],
+                                   event.slots[4], event.slots[5])
+                     : std::string{"none"},
+                 state.EvictedUnmatchedOf(device),
                  state.probe != nullptr ? state.probe(qmd) : std::string{"?"});
     };
+    // A record evicted before the back made it (a deep backlog on a hot word): not a
+    // divergence. The fold missed it, which only lowered the bound.
+    if (found == nullptr && state.TakeEvictedUnmatched(device, reduction)) {
+        ++state.unpredicted_evicted;
+        u64& unpredicted = reduction ? state.unpredicted_reductions
+                                     : state.unpredicted[static_cast<size_t>(writer)];
+        ++unpredicted;
+        return;
+    }
     const size_t index = static_cast<size_t>(writer);
     if (reduction) {
         if (!found) {
