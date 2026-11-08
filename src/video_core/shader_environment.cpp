@@ -1242,6 +1242,27 @@ Tegra::Texture::TICEntry GraphicsEnvironment::LiveTextureInfo(u32 handle) {
                            handle, true);
 }
 
+bool GraphicsEnvironment::TextureReadsStillMatch() {
+    if (!snapshot) {
+        return true;
+    }
+    const auto entry_of = [&](u32 handle) {
+        return ReadTextureInfo(snapshot->tic_address, snapshot->tic_limit,
+                               snapshot->via_header_index, handle, true);
+    };
+    for (const auto& [handle, type] : texture_types) {
+        if (ConvertTextureType(entry_of(handle)) != type) {
+            return false;
+        }
+    }
+    for (const auto& [handle, format] : texture_pixel_formats) {
+        if (ConvertTexturePixelFormat(entry_of(handle)) != format) {
+            return false;
+        }
+    }
+    return true;
+}
+
 GraphicsEnvironment::LiveCheck GraphicsEnvironment::CheckAgainstLive() {
     LiveCheck check;
     const auto note = [&](bool same, auto&& describe) {

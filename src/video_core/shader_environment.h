@@ -226,6 +226,12 @@ public:
     /// from the engine and guest memory as they are now (EDEN_NX2_ASYNC_TRANSLATE=3).
     [[nodiscard]] LiveCheck CheckAgainstLive();
 
+    /// GPU thread, before a pipeline translated from the snapshot is used: the texture
+    /// descriptors it read (types and formats), read again from the snapshot's pool with
+    /// ReadBlock, still give what it recorded. False means the pool changed meanwhile (or a
+    /// descriptor needed the cache flush the worker can't do).
+    [[nodiscard]] bool TextureReadsStillMatch();
+
 private:
     /// What TakeSnapshot copies.
     struct Snapshot {
