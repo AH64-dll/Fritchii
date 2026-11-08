@@ -418,8 +418,8 @@ public:
 
     /// A GPU write of `value` to the u32 at `device_address`.
     void OnWrite(u64 device_address, u32 value) {
-        // Ocarina of Time's present poll (EXP24, svc_nx2_oot_present.cpp); unset otherwise.
-        Common::Nx2GpuWrite::Notify(device_address, value);
+        // (Common::Nx2GpuWrite::Notify, for Ocarina of Time's present poll, is called by each
+        // write site itself, with its path and host pointer.)
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }

@@ -142,8 +142,14 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
     if ((argument >> 3) & 1) {
         const u32 reduction = (argument >> 9) & 7;
         rasterizer->SignalFence([this, address, payload, reduction] {
-            memory_manager.Write<u32>(address, ReduceSemaphore(reduction, false,
-                                                               memory_manager.Read<u32>(address), payload));
+            const u32 value = ReduceSemaphore(reduction, false, memory_manager.Read<u32>(address),
+                                              payload);
+            memory_manager.Write<u32>(address, value);
+            if (Common::Nx2GpuWrite::g_listener.load(std::memory_order_relaxed) != nullptr) {
+                Common::Nx2GpuWrite::Notify(Common::Nx2GpuWrite::Path::ComputeReduce,
+                                            memory_manager.GpuToCpuAddress(address).value_or(0),
+                                            address, memory_manager.GetPointer(address), value);
+            }
         });
         return;
     }
@@ -427,6 +433,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         memory_manager.Write<u32>(address, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
+                            Common::Nx2GpuWrite::Notify(Common::Nx2GpuWrite::Path::QmdReduce,
+                                                        *device, address,
+                                                        memory_manager.GetPointer(address), value);
                         }
                         static const u64 watch = [] {
                             const char* text = std::getenv("EDEN_NX2_SEM_WATCH");
@@ -451,6 +460,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         memory_manager.Write<u32>(address, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
+                            Common::Nx2GpuWrite::Notify(Common::Nx2GpuWrite::Path::QmdMax, *device,
+                                                        address,
+                                                        memory_manager.GetPointer(address), value);
                         }
                     });
                 } else {

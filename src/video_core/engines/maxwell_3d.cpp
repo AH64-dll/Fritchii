@@ -826,6 +826,12 @@ void Maxwell3D::StampQueryResult(Core::System& system, u64 payload, bool long_qu
     } else {
         memory_manager.Write<u32>(sequence_address, static_cast<u32>(payload));
     }
+    if (Common::Nx2GpuWrite::g_listener.load(std::memory_order_relaxed) != nullptr) {
+        Common::Nx2GpuWrite::Notify(Common::Nx2GpuWrite::Path::Stamp3D,
+                                    memory_manager.GpuToCpuAddress(sequence_address).value_or(0),
+                                    sequence_address, memory_manager.GetPointer(sequence_address),
+                                    static_cast<u32>(payload));
+    }
     if (const u64 trace = VideoCommon::QueryTrace::Sample(VideoCommon::QueryTrace::Event::Write)) {
         LOG_INFO(HW_GPU,
                  "DKB_QUERY write n={} path=stamp as={} gpu={:#x} bytes={} value={:#x}",
