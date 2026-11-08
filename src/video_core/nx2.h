@@ -15,6 +15,7 @@
 
 #include "common/common_types.h"
 #include "common/nx2_gpu_write_listener.h"
+#include "video_core/nx2_frame_fence.h"
 
 namespace Tegra {
 
@@ -569,13 +570,17 @@ private:
     std::atomic<size_t> count{};
 };
 
-// Render-frame clock (EDEN_NX2_RENDER_CLOCK=1, fable_answer_16 1b): one count per guest frame,
-// bumped where the frame's last GPU work is, so the texture cache's relocation rules can tell
-// frames apart where the host present tick (mid-stream) cannot. Two sources: a write to the
-// present poll's learned word (core/hle/kernel/svc/svc_nx2_oot_present.cpp OnGpuWrite, needs
-// EXP24=1 to learn the word), or with EDEN_NX2_RENDER_CLOCK_SYNCPT=<id> the split's back
-// signalling that syncpoint (FenceManager::SignalSyncPoint, in stream order). Nothing counts
-// while the texture cache does not want the clock.
+// Render-frame clock (EDEN_NX2_RENDER_CLOCK=1, fable_answer_16 1b and 17): one count per guest
+// frame, bumped where the frame's last GPU work is, so the texture cache's relocation rules can
+// tell frames apart where the host present tick (mid-stream) cannot. Sources:
+// - by default the flip's frame fence (Nx2FrameFenceClock, video_core/nx2_frame_fence.h),
+//   bumped on the split's back in stream order (FenceManager::SignalSyncPoint);
+// - EDEN_NX2_RENDER_CLOCK_SYNCPT=<id>: every back signal of that syncpoint (manual override);
+// - EDEN_NX2_RENDER_CLOCK=2: a write to the present poll's learned word
+//   (core/hle/kernel/svc/svc_nx2_oot_present.cpp OnGpuWrite, needs EXP24=1). A guest thread
+//   writes that word, so it never fires (fable_answer_17 0); kept to compare.
+// Nothing counts while the texture cache does not want the clock (EDEN_NX2_RENDER_CLOCK or
+// EXP43=4).
 inline std::atomic<bool> g_nx2_render_clock_wanted{false};
 inline std::atomic<u64> g_nx2_render_frame{};
 // Read on first use, not at static initialization: that runs before main() applies
@@ -587,19 +592,43 @@ inline int Nx2RenderClockSyncpt() {
     }();
     return syncpt;
 }
-// Syncpoint signals by id while the clock is wanted (logged with the clock, to find the one
-// signalled once a frame).
+/// EDEN_NX2_RENDER_CLOCK: 0 unset, 1 the clock, 2 the clock on the poll-word source.
+inline int Nx2RenderClockEnv() {
+    static const int env = [] {
+        const char* value = std::getenv("EDEN_NX2_RENDER_CLOCK");
+        return value == nullptr ? 0 : value[0] == '1' ? 1 : value[0] == '2' ? 2 : 0;
+    }();
+    return env;
+}
+inline bool Nx2RenderClockWordSource() {
+    return Nx2RenderClockSyncpt() < 0 && Nx2RenderClockEnv() == 2;
+}
+inline bool Nx2RenderClockFlipSource() {
+    return Nx2RenderClockSyncpt() < 0 && Nx2RenderClockEnv() != 2;
+}
+// Syncpoint signals by id while the clock is wanted (logged with the clock).
 inline constexpr size_t Nx2SyncpointSignalSlots = 192;
 inline std::array<std::atomic<u32>, Nx2SyncpointSignalSlots> g_nx2_syncpoint_signals{};
+// Numbers the nx2:syncpt sessions (the frame fence's slot key is (session << 32) | slot).
+inline std::atomic<u32> g_nx2_syncpt_sessions{};
 
-inline void Nx2NoteSyncpointSignal(u32 id) {
+/// The back signals syncpoint `id`, which then reads `new_value` (FenceManager::SignalSyncPoint,
+/// before the increment; only called while the clock is wanted).
+inline void Nx2NoteSyncpointSignal(u32 id, u32 new_value) {
     if (!g_nx2_render_clock_wanted.load(std::memory_order_relaxed) ||
         id >= Nx2SyncpointSignalSlots) {
         return;
     }
     g_nx2_syncpoint_signals[id].fetch_add(1, std::memory_order_relaxed);
-    if (static_cast<int>(id) == Nx2RenderClockSyncpt()) {
-        g_nx2_render_frame.fetch_add(1, std::memory_order_relaxed);
+    if (const int override_id = Nx2RenderClockSyncpt(); override_id >= 0) {
+        if (static_cast<int>(id) == override_id) {
+            g_nx2_render_frame.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else if (id == g_nx2_frame_fence.syncpoint.load(std::memory_order_relaxed) &&
+               Nx2RenderClockFlipSource()) {
+        if (g_nx2_frame_fence.NoteSignal(new_value)) {
+            g_nx2_render_frame.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 

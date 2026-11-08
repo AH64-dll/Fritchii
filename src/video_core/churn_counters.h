@@ -26,6 +26,8 @@ enum Counter : size_t {
     BuffersDeleted,    ///< BufferCache::DeleteBuffer
     BuffersJoined,     ///< BufferCache::JoinOverlap (each also deletes the joined buffer)
     BufferJoinBytes,   ///< Bytes copied by those joins
+    BufferJoinsSkipped, ///< Joins without the copy (EDEN_NX2_JOIN_SKIP_CPU=1)
+    BufferJoinSkippedBytes,
     StagingBuffers,    ///< StagingBufferPool::CreateStagingBuffer
     StagingBytes,
     DeviceAllocations, ///< vkAllocateMemory by the allocator (blocks and dedicated memory)
