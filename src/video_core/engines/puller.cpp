@@ -479,6 +479,7 @@ std::optional<QmdPredictionCheck> CheckQmdPrediction(DmaPusher& dma_pusher,
             .word = word,
             .done = done,
             .gpu_dirty = Nx2IsGpuWritten(*device),
+            .pointer = dma_pusher.memory_manager.GetPointer(acquire.address),
         });
         return QmdPredictionCheck{*device, Prediction::BackSequence(), bound};
     }
@@ -506,16 +507,42 @@ void QmdPredictionMetBy(DmaPusher& dma_pusher, const QmdPredictionCheck& check,
         Prediction::CheckBound(*check.bound,
                                dma_pusher.memory_manager.Read<u32>(acquire.address));
     }
-    const auto release = Prediction::BackReleaseSince(check.device, check.sequence);
+    auto release = Prediction::BackReleaseSince(check.device, check.sequence);
+    // A release the back made before the check that landed after it (a reduction, a fence
+    // release) met it too: the newest one the back made for the word.
+    bool before_check = false;
     if (!release) {
-        Prediction::NoteMetBy(MetBy::Other);
-    } else if (release->reduction) {
-        Prediction::NoteMetBy(MetBy::QmdReduction);
-    } else if (!acquire.Matches(release->payload)) {
-        Prediction::NoteMetBy(MetBy::Other);
-    } else {
-        Prediction::NoteMetBy(release->writer == Prediction::Writer::Qmd ? MetBy::QmdRelease
-                                                                         : MetBy::DmaRelease);
+        release = Prediction::BackReleaseLatest(check.device);
+        before_check = release.has_value();
+    }
+    MetBy met_by = MetBy::Other;
+    if (release && release->reduction) {
+        met_by = MetBy::QmdReduction;
+    } else if (release && acquire.Matches(release->payload)) {
+        met_by = release->writer == Prediction::Writer::Qmd ? MetBy::QmdRelease : MetBy::DmaRelease;
+    }
+    Prediction::NoteMetBy(met_by);
+    if (before_check && met_by != MetBy::Other) {
+        Prediction::NoteMetBy(MetBy::BeforeCheck);
+    }
+}
+
+// EXP13=2: a plain release the puller sent, recorded so the reduction bound sees it queued or
+// run but not landed (it sets the word).
+void RecordPullerRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload) {
+    namespace Prediction = VideoCommon::QmdPrediction;
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!Prediction::MirrorMode() || !split.Active()) {
+        return;
+    }
+    if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address)) {
+        Prediction::Note(*device,
+                         {.writer = Prediction::Writer::Puller,
+                          .kind = Prediction::Kind::Plain,
+                          .payload = payload,
+                          .op = 0,
+                          .is_signed = false},
+                         dma_pusher.memory_manager.Read<u32>(address), split.SentPosition(), 0);
     }
 }
 
@@ -831,6 +858,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 split.NoteRelease(*device, sequence_address, payload);
             }
         }
+        RecordPullerRelease(dma_pusher, sequence_address, payload);
     } else if (g_nx2_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
         // written the commands this channel runs next: suspend the channel until the value is
@@ -1007,6 +1035,7 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
     });
+    RecordPullerRelease(dma_pusher, sequence_address, payload);
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
@@ -1042,6 +1071,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
                 split.NoteRelease(*device, address, payload);
             }
         }
+        RecordPullerRelease(dma_pusher, address, payload);
         return;
     }
     // Acquires: the result only feeds the warning below, so with the split the pending fences are

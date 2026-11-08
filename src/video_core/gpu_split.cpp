@@ -548,11 +548,24 @@ size_t GpuSplit::MaxRangedWrites() {
 GpuSplit::GuestWriters GpuSplit::QueuedGuestWriters(u64 done, GPUVAddr address, u64 device,
                                                      u64 size, std::span<const u64> skip) const {
     GuestWriters found{};
-    found.unbounded = (std::max)({last_unbounded_writer_position, last_unranged_position,
-                                  last_function_position, last_method_write_position});
-    if (found.unbounded <= done) {
-        found.unbounded = 0;
-    }
+    using Cause = GuestWriterCause;
+    const auto unbounded = [&](u64 position, Cause cause, const char* what = nullptr) {
+        if (position > done && position > found.unbounded) {
+            found.unbounded = position;
+            found.unbounded_cause = cause;
+            found.what = what;
+        }
+    };
+    const auto noted = [&](u64 position, Cause cause) {
+        if (position > found.noted) {
+            found.noted = position;
+            found.noted_cause = cause;
+        }
+    };
+    unbounded(last_unbounded_writer_position, Cause::UnboundedWriter);
+    unbounded(last_unranged_position, Cause::Unranged);
+    unbounded(last_function_position, Cause::Function);
+    unbounded(last_method_write_position, Cause::MethodWrite);
     const u64 end = device + size;
     // NoteMemoryWrite and NoteMemoryWriteData (puller releases, 3D reports and uploads), newest
     // first; an unknown range may write anything.
@@ -565,14 +578,14 @@ GpuSplit::GuestWriters GpuSplit::QueuedGuestWriters(u64 done, GPUVAddr address, 
             break;
         }
         if (write.end == ~u64{0}) {
-            found.unbounded = (std::max)(found.unbounded, write.position);
+            unbounded(write.position, Cause::UnknownPending, write.what);
         } else if (write.begin < end && device < write.end) {
-            found.noted = (std::max)(found.noted, write.position);
+            noted(write.position, Cause::Pending);
             break;
         }
     }
     if (scanned == pending_writes.size()) {
-        found.unbounded = write_position;
+        unbounded(write_position, Cause::PendingScanLimit);
     }
     // NoteWriterRange and NoteReleaseWriter (compute and copy releases, uploads, copies).
     const u64 oldest =
@@ -588,19 +601,19 @@ GpuSplit::GuestWriters GpuSplit::QueuedGuestWriters(u64 done, GPUVAddr address, 
         }
         if (range.begin < end && device < range.end &&
             std::find(skip.begin(), skip.end(), range.position) == skip.end()) {
-            found.noted = (std::max)(found.noted, range.position);
+            noted(range.position, Cause::WriterRange);
             reached = true;
             break;
         }
     }
     if (!reached && (scanned == MaxWriterScan || oldest != 0)) {
-        found.unbounded = write_position;
+        unbounded(write_position, Cause::WriterScanLimit);
     }
     // RangeLastWrite (3D constant buffer uploads and the like), by GPU address.
     for (auto it = ranged_writes.rbegin(); it != ranged_writes.rend() && it->position > done;
          ++it) {
         if (it->begin < address + size && address < it->end) {
-            found.noted = (std::max)(found.noted, it->position);
+            noted(it->position, Cause::Ranged);
             break;
         }
     }

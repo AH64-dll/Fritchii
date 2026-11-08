@@ -64,7 +64,7 @@ struct FrontQmdMirror {
         u64 position; ///< The end of the 0x107 that writes it; 0 = empty
         NativeQmdScheduler::Descriptor words;
     };
-    static constexpr size_t MaxOverlays = 64;
+    static constexpr size_t MaxOverlays = 256; ///< #717 has 64; OoT keeps more in flight
 
     FrontQmdMirror() {
         scheduler.table = &table;
@@ -135,6 +135,10 @@ void ResyncFrontQmd(VideoCommon::GpuSplit& split, VideoCommon::QmdPrediction::Mi
     mirror.Clear();
     mirror.session = split.Session();
     mirror.synced = true;
+    if (why == VideoCommon::QmdPrediction::Mirror::SessionStart) {
+        // Records from before (another split session's ring positions, or EXP13=1's) go.
+        VideoCommon::QmdPrediction::SetRecordsValid(false, 0);
+    }
     VideoCommon::QmdPrediction::SetRecordsValid(true, split.SentPosition());
     VideoCommon::QmdPrediction::NoteMirror(why);
 }
@@ -250,9 +254,9 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
                                               payload);
             memory_manager.Write<u32>(address, value);
             // EXP13=2: counted as landed for the reduction bound's records (nothing else).
-            if (VideoCommon::QmdPrediction::Enabled()) {
+            if (VideoCommon::QmdPrediction::MirrorMode()) {
                 if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                    Tegra::Nx2NoteLanded(*device);
+                    Tegra::Nx2NoteLanded(*device, value);
                 }
             }
             if (Common::Nx2GpuWrite::g_listener.load(std::memory_order_relaxed) != nullptr) {
@@ -1639,6 +1643,17 @@ void KeplerCompute::FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontSt
         (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
     if (const auto device = memory_manager.GpuToCpuAddress(address)) {
         split.NoteRelease(*device, address, fs.registers[0x6c2]);
+        if (VideoCommon::QmdPrediction::MirrorMode()) {
+            // EXP13=2: recorded so the reduction bound sees it queued or run but not landed.
+            namespace Prediction = VideoCommon::QmdPrediction;
+            Prediction::Note(*device,
+                             {.writer = Prediction::Writer::Report,
+                              .kind = Prediction::Kind::Plain,
+                              .payload = fs.registers[0x6c2],
+                              .op = 0,
+                              .is_signed = false},
+                             memory_manager.Read<u32>(address), split.SentPosition(), 0);
+        }
     }
 }
 
@@ -1964,9 +1979,19 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
         target = (std::max)(target, mirror.evicted); // Its inline QMD may have been evicted
     }
     if (target > done) {
+        // What set the target, for the wait cause histogram.
+        using Cause = VideoCommon::GuestWriterCause;
+        Cause cause = writers.noted >= writers.unbounded ? writers.noted_cause
+                                                         : writers.unbounded_cause;
+        const char* what = writers.noted >= writers.unbounded ? nullptr : writers.what;
+        if (overlay == nullptr && mirror.evicted > (std::max)(writers.noted, writers.unbounded)) {
+            cause = Cause::OverlayEvicted;
+            what = nullptr;
+        }
         ++mirror.window_waits;
         split.WaitUntil(target, VideoCommon::DrainSite::QmdRead);
         Prediction::NoteMirror(Prediction::Mirror::Waited);
+        Prediction::NoteWait(cause, what);
     } else {
         Prediction::NoteMirror(Prediction::Mirror::Memory);
     }
