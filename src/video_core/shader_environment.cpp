@@ -1194,6 +1194,37 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
     is_proprietary_driver = texture_bound == 2 || Shader::Ampere::HasNativeAddressMap(code);
 }
 
+bool FileEnvironment::RecordFits(std::ifstream& file, u64 bytes_left) {
+    // Code size and the five table counts, then seven u32 fields (see Deserialize).
+    std::array<u64, 6> counts{};
+    constexpr u64 HeaderSize = sizeof(counts) + 7 * sizeof(u32);
+    if (bytes_left < HeaderSize) {
+        return false;
+    }
+    const auto start = file.tellg();
+    file.read(reinterpret_cast<char*>(counts.data()), sizeof(counts));
+    file.seekg(start);
+    // Bytes per unit of each count: code bytes, then one table entry (key and value).
+    constexpr std::array<u64, 6> UnitSizes{
+        1,
+        sizeof(u32) + sizeof(Shader::TextureType),
+        sizeof(u32) + sizeof(Shader::TexturePixelFormat),
+        sizeof(u64) + sizeof(u32),
+        sizeof(u64) + sizeof(u8),
+        sizeof(u64) + sizeof(Shader::ReplaceConstant),
+    };
+    const u64 left = bytes_left - HeaderSize;
+    u64 body = 0;
+    for (size_t i = 0; i < counts.size(); ++i) {
+        // Each count alone at most `left` first, so the sum below cannot overflow.
+        if (counts[i] > left) {
+            return false;
+        }
+        body += counts[i] * UnitSizes[i];
+    }
+    return body <= left;
+}
+
 void FileEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
     DumpImpl(pipeline_hash, shader_hash, code, read_highest, read_lowest, initial_offset, stage);
 }

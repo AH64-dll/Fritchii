@@ -246,6 +246,12 @@ public:
 
     void Deserialize(std::ifstream& file);
 
+    /// Whether the record at the file's read position (what Deserialize reads) can fit in the
+    /// `bytes_left` bytes before the end of the file: its code size and table counts are peeked
+    /// and the read position is left where it was. A corrupt record's counts would otherwise
+    /// make Deserialize allocate gigabytes.
+    [[nodiscard]] static bool RecordFits(std::ifstream& file, u64 bytes_left);
+
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
 
     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;

@@ -1884,6 +1884,13 @@ void PipelineCache::StartComputeWarm(u64 title_id) {
                 LOG_WARNING(Render_Vulkan, "Nx2Perf compute_warm: unexpected entry in {}", path);
                 break;
             }
+            if (!FileEnvironment::RecordFits(file, static_cast<u64>(end - file.tellg()))) {
+                LOG_WARNING(Render_Vulkan,
+                            "Nx2Perf compute_warm: entry {} of {} is larger than the file, "
+                            "skipping the rest",
+                            file_entries + 1, path);
+                break;
+            }
             Entry entry;
             entry.env.Deserialize(file);
             if (entry.env.ShaderStage() != Shader::Stage::Compute) {
@@ -2078,6 +2085,16 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
                         if (num_envs != 1) {
                             LOG_WARNING(Render_Vulkan,
                                         "Nx2Perf graphics_warm: unexpected entry, stopping");
+                            reader->failed = true;
+                            break;
+                        }
+                        if (!FileEnvironment::RecordFits(
+                                reader->file,
+                                static_cast<u64>(reader->end - reader->file.tellg()))) {
+                            LOG_WARNING(Render_Vulkan,
+                                        "Nx2Perf graphics_warm: entry {} is larger than the "
+                                        "file, skipping the rest",
+                                        reader->read + 1);
                             reader->failed = true;
                             break;
                         }
