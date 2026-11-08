@@ -173,7 +173,7 @@ static void LogRuntimes() {
     LOG_INFO(Frontend, "Qt Compile: {} Runtime: {}", QT_VERSION_STR, qVersion());
 }
 
-static QString PrettyProductName() {
+QString PrettyProductName() {
 #ifdef _WIN32
     // After Windows 10 Version 2004, Microsoft decided to switch to a different notation: 20H2
     // With that notation change they changed the registry key used to denote the current version
@@ -211,6 +211,20 @@ static void RemoveCachedContents() {
     Common::FS::RemoveDirRecursively(offline_system_data);
 }
 
+std::string BuildVersionString() {
+    const auto branch_name = std::string(Common::g_scm_branch);
+    const auto description = std::string(Common::g_scm_desc);
+    const auto build_id = std::string(Common::g_build_id);
+
+    const auto yuzu_build =
+        std::string_view{Common::g_build_name} == "Fritchii"
+            ? fmt::format("Fritchii {} | {}-{}", Common::g_build_version, branch_name, description)
+            : fmt::format("Lichii Development Build | {}-{}", branch_name, description);
+    const auto override_build =
+        fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);
+    return override_build.empty() ? yuzu_build : override_build;
+}
+
 void Init(QWidget* root) {
     rootObject = root;
 
@@ -230,22 +244,10 @@ void Init(QWidget* root) {
 
     QtCommon::Meta::RegisterMetaTypes();
 
-    // build version
-    const auto branch_name = std::string(Common::g_scm_branch);
-    const auto description = std::string(Common::g_scm_desc);
-    const auto build_id = std::string(Common::g_build_id);
-
-    const auto yuzu_build =
-        std::string_view{Common::g_build_name} == "Fritchii"
-            ? fmt::format("Fritchii {} | {}-{}", Common::g_build_version, branch_name, description)
-            : fmt::format("Lichii Development Build | {}-{}", branch_name, description);
-    const auto override_build =
-        fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);
-    const auto yuzu_build_version = override_build.empty() ? yuzu_build : override_build;
     const auto processor_count = std::thread::hardware_concurrency();
 
     // info logging
-    LOG_INFO(Frontend, "Lichii Version: {}", yuzu_build_version);
+    LOG_INFO(Frontend, "Lichii Version: {}", BuildVersionString());
     LogRuntimes();
 #ifdef ARCHITECTURE_x86_64
     const auto& caps = Common::g_cpu_caps;

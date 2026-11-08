@@ -57,7 +57,11 @@ const QString tr(const std::string& str);
  */
 [[nodiscard]] QPixmap CreateCirclePixmapFromColor(const QColor& color);
 
+/// The OS name and version, e.g. "Windows 11 Version 24H2 (Build 26100.2314)".
+[[nodiscard]] QString PrettyProductName();
 
+/// The version line the log starts with, e.g. "Fritchii v4.5 | branch-1a2b3c4d".
+[[nodiscard]] std::string BuildVersionString();
 
 std::filesystem::path GetEdenCommand();
 } // namespace QtCommon

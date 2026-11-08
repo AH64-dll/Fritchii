@@ -61,6 +61,8 @@
 
 #include "util/clickable_label.h"
 #include "util/controller_navigation.h"
+#include "util/export_log.h"
+#include "fritchii/fritchii_ui.h"
 #include "util/overlay_dialog.h"
 
 #include "multiplayer/state.h"
@@ -443,6 +445,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     ConnectMenuEvents();
     ConnectWidgetEvents();
+    SetUpFritchiiUi();
 
     QtCommon::SetupHID();
     controller_dialog->refreshConfiguration();
@@ -2039,12 +2042,12 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
         switch (result) {
         case Core::SystemResultStatus::ErrorGetLoader:
             LOG_CRITICAL(Frontend, "Failed to obtain loader for {}!", filename.toStdString());
-            QMessageBox::critical(this, tr("Error while loading ROM!"),
-                                  tr("The ROM format is not supported."));
+            ShowErrorWithExportLog(tr("Error while loading ROM!"),
+                                   tr("The ROM format is not supported."));
             break;
         case Core::SystemResultStatus::ErrorVideoCore:
-            QMessageBox::critical(
-                this, tr("An error occurred initializing the video core."),
+            ShowErrorWithExportLog(
+                tr("An error occurred initializing the video core."),
                 tr("This is usually caused by outdated GPU drivers. "
                    "Please see the log for more details. See: "
                    "<a href='https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/user/HowToAccessLogs.md'>"
@@ -2066,10 +2069,10 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
                         .arg(QString::fromStdString(
                             GetResultStatusString(static_cast<Loader::ResultStatus>(error_id))));
 
-                QMessageBox::critical(this, title, description);
+                ShowErrorWithExportLog(title, description);
             } else {
-                QMessageBox::critical(
-                    this, tr("Error while loading ROM!"),
+                ShowErrorWithExportLog(
+                    tr("Error while loading ROM!"),
                     tr("An unknown error occurred. Please see the log for more details."));
             }
             break;
@@ -2231,8 +2234,8 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
             prepared_romfs = watcher.result();
         } catch (const std::exception& error) {
             LOG_ERROR(Frontend, "Loose RomFS preparation failed: {}", error.what());
-            QMessageBox::critical(this, tr("Unable to prepare game files"),
-                                  tr("Game preparation failed. See the log for details."));
+            ShowErrorWithExportLog(tr("Unable to prepare game files"),
+                                   tr("Game preparation failed. See the log for details."));
             return;
         }
         if (close_pending) {
@@ -4234,6 +4237,25 @@ void MainWindow::OnOpenModFolder() {
     QtCommon::Game::OpenModFolder();
 }
 
+void MainWindow::OnExportLog() {
+    ExportLog::Export(this, vk_device_records);
+}
+
+void MainWindow::ShowErrorWithExportLog(const QString& title, const QString& text) {
+    if (!FritchiiUi::Enabled()) {
+        QMessageBox::critical(this, title, text);
+        return;
+    }
+    QMessageBox box(QMessageBox::Critical, title, text, QMessageBox::Ok, this);
+    box.setTextFormat(Qt::RichText);
+    QPushButton* export_button = box.addButton(tr("Export Log..."), QMessageBox::ActionRole);
+    box.setDefaultButton(QMessageBox::Ok);
+    box.exec();
+    if (box.clickedButton() == export_button) {
+        OnExportLog();
+    }
+}
+
 void MainWindow::OnOpenLogFolder() {
     QtCommon::Game::OpenLogFolder();
 }
@@ -5704,6 +5726,14 @@ static void AdjustLinkColor() {
 }
 
 void MainWindow::UpdateUITheme() {
+    if (FritchiiUi::ApplyTheme()) {
+        setStyleSheet({});
+#ifdef _WIN32
+        RemoveTitlebarFilter();
+        ApplyGlobalDarkTitlebar(true);
+#endif
+        return;
+    }
     const QString default_theme = QString::fromUtf8(UISettings::themes[size_t(UISettings::default_theme)].second);
     QString current_theme = QString::fromStdString(UISettings::values.theme);
 

@@ -1,0 +1,17 @@
+<RCC>
+    <qresource prefix="fritchii">
+        <file>style.qss</file>
+        <file>whats-new.md</file>
+        <file>fonts/Inter-Regular.ttf</file>
+        <file>fonts/Inter-Medium.ttf</file>
+        <file>icons/library.svg</file>
+        <file>icons/settings.svg</file>
+        <file>icons/help.svg</file>
+        <file>icons/menu.svg</file>
+        <file>icons/play.svg</file>
+        <file>icons/plus.svg</file>
+        <file>icons/list.svg</file>
+        <file>icons/check.svg</file>
+        <file>icons/chevron-down.svg</file>
+    </qresource>
+</RCC>

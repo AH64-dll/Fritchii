@@ -58,12 +58,14 @@ namespace VkDeviceInfo {
 class Record {
 public:
     explicit Record(std::string_view name, const std::vector<VkPresentModeKHR>& vsync_modes,
-                    bool has_broken_compute);
+                    bool has_broken_compute, std::string_view driver_version = {});
     ~Record();
 
     const std::string name;
     const std::vector<VkPresentModeKHR> vsync_support;
     const bool has_broken_compute;
+    /// The driver's own version text (e.g. "581.57"), for support logs.
+    const std::string driver_version;
 };
 
 // TODO(crueter): Port some configure_graphics.cpp stuff

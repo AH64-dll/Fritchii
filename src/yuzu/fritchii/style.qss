@@ -1,0 +1,204 @@
+/* Fritchii "Graphite": near-black, one violet accent, Inter. Colours live in the palette
+   (fritchii_ui.cpp); this file shapes the widgets. */
+
+QToolTip {
+    background: #1f1f24;
+    color: #ececf1;
+    border: 1px solid #2a2a30;
+    border-radius: 6px;
+    padding: 6px 8px;
+}
+
+QMenuBar { background: #111113; }
+QMenuBar::item { padding: 6px 10px; background: transparent; border-radius: 6px; }
+QMenuBar::item:selected { background: #1f1f24; }
+
+QMenu {
+    background: #1b1b1f;
+    border: 1px solid #2a2a30;
+    border-radius: 10px;
+    padding: 6px;
+}
+QMenu::item { padding: 7px 30px 7px 14px; border-radius: 6px; }
+QMenu::item:selected { background: #2b2640; color: #ececf1; }
+QMenu::item:disabled { color: #55555f; }
+QMenu::separator { height: 1px; background: #2a2a30; margin: 5px 8px; }
+QMenu::indicator { width: 14px; height: 14px; left: 6px; }
+
+QPushButton {
+    background: #1f1f24;
+    border: 1px solid #2a2a30;
+    border-radius: 8px;
+    padding: 7px 18px;
+}
+QPushButton:hover { background: #26262c; }
+QPushButton:pressed { background: #2b2b32; }
+QPushButton:default { background: #a78bfa; color: #1c1433; border: 1px solid #a78bfa; }
+QPushButton:default:hover { background: #b59dfb; }
+QPushButton:disabled { color: #55555f; background: #18181b; }
+
+QLineEdit, QComboBox, QPlainTextEdit, QTextEdit {
+    background: #18181b;
+    border: 1px solid #2a2a30;
+    border-radius: 8px;
+    padding: 6px 10px;
+}
+QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus, QTextEdit:focus { border-color: #a78bfa; }
+QComboBox:hover, QLineEdit:hover { border-color: #3a3a42; }
+QComboBox::drop-down { border: none; width: 26px; }
+QComboBox::down-arrow { image: url(:/fritchii/icons/chevron-down.svg); width: 12px; height: 12px; }
+QComboBox QAbstractItemView {
+    background: #1b1b1f;
+    border: 1px solid #2a2a30;
+    padding: 4px;
+    outline: none;
+    selection-background-color: #2b2640;
+    selection-color: #ececf1;
+}
+
+QCheckBox, QRadioButton { spacing: 10px; }
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border-radius: 5px;
+    border: 1px solid #3a3a42;
+    background: #18181b;
+}
+QCheckBox::indicator:hover { border-color: #a78bfa; }
+QCheckBox::indicator:checked {
+    background: #a78bfa;
+    border-color: #a78bfa;
+    image: url(:/fritchii/icons/check.svg);
+}
+QCheckBox::indicator:disabled { background: #141416; border-color: #26262c; }
+
+QGroupBox {
+    border: 1px solid #222227;
+    border-radius: 12px;
+    margin-top: 26px;
+    padding: 14px 12px 10px 12px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 6px;
+    color: #9a9aa8;
+}
+
+QTabWidget::pane { border: none; }
+QTabBar::tab {
+    background: transparent;
+    color: #9a9aa8;
+    padding: 8px 14px;
+    border: none;
+    border-bottom: 2px solid transparent;
+}
+QTabBar::tab:hover { color: #ececf1; }
+QTabBar::tab:selected { color: #ececf1; border-bottom: 2px solid #a78bfa; }
+
+QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 0; }
+QScrollBar::handle:vertical { background: #2e2e35; border-radius: 4px; min-height: 32px; margin: 2px; }
+QScrollBar::handle:horizontal { background: #2e2e35; border-radius: 4px; min-width: 32px; margin: 2px; }
+QScrollBar::handle:hover { background: #3a3a42; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+
+QHeaderView::section {
+    background: #111113;
+    color: #9a9aa8;
+    border: none;
+    border-bottom: 1px solid #222227;
+    padding: 6px 10px;
+}
+QTreeView, QListView, QTableView { border: none; outline: none; }
+QTreeView::item, QListView::item { padding: 4px; }
+QTreeView::item:selected, QListView::item:selected, QTableView::item:selected {
+    background: #2b2640;
+    color: #ececf1;
+}
+
+QSlider::groove:horizontal { height: 4px; background: #2a2a30; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: #a78bfa; border-radius: 2px; }
+QSlider::handle:horizontal {
+    background: #ececf1;
+    width: 14px;
+    height: 14px;
+    margin: -5px 0;
+    border-radius: 7px;
+}
+
+QProgressBar {
+    background: #1f1f24;
+    border: none;
+    border-radius: 4px;
+    text-align: center;
+    color: #ececf1;
+}
+QProgressBar::chunk { background: #a78bfa; border-radius: 4px; }
+
+QStatusBar { background: #0c0c0e; color: #9a9aa8; }
+QStatusBar::item { border: none; }
+QStatusBar QLabel { color: #9a9aa8; padding: 0 6px; }
+QPushButton#TogglableStatusBarButton, QPushButton#DockingStatusBarButton,
+QPushButton#OotFpsStatusBarButton, QPushButton#GPUStatusBarButton,
+QPushButton#RendererStatusBarButton, QPushButton#RefreshButton {
+    background: transparent;
+    border: none;
+    color: #9a9aa8;
+    padding: 3px 10px;
+    border-radius: 6px;
+}
+QPushButton#TogglableStatusBarButton:hover, QPushButton#DockingStatusBarButton:hover,
+QPushButton#OotFpsStatusBarButton:hover, QPushButton#GPUStatusBarButton:hover,
+QPushButton#RendererStatusBarButton:hover, QPushButton#RefreshButton:hover {
+    background: #1f1f24;
+    color: #ececf1;
+}
+QPushButton#OotFpsStatusBarButton { color: #a78bfa; }
+
+/* Settings sidebar */
+QListWidget#selectorList { background: transparent; border: none; outline: none; }
+QListWidget#selectorList::item { padding: 9px 14px; border-radius: 8px; margin: 1px 0; }
+QListWidget#selectorList::item:hover { background: #1b1b1f; }
+QListWidget#selectorList::item:selected { background: #2b2640; color: #ececf1; }
+
+/* What's New and the update dialog */
+QLabel#FritchiiDialogTitle { font-size: 24px; font-weight: 500; color: #ececf1; }
+QTextBrowser#FritchiiNotes { background: transparent; border: none; font-size: 15px; }
+
+/* Home and rail (fritchii/home.cpp) */
+QWidget#FritchiiRail { background: #0c0c0e; }
+QToolButton#FritchiiRailButton {
+    background: transparent;
+    border: none;
+    border-radius: 12px;
+    padding: 10px;
+}
+QToolButton#FritchiiRailButton:hover { background: #1b1b1f; }
+QToolButton#FritchiiRailButton:checked { background: #1f1b2e; }
+QWidget#FritchiiHome { background: #111113; }
+QLabel#FritchiiHeroTitle { font-size: 30px; font-weight: 500; color: #ececf1; }
+QLabel#FritchiiSection { font-size: 14px; color: #9a9aa8; }
+QPushButton#FritchiiPlay {
+    background: #a78bfa;
+    color: #1c1433;
+    border: none;
+    border-radius: 8px;
+    min-height: 44px;
+    max-height: 44px;
+    padding: 0 30px;
+    font-size: 16px;
+    font-weight: 500;
+}
+QPushButton#FritchiiPlay:hover { background: #b59dfb; }
+QPushButton#FritchiiPlay:pressed { background: #9a7cf5; }
+QToolButton#FritchiiTile {
+    background: transparent;
+    border: none;
+    border-radius: 12px;
+    padding: 8px;
+    color: #c9c9d3;
+    font-size: 13px;
+}
+QToolButton#FritchiiTile:hover { background: #1b1b1f; color: #ececf1; }
