@@ -127,11 +127,13 @@ static void GetFuncAddress(Common::DynamicLibrary& dll, const char* name, T& pfn
 }
 
 namespace {
-/// EDEN_NX2_SEC_RESERVE=1 (off by default): the guest memory section is created reserved, and
+/// EDEN_NX2_SEC_RESERVE (on by default, =0 off): the guest memory section is created reserved, and
 /// HostMemory::Commit commits its pages as the kernel hands them out (see host_memory.h).
 bool ReserveGuestMemory() {
+    // On by default (2026-11-08: Castle Town 15.1 -> 12.8 GB working set with the prebuild
+    // streaming, ~3 GB less commit, 0 fault commits); EDEN_NX2_SEC_RESERVE=0 turns it off.
     const char* value = std::getenv("EDEN_NX2_SEC_RESERVE");
-    return value != nullptr && value[0] == '1';
+    return value == nullptr || value[0] != '0';
 }
 
 /// The views of a reserved section, for ReservedPageHandler.

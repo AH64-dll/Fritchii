@@ -1183,14 +1183,17 @@ double SecondsSinceDiskLoad() {
         .count();
 }
 
-// EDEN_NX2_PREBUILD_STREAM=1 (off by default): the disk cache records of queued builds are not
+// EDEN_NX2_PREBUILD_STREAM (on by default, =0 off): the disk cache records of queued builds are not
 // kept in memory from boot until a worker builds them (minutes for the background builds, over
 // a gigabyte for a large cache); each keeps its place in the file and is read again just before
 // its build (RecordStream). What is built, in which order, and which record is tried first stay
 // as without it.
 bool PrebuildStreamEnabled() {
     static const bool enabled = [] {
-        const bool on = VideoCore::Nx2Debug::EnvSwitch("EDEN_NX2_PREBUILD_STREAM") == 1;
+        // On by default (2026-11-08: 4 fresh launches, background prebuild 21.4 -> 14.8 s, workers
+        // waited 0.03 s in total, no more slow frames); EDEN_NX2_PREBUILD_STREAM=0 turns it off.
+        const char* const stream_value = std::getenv("EDEN_NX2_PREBUILD_STREAM");
+        const bool on = stream_value == nullptr || stream_value[0] != '0';
         LOG_INFO(Render_Vulkan, "EDEN_NX2_PREBUILD_STREAM: disk cache records {}",
                  on ? "read again for each build" : "kept in memory until built");
         return on;
