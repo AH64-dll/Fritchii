@@ -294,8 +294,8 @@ inline std::atomic<int> g_idle_pause{-1};
 /// goes off or an image does not fit in device memory. A taken image starts uninitialized
 /// (UNDEFINED layout, contents discarded) as a new one does. Its bytes are left out of the
 /// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
-/// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 0 (default)
-/// = off.
+/// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 1 is the default
+/// (LoadExperiments); 0 = off.
 /// EXP43 (live; render target relocation, fable_answer_12 2A; TextureCache::JoinImages): a render
 /// target a clear overwrites whole, with no copies, aliases or remapped images among its overlaps
 /// and exactly one predecessor among its bad overlaps (an image of the same single-level,
@@ -306,7 +306,7 @@ inline std::atomic<int> g_idle_pause{-1};
 /// again; its VkImage, memory, views and framebuffers stay). 3 = as 2, and with several
 /// predecessors the most recently modified one moves (lets a chain made before the switch went
 /// on stop growing and age out). 1 = retire early: the predecessor is deleted at once and a new
-/// image made, as with 0. 0 (default) = off: candidates are only counted. Never for a shape
+/// image made, as with 0. 0 = off: candidates are only counted. Default 3 (LoadExperiments). Never for a shape
 /// whose GPU-written contents were sampled or rendered to without a clear in a later frame, or
 /// read by the CPU (sticky per shape for the session: "Render target relocation guard (EXP43)"),
 /// nor for rescaled, sparse, converted or CPU-read images, ones with a download queued, bound as
@@ -356,6 +356,13 @@ inline void LoadExperiments() {
         // EXP35 = 2 (2026-11-08): every guest write collected (guest-core write lock spinning 0.7% ->
         // 0, standing 45.3 -> 46.5 fps, route flash reports 253 = camera noise).
         g_experiments[35].store(2, std::memory_order_relaxed);
+        // EXP42 = 1 and EXP43 = 3 (2026-11-08, moving-NPC dips): pooled VkImages for deleted
+        // render targets, and drifted per-frame targets relocated in place (the newest of several
+        // predecessors). Castle Town live toggles: EXP43 0/3 46.3 -> 49.3 fps, EXP42 0/1 on top
+        // 44.7 -> 47.9 (each won all 4 pairs); 21 loads 0 washed out; owner playtest: no visual
+        // bugs, rarely under 40 fps.
+        g_experiments[42].store(1, std::memory_order_relaxed);
+        g_experiments[43].store(3, std::memory_order_relaxed);
         // EXP39 = 3: publish to a back that waits after 8 words, no snapshot refresh of entries
         // that ran (zortos293/Lichii#805 62db242b34; see the EXP39 notes above). Timing only.
         g_experiments[39].store(3, std::memory_order_relaxed);
