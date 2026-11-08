@@ -127,6 +127,88 @@ struct DrawReuseProbe {
         textures_same_previous{};
 };
 
+// EDEN_NX2_EXP32 (texture binding memo, GraphicsPipeline::TextureMemo), bits: 1 = on, 2 = verify
+// (every hit for VERIFY_ALL_FRAMES frames after the switch changes, then one hit in VERIFY_EVERY:
+// the full path runs and is compared with the memo), 4 = a mismatch turns the memo off until the
+// switch changes. Counts are logged every 10 s while the switch is set. Used by the GPU back
+// thread only (draws and RasterizerVulkan::TickFrame).
+struct TextureMemoControl {
+    static constexpr u32 VERIFY_ALL_FRAMES = 120;
+    static constexpr u64 VERIFY_EVERY = 64;
+
+    static TextureMemoControl& Get() {
+        static TextureMemoControl control;
+        return control;
+    }
+
+    [[nodiscard]] bool Usable(int value) const {
+        return (value & 1) != 0 && value != disabled_value;
+    }
+
+    /// Whether this hit is checked against the full path.
+    [[nodiscard]] bool ShouldVerify(int value) {
+        if ((value & 2) == 0) {
+            return false;
+        }
+        return verify_frames_left > 0 || ++verify_counter % VERIFY_EVERY == 0;
+    }
+
+    void Frame() {
+        const int value = VideoCore::Nx2Debug::Experiment(32);
+        if (value != last_value) {
+            last_value = value;
+            disabled_value = -1;
+            ++generation;
+            verify_frames_left = (value & 2) != 0 ? VERIFY_ALL_FRAMES : 0;
+        } else if (verify_frames_left > 0) {
+            --verify_frames_left;
+        }
+        if (value == 0 && lookups == 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (window_start == std::chrono::steady_clock::time_point{}) {
+            window_start = now;
+            return;
+        }
+        const double seconds = std::chrono::duration<double>(now - window_start).count();
+        if (seconds < 10.0) {
+            return;
+        }
+        const double hit_share =
+            lookups != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(lookups) : 0.0;
+        LOG_INFO(Render_Vulkan,
+                 "Texture memo (EXP32={}) last {:.1f} s: {} draws looked up, {} hits ({:.1f}%) | "
+                 "misses: no memo {}, state {}, handles {}, guest entries {}, images {} | "
+                 "recorded {}, refused {} | verified {}, mismatches {}{}",
+                 value, seconds, lookups, hits, hit_share, miss_no_memo, miss_state, miss_handles,
+                 miss_entries, miss_images, recorded, refused, verified, mismatches,
+                 disabled_value == value ? " (memo off after a mismatch)" : "");
+        lookups = hits = miss_no_memo = miss_state = miss_handles = miss_entries = miss_images = 0;
+        recorded = refused = verified = mismatches = 0;
+        window_start = now;
+    }
+
+    int last_value = 0;
+    int disabled_value = -1; ///< the switch value a mismatch turned the memo off for
+    u64 generation = 1;      ///< memos recorded under another generation are dropped
+    u32 verify_frames_left = 0;
+    u64 verify_counter = 0;
+    u32 mismatches_logged = 0;
+    std::chrono::steady_clock::time_point window_start{};
+    u64 lookups{}, hits{}, miss_no_memo{}, miss_state{}, miss_handles{}, miss_entries{},
+        miss_images{}, recorded{}, refused{}, verified{}, mismatches{};
+};
+
+/// A Vulkan handle's bits, for logs (a pointer or a 64-bit integer, depending on the platform).
+template <typename Handle>
+u64 HandleBits(Handle handle) {
+    static_assert(sizeof(Handle) <= sizeof(u64));
+    u64 bits = 0;
+    std::memcpy(&bits, &handle, sizeof(Handle));
+    return bits;
+}
+
 using boost::container::small_vector;
 using boost::container::static_vector;
 using Shader::ImageBufferDescriptor;
@@ -368,6 +450,8 @@ void NoteDrawReuseProbeFrame() {
     if (DrawReuseProbe::Enabled()) [[unlikely]] {
         DrawReuseProbe::Get().Frame();
     }
+    // The texture binding memo's frame too (EXP32: verify window, switch changes, its log).
+    TextureMemoControl::Get().Frame();
 }
 
 std::chrono::nanoseconds GraphicsPipeline::TakeHoldTime() noexcept {
@@ -581,6 +665,191 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
     transitions.push_back(transition);
 }
 
+bool GraphicsPipeline::TextureMemoHit(const TextureCache::TextureMemoState& state,
+                                      std::span<const VideoCommon::ImageViewInOut> views,
+                                      std::span<const u32> sampler_handles) {
+    auto& control = TextureMemoControl::Get();
+    ++control.lookups;
+    const TextureMemo& memo = texture_memo;
+    if (!memo.valid || memo.generation != control.generation ||
+        memo.handles.size() != views.size() ||
+        memo.sampler_handles.size() != sampler_handles.size()) {
+        ++control.miss_no_memo;
+        return false;
+    }
+    if (memo.state != state) {
+        ++control.miss_state;
+        return false;
+    }
+    for (size_t index = 0; index < views.size(); ++index) {
+        if (views[index].index != memo.handles[index] ||
+            sampler_handles[index] != memo.sampler_handles[index]) {
+            ++control.miss_handles;
+            return false;
+        }
+    }
+    // The guest may have rewritten an entry in place: VisitImageView and GetSamplerId would read
+    // it again and resolve it again.
+    for (const TextureCache::TextureMemoEntry& entry : memo.entries) {
+        if (!texture_cache.TextureMemoEntryCurrent(state, entry)) {
+            ++control.miss_entries;
+            return false;
+        }
+    }
+    // What preparing the views would act on: CPU-modified contents to upload, aliases to sync.
+    for (const VideoCommon::ImageViewId view : memo.views) {
+        if (!texture_cache.TextureMemoViewClean(view)) {
+            ++control.miss_images;
+            return false;
+        }
+    }
+    ++control.hits;
+    return true;
+}
+
+void GraphicsPipeline::RecordTextureMemo(const TextureCache::TextureMemoState& state,
+                                         std::span<const VideoCommon::ImageViewInOut> views,
+                                         std::span<const u32> sampler_handles,
+                                         std::span<const VideoCommon::SamplerId> samplers,
+                                         std::span<const DescriptorUpdateEntry> descriptors,
+                                         std::span<const u8> rescaled) {
+    auto& control = TextureMemoControl::Get();
+    TextureMemo& memo = texture_memo;
+    memo.valid = false;
+    size_t texture_arrays = 0;
+    for (const Shader::Info& info : stage_infos) {
+        texture_arrays += info.texture_descriptors.size();
+    }
+    if (sampler_handles.size() != views.size() || samplers.size() != views.size() ||
+        descriptors.size() != views.size() || rescaled.size() != texture_arrays) {
+        ++control.refused;
+        return;
+    }
+    // An image made, joined, deleted or rescaled while resolving, or the pools moved: the same
+    // state need not give these ids again.
+    if (texture_cache.GraphicsTextureMemoState() != state) {
+        ++control.refused;
+        return;
+    }
+    memo.entries.resize(views.size());
+    for (size_t index = 0; index < views.size(); ++index) {
+        if (!texture_cache.TakeTextureMemoEntry(views[index].index, sampler_handles[index],
+                                                views[index].id, samplers[index],
+                                                memo.entries[index])) {
+            ++control.refused;
+            return;
+        }
+    }
+    memo.handles.resize(views.size());
+    memo.views.resize(views.size());
+    for (size_t index = 0; index < views.size(); ++index) {
+        memo.handles[index] = views[index].index;
+        memo.views[index] = views[index].id;
+    }
+    memo.sampler_handles.assign(sampler_handles.begin(), sampler_handles.end());
+    memo.samplers.assign(samplers.begin(), samplers.end());
+    memo.descriptors.assign(descriptors.begin(), descriptors.end());
+    memo.rescaled.assign(rescaled.begin(), rescaled.end());
+    memo.state = state;
+    memo.generation = control.generation;
+    memo.touch_frame = texture_cache.FrameTick();
+    memo.valid = true;
+    ++control.recorded;
+}
+
+bool GraphicsPipeline::VerifyTextureMemo(std::span<const VideoCommon::ImageViewInOut> views,
+                                         std::span<const VideoCommon::SamplerId> samplers,
+                                         std::span<const DescriptorUpdateEntry> descriptors,
+                                         std::span<const u8> rescaled, int switch_value) {
+    auto& control = TextureMemoControl::Get();
+    ++control.verified;
+    const TextureMemo& memo = texture_memo;
+    constexpr size_t no_index = ~size_t{0};
+    size_t binding = no_index;
+    size_t bad_array = no_index;
+    const bool sizes_match = memo.views.size() == views.size() &&
+                             memo.samplers.size() == samplers.size() &&
+                             memo.descriptors.size() == descriptors.size() &&
+                             memo.rescaled.size() == rescaled.size() &&
+                             views.size() == descriptors.size() &&
+                             views.size() == samplers.size();
+    if (sizes_match) {
+        for (size_t index = 0; index < views.size(); ++index) {
+            const VkDescriptorImageInfo& kept = memo.descriptors[index].image;
+            const VkDescriptorImageInfo& fresh = descriptors[index].image;
+            if (memo.views[index] != views[index].id || memo.samplers[index] != samplers[index] ||
+                kept.imageView != fresh.imageView || kept.sampler != fresh.sampler ||
+                kept.imageLayout != fresh.imageLayout) {
+                binding = index;
+                break;
+            }
+        }
+        if (binding == no_index) {
+            for (size_t index = 0; index < rescaled.size(); ++index) {
+                if (memo.rescaled[index] != rescaled[index]) {
+                    bad_array = index;
+                    break;
+                }
+            }
+        }
+        if (binding == no_index && bad_array == no_index) {
+            return true;
+        }
+    }
+    ++control.mismatches;
+    if (control.mismatches_logged < 32) {
+        ++control.mismatches_logged;
+        if (!sizes_match) {
+            LOG_WARNING(Render_Vulkan,
+                        "Texture memo mismatch (EXP32): pipeline {:016x} (vs {:016x} fs {:016x}): "
+                        "memo has {} views {} samplers {} descriptors {} arrays, fresh {} {} {} {}",
+                        key.Hash(), key.unique_hashes[1], key.unique_hashes[5], memo.views.size(),
+                        memo.samplers.size(), memo.descriptors.size(), memo.rescaled.size(),
+                        views.size(), samplers.size(), descriptors.size(), rescaled.size());
+        } else if (binding != no_index) {
+            // The stage the binding belongs to (views are in stage order).
+            size_t stage = 0;
+            size_t first = 0;
+            for (; stage < NUM_STAGES; ++stage) {
+                const size_t count = Shader::NumDescriptors(stage_infos[stage].texture_descriptors);
+                if (binding < first + count) {
+                    break;
+                }
+                first += count;
+            }
+            const VkDescriptorImageInfo& kept = memo.descriptors[binding].image;
+            const VkDescriptorImageInfo& fresh = descriptors[binding].image;
+            LOG_WARNING(Render_Vulkan,
+                        "Texture memo mismatch (EXP32): pipeline {:016x} (vs {:016x} fs {:016x}) "
+                        "binding {} of {} (stage {}, element {}): handle {:#x} tsc {:#x} | memo "
+                        "view {} sampler {} (image view {:#x}, sampler {:#x}, layout {}) | fresh "
+                        "view {} sampler {} (image view {:#x}, sampler {:#x}, layout {})",
+                        key.Hash(), key.unique_hashes[1], key.unique_hashes[5], binding,
+                        views.size(), stage, binding - first, memo.handles[binding],
+                        memo.sampler_handles[binding], memo.views[binding].index,
+                        memo.samplers[binding].index, HandleBits(kept.imageView),
+                        HandleBits(kept.sampler), static_cast<u32>(kept.imageLayout),
+                        views[binding].id.index, samplers[binding].index,
+                        HandleBits(fresh.imageView), HandleBits(fresh.sampler),
+                        static_cast<u32>(fresh.imageLayout));
+        } else {
+            LOG_WARNING(Render_Vulkan,
+                        "Texture memo mismatch (EXP32): pipeline {:016x} (vs {:016x} fs {:016x}) "
+                        "texture array {} of {}: rescaled memo {} fresh {}",
+                        key.Hash(), key.unique_hashes[1], key.unique_hashes[5], bad_array,
+                        rescaled.size(), u32{memo.rescaled[bad_array]}, u32{rescaled[bad_array]});
+        }
+    }
+    if ((switch_value & 4) != 0 && control.disabled_value != switch_value) {
+        control.disabled_value = switch_value;
+        LOG_WARNING(Render_Vulkan,
+                    "Texture memo (EXP32={}) turned off after a mismatch; set EDEN_NX2_EXP32 to "
+                    "another value to turn it on again",
+                    switch_value);
+    }
+    return false;
+}
+
 template <typename Spec>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     zero_texture_handles = 0;
@@ -588,6 +857,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
     views.reserve(num_image_elements);
     samplers.reserve(num_textures);
+    // EDEN_NX2_EXP32: texture binding memo (TextureMemo), for pipelines whose image bindings are
+    // all sampled textures. Their sampler handles are kept and resolved after the lookup.
+    const int memo_switch = VideoCore::Nx2Debug::Experiment(32);
+    const bool texture_memo_on = memo_switch != 0 && num_textures != 0 &&
+                                 num_image_elements == num_textures &&
+                                 TextureMemoControl::Get().Usable(memo_switch);
+    boost::container::small_vector<u32, 96> sampler_handles;
 
     namespace Profile = VideoCommon::Nx2Profile;
     // EDEN_NX2_EXP7: time each step of every call and log the calls that take over 4 ms (which
@@ -741,8 +1017,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 }
                 views.push_back({handle.first});
 
-                VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
-                samplers.push_back(sampler);
+                if (texture_memo_on) {
+                    sampler_handles.push_back(handle.second);
+                } else {
+                    VideoCommon::SamplerId sampler{
+                        texture_cache.GetSamplerId(handle.second, false)};
+                    samplers.push_back(sampler);
+                }
             }
         }
         if constexpr (Spec::has_images) {
@@ -772,13 +1053,49 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
     }
     ASSERT(views.size() == num_image_elements);
-    ASSERT(samplers.size() == num_textures);
     mark();
+    // EXP32: a hit takes the ids (here) and the descriptors (prepare_stage) of the pipeline's
+    // previous draw; a hit picked for verification resolves and pushes the full way, then
+    // compares (VerifyTextureMemo). Every other draw with the memo on records it.
+    bool memo_hit = false;
+    bool memo_verify = false;
+    TextureCache::TextureMemoState memo_state{};
     {
         Profile::Scope scope{Profile::Zone::FillImageViews};
-        texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
-                                     Spec::has_images);
+        if (texture_memo_on) {
+            memo_state = texture_cache.GraphicsTextureMemoState();
+            if (TextureMemoHit(memo_state, std::span(views.data(), views.size()),
+                               std::span(sampler_handles.data(), sampler_handles.size()))) {
+                memo_verify = TextureMemoControl::Get().ShouldVerify(memo_switch);
+                memo_hit = !memo_verify;
+            }
+            if (memo_hit) {
+                for (size_t index = 0; index < views.size(); ++index) {
+                    views[index].id = texture_memo.views[index];
+                }
+                samplers.assign(texture_memo.samplers.begin(), texture_memo.samplers.end());
+                // Preparing the views touches their images in the LRU; again in a frame is a
+                // no-op.
+                const u64 frame = texture_cache.FrameTick();
+                if (texture_memo.touch_frame != frame) {
+                    texture_memo.touch_frame = frame;
+                    for (const VideoCommon::ImageViewId view_id : texture_memo.views) {
+                        texture_cache.TouchTextureMemoView(view_id);
+                    }
+                }
+            } else {
+                for (const u32 sampler_handle : sampler_handles) {
+                    samplers.push_back(texture_cache.GetSamplerId(sampler_handle, false));
+                }
+                texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
+                                             Spec::has_images);
+            }
+        } else {
+            texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
+                                         Spec::has_images);
+        }
     }
+    ASSERT(samplers.size() == num_textures);
     mark();
     if (DrawReuseProbe::Enabled()) [[unlikely]] {
         u64 textures = 0;
@@ -928,6 +1245,21 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     RenderAreaPushConstant render_area;
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
+    // EXP32: what a draw that did not hit pushes, to be recorded (or compared, when verifying).
+    boost::container::small_vector<DescriptorUpdateEntry, 32> fresh_descriptors;
+    boost::container::small_vector<u8, 32> fresh_rescaled;
+    u8* fresh_rescaled_cursor{};
+    size_t memo_descriptor_index{};
+    size_t memo_rescaled_index{};
+    if (texture_memo_on && !memo_hit) {
+        fresh_descriptors.reserve(num_textures);
+        size_t texture_arrays{};
+        for (const Shader::Info& info : stage_infos) {
+            texture_arrays += info.texture_descriptors.size();
+        }
+        fresh_rescaled.resize(texture_arrays);
+        fresh_rescaled_cursor = fresh_rescaled.data();
+    }
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
@@ -939,8 +1271,31 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 // Libraries: the fragment stage's rescaling bits start at fixed indices.
                 rescaling.Seek(GPL_FRAGMENT_TEXTURE_SCALING_BASE, GPL_FRAGMENT_IMAGE_SCALING_BASE);
             }
-            PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
-                                 rescaling, samplers_it, views_it);
+            if (memo_hit) {
+                // The stage's textures as the pipeline's previous draw pushed them (only sampled
+                // textures: no image descriptors to mark modified).
+                const Shader::Info& memo_info{stage_infos[stage]};
+                const u32 count{Shader::NumDescriptors(memo_info.texture_descriptors)};
+                guest_descriptor_queue.AddEntries(
+                    texture_memo.descriptors.data() + memo_descriptor_index, count);
+                memo_descriptor_index += count;
+                for (size_t texture_array = 0;
+                     texture_array < memo_info.texture_descriptors.size(); ++texture_array) {
+                    rescaling.PushTexture(texture_memo.rescaled[memo_rescaled_index++] != 0);
+                }
+                samplers_it += count;
+                views_it += count;
+            } else if (texture_memo_on) {
+                const size_t first{guest_descriptor_queue.UpdateCount()};
+                PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
+                                     rescaling, samplers_it, views_it, &fresh_rescaled_cursor);
+                const DescriptorUpdateEntry* const pushed{guest_descriptor_queue.UpdateData()};
+                fresh_descriptors.insert(fresh_descriptors.end(), pushed + first,
+                                         pushed + guest_descriptor_queue.UpdateCount());
+            } else {
+                PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
+                                     rescaling, samplers_it, views_it);
+            }
         }
         const auto& info{stage_infos[stage]};
         if (info.uses_render_area) {
@@ -966,6 +1321,22 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     if constexpr (Spec::enabled_stages[4]) {
         prepare_stage(4);
+    }
+    if (texture_memo_on && !memo_hit) {
+        const std::span<const u8> rescaled_span{
+            fresh_rescaled.data(), static_cast<size_t>(fresh_rescaled_cursor - fresh_rescaled.data())};
+        const std::span<const VideoCommon::ImageViewInOut> views_span{views.data(), views.size()};
+        const std::span<const VideoCommon::SamplerId> samplers_span{samplers.data(),
+                                                                    samplers.size()};
+        const std::span<const DescriptorUpdateEntry> descriptors_span{fresh_descriptors.data(),
+                                                                      fresh_descriptors.size()};
+        if (memo_verify) {
+            static_cast<void>(VerifyTextureMemo(views_span, samplers_span, descriptors_span,
+                                                rescaled_span, memo_switch));
+        }
+        RecordTextureMemo(memo_state, views_span,
+                          std::span<const u32>(sampler_handles.data(), sampler_handles.size()),
+                          samplers_span, descriptors_span, rescaled_span);
     }
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
