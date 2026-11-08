@@ -717,7 +717,7 @@ void SetCurrentThreadToPerformanceCores() {
 #endif
 }
 
-void PinCurrentThread(PinnedRole role) {
+void PinCurrentThread(PinnedRole role, int guest_core) {
 #ifdef _WIN32
     // Off with EDEN_NX2_PIN_THREADS=0, forced with 1, otherwise on with enough performance cores
     // (ThreadPinning::MakePlan): the split's back did about 8% more draws a second at Lake Hylia
@@ -737,9 +737,30 @@ void PinCurrentThread(PinnedRole role) {
     case PinnedRole::GpuBack:
         mask = plan.back;
         break;
-    case PinnedRole::GuestCore:
+    case PinnedRole::GuestCore: {
         mask = plan.guest;
+        // EDEN_NX2_GUEST_PIN_EACH=1: one physical core each (the guest cores' JIT code was 73-80%
+        // of their busy time at Castle Town; two on one core's SMT siblings share its units).
+        static const std::vector<u64> guest_cores = [] {
+            std::vector<u64> masks;
+            const char* value = std::getenv("EDEN_NX2_GUEST_PIN_EACH");
+            if (plan.guest == 0 || value == nullptr || value[0] != '1') {
+                return masks;
+            }
+            for (const ThreadPinning::Core& core : ReadPinningTopology().cores) {
+                if (core.mask != 0 && (core.mask & ~plan.guest) == 0) {
+                    masks.push_back(core.mask);
+                }
+            }
+            LOG_INFO(Common, "Thread pinning: each guest core on its own physical core ({} cores)",
+                     masks.size());
+            return masks;
+        }();
+        if (guest_core >= 0 && !guest_cores.empty()) {
+            mask = guest_cores[static_cast<size_t>(guest_core) % guest_cores.size()];
+        }
         break;
+    }
     }
     if (mask != 0) {
         GROUP_AFFINITY affinity{};

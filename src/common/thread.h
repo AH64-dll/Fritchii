@@ -113,7 +113,9 @@ void SetCurrentThreadToPerformanceCores();
 /// cores kept off them, so an SMT sibling never shares the GPU threads' core. See
 /// ThreadPinning::MakePlan for when it applies; EDEN_NX2_PIN_THREADS=0 turns it off, 1 forces it.
 enum class PinnedRole : u32 { GpuFront, GpuBack, GuestCore };
-void PinCurrentThread(PinnedRole role);
+/// `guest_core`: the guest core index for GuestCore. With EDEN_NX2_GUEST_PIN_EACH=1 each guest core
+/// gets one physical core of the guest set to itself (its SMT siblings) instead of the whole set.
+void PinCurrentThread(PinnedRole role, int guest_core = -1);
 /// Windows: the processor group 0 logical processors background work should use to stay off the
 /// cores pinned to the GPU threads (and their L3 cache where the CPU has several). 0 while nothing
 /// is pinned, and elsewhere.
