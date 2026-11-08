@@ -1203,6 +1203,10 @@ void PlacePrebuildThread(bool quiet) {
 
 // Precompiled pipeline workers: idle priority on the background cores beside the game, or every
 // core at normal priority while the frontend holds the game for them (ShaderNotify full speed).
+// Set on precompiled pipeline workers: their builds stay out of the "Building: N shaders"
+// counter, which would climb by the thousand during a preparation the frontend already shows.
+thread_local bool t_precompile_build = false;
+
 void PlacePrecompileThread(bool full) {
     if (full) {
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Normal);
@@ -3723,6 +3727,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     const size_t full_threads =
         std::max<size_t>(threads, std::max(1U, std::thread::hardware_concurrency()));
     const auto work = [&](std::stop_token stop, size_t worker) {
+        t_precompile_build = true;
         Common::SetCurrentThreadName("VkPrecompile");
         std::optional<bool> placed_full;
         // Shader libraries built here go to the driver's cache only, like the graphics warm-up.
@@ -4770,7 +4775,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     return std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache,
         libraries_only ? WarmPipelineCache() : vulkan_pipeline_cache,
-        libraries_only ? nullptr : &shader_notify, device, descriptor_pool,
+        libraries_only || t_precompile_build ? nullptr : &shader_notify, device, descriptor_pool,
         guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
         render_pass_cache, key, std::move(modules), infos, std::move(emit_stages),
         library_params);
