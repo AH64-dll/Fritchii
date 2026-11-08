@@ -92,7 +92,12 @@ public:
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
         // The accuracy can change while the game runs (settings dialog, Settings::UpdateGPUAccuracy
         // at each command list end): read once, every decision of this fence uses one value.
-        const bool delay_fence = DelayFences();
+        // EXP33 (zortos293/Lichii#337): a fence that writes a fence-flagged query report is never
+        // skipped as empty, and its operation waits for the fence: a skipped fence runs its
+        // operation at once, before the host GPU has run the work the report follows, and
+        // Ocarina of Time then reads a wrong report (white flashes on leaves and walls at low GPU
+        // accuracy). Only set by the query cache while EXP33 is on.
+        const bool delay_fence = DelayFences() || VideoCore::g_signaling_query_report_fence;
         // EDEN_NX2_EXP28 (zortos293/Lichii#717 FENCE_TRIM, FENCE_FOLD), one value per fence.
         const int fence_trims = VideoCore::Nx2Debug::Experiment(28);
         const bool trim = (fence_trims & 1) != 0;

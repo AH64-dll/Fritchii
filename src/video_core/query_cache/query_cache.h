@@ -27,6 +27,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/rasterizer_interface.h"
 #include "video_core/query_cache/bank_base.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_cache/query_base.h"
@@ -340,7 +341,17 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     };
     u8* pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
-    bool is_synced = (Settings::IsGPUFenceBehaviorDefault() ? !VideoCore::Nx2Debug::AccuratePart(1) : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) && is_fence;
+    // EXP33 (zortos293/Lichii#337): a fence-flagged report stays registered until its fence runs
+    // (as Balanced already does), and its fence is made and waited for even when empty
+    // (g_signaling_query_report_fence). Both halves: the fence alone, with the query freed at
+    // once, left a stale operation behind (three channels waiting forever on a semaphore).
+    const bool keep_fence_report = is_fence && VideoCore::Nx2Debug::Experiment(33) != 0;
+    const bool is_synced = !keep_fence_report &&
+                           (Settings::IsGPUFenceBehaviorDefault()
+                                ? !VideoCore::Nx2Debug::AccuratePart(1)
+                                : !Settings::IsGPUFenceBehaviorBalanced() &&
+                                      !Settings::IsGPUFenceBehaviorAccurate()) &&
+                           is_fence;
     // Counted for Nx2AsyncReportsSettled (SEM_FAST) and FlushQueryResults' own-report wait
     // (EXP30, zortos293/Lichii#559): completed on every way out of the operation, written or
     // discarded, and when the operation is dropped without running.
@@ -415,7 +426,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     });
     if (is_fence) {
         report->Issue();
+        VideoCore::g_signaling_query_report_fence = keep_fence_report;
         impl->rasterizer.SignalFence(std::move(operation));
+        VideoCore::g_signaling_query_report_fence = false;
     } else {
         if (!VideoCore::Nx2Debug::AccuratePart(1) && counter_type == QueryType::Payload) {
             // EXP13=2: marked before the word is written (nx2.h).
