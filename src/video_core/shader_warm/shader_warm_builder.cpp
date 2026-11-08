@@ -410,20 +410,22 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     if (options.runtime_caches) {
         caches = *options.runtime_caches;
     } else {
-        // The current version's cache, or right after a version bump, the newest older cache
-        // with the same record layout (the play history the guesses come from).
-        const auto own = VideoCommon::VersionedPipelineCachePath(
-            TitleDir(title_id), "vulkan", VideoCommon::VulkanPipelineCacheVersion);
-        if (fs::exists(own, ec)) {
-            caches.push_back(own);
-        } else {
-            for (const u32 version : CompatibleRuntimeCacheVersions) {
-                const auto older =
-                    VideoCommon::VersionedPipelineCachePath(TitleDir(title_id), "vulkan", version);
-                if (fs::exists(older, ec)) {
-                    caches.push_back(older);
-                    break;
-                }
+        // The play history the guesses come from: this fork's cache (vulkan-frizti), else the
+        // shared name of this version, else the newest cache of a version with the same record
+        // layout (zortos293/Lichii builds).
+        std::vector<fs::path> candidates{
+            VideoCommon::VersionedPipelineCachePath(TitleDir(title_id), "vulkan-frizti",
+                                                    VideoCommon::VulkanPipelineCacheVersion),
+            VideoCommon::VersionedPipelineCachePath(TitleDir(title_id), "vulkan",
+                                                    VideoCommon::VulkanPipelineCacheVersion)};
+        for (const u32 version : CompatibleRuntimeCacheVersions) {
+            candidates.push_back(
+                VideoCommon::VersionedPipelineCachePath(TitleDir(title_id), "vulkan", version));
+        }
+        for (const auto& candidate : candidates) {
+            if (fs::exists(candidate, ec)) {
+                caches.push_back(candidate);
+                break;
             }
         }
     }

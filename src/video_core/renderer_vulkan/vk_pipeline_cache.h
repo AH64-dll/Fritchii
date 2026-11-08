@@ -227,7 +227,7 @@ private:
                                                      const ComputePipelineCacheKey& key,
                                                      Shader::Environment& env,
                                                      PipelineStatistics* statistics,
-                                                     bool build_in_parallel);
+                                                     bool build_in_parallel, bool warm = false);
 
     void SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                       const vk::PipelineCache& pipeline_cache, u32 cache_version);
@@ -259,6 +259,15 @@ private:
     /// kept shutdown waiting on driver compiles.
     std::atomic<bool> warm_cancel{false};
     std::unique_ptr<std::stop_callback<std::function<void()>>> warm_stop_callback;
+
+    /// Waits until the warm-up may build (ShaderNotify::WarmMayBuild). False when it is to stop.
+    bool WaitForWarmTurn(std::stop_token stop);
+
+    /// The pipeline cache warm-up builds go through: none by default, so the tens of thousands
+    /// of warm-up programs stay in the driver's disk cache and out of vulkan_pipelines.bin (which
+    /// is loaded into memory at every boot). EDEN_NX2_WARM_APP_CACHE=1 uses ours.
+    [[nodiscard]] vk::PipelineCache& WarmPipelineCache();
+    vk::PipelineCache no_pipeline_cache;
 
     const Device& device;
     Scheduler& scheduler;

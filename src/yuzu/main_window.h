@@ -362,6 +362,7 @@ private slots:
     void OnGameListConvertToNup(const std::string& game_path);
     void OnGameListPrepareShaderWarm(u64 program_id, const std::string& game_path);
     void OnGameListDeleteShaderWarm(u64 program_id);
+    void OnPrepareShadersNow();
     void OnGameListExtractNup(const std::string& game_path);
     void OnGameListEditNupMetadata(const std::string& game_path);
     void OnGameListCopyTID(u64 program_id);
@@ -615,6 +616,8 @@ private:
     std::shared_ptr<std::atomic_bool> nup_cancel;
     bool nup_running{};
     QPointer<ShaderWarmDialog> shader_warm_dialog;
+    QAction* action_prepare_shaders_now = nullptr;
+    QPointer<QProgressDialog> shader_warm_run_dialog;
     std::string nup_source_path;
 
     // Last game booted, used for multi-process apps

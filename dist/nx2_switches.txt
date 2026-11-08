@@ -38,3 +38,9 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_KEEP_ASTC=1
 # Threads for each shader warm-up (compute, then graphics), 1 to 32. They run at low priority.
 #EDEN_NX2_WARM_THREADS=4
+# The warm-up builds only while the game is paused or from Emulation > Prepare Shaders Now;
+# =1 lets it build while the game runs too.
+#EDEN_NX2_WARM_WHILE_PLAYING=1
+# Warm-up builds skip our vulkan_pipelines file (only the driver's cache keeps them); =1 adds
+# them to it.
+#EDEN_NX2_WARM_APP_CACHE=1

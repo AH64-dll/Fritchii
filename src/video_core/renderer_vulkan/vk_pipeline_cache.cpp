@@ -63,6 +63,7 @@
 #include "video_core/shader_environment.h"
 #include "video_core/shader_notify.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
+#include "video_core/shader_warm/warm_records.h"
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -87,6 +88,9 @@ using VideoCommon::GuessMissing;
 using VideoCommon::GraphicsEnvironment;
 
 constexpr u32 CACHE_VERSION = VideoCommon::VulkanPipelineCacheVersion;
+// The warm-up builder writes these keys byte for byte (shader_warm/warm_records.h).
+static_assert(sizeof(GraphicsPipelineCacheKey) == VideoCommon::ShaderWarm::GraphicsKeySize);
+static_assert(sizeof(ComputePipelineCacheKey) == sizeof(VideoCommon::ShaderWarm::ComputeKey));
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
@@ -1916,6 +1920,7 @@ void PipelineCache::StartComputeWarm(u64 title_id) {
     const size_t NumThreads = WarmThreads();
     progress->running = NumThreads;
     compute_warm_done = false;
+    shader_notify.BeginWarm();
     shader_notify.SetWarmProgress(1, 0, entries->size());
     LOG_INFO(Render_Vulkan, "Nx2Perf compute_warm: {} programs to build on {} low priority threads",
              entries->size(), NumThreads);
@@ -1924,7 +1929,7 @@ void PipelineCache::StartComputeWarm(u64 title_id) {
                                            file_entries, read_ok](std::stop_token stop) {
             Common::SetCurrentThreadName("VkComputeWarm");
             Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
-            while (!stop.stop_requested() && !warm_cancel) {
+            while (WaitForWarmTurn(stop)) {
                 const size_t index = progress->next.fetch_add(1);
                 if (index >= entries->size()) {
                     break;
@@ -1935,7 +1940,7 @@ void PipelineCache::StartComputeWarm(u64 title_id) {
                 try {
                     ShaderPools pools;
                     // Built and destroyed here: only the driver's cache keeps it.
-                    ok = CreateComputePipeline(pools, entry.key, entry.env, nullptr, false)
+                    ok = CreateComputePipeline(pools, entry.key, entry.env, nullptr, false, true)
                              .pipeline != nullptr;
                 } catch (const std::exception& e) {
                     LOG_DEBUG(Render_Vulkan, "compute_warm {:016x}: {}", entry.key.unique_hash,
@@ -1959,6 +1964,7 @@ void PipelineCache::StartComputeWarm(u64 title_id) {
                     WriteWarmMarker(warm_file, title_file, device, file_entries);
                 }
                 compute_warm_done = true;
+                shader_notify.EndWarm();
                 LOG_INFO(Render_Vulkan,
                          "Nx2Perf compute_warm: finished, {} built, {} failed, {} not reached, "
                          "{:.0f} s",
@@ -2035,6 +2041,7 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
     }
     const size_t NumThreads = WarmThreads();
     reader->running = NumThreads;
+    shader_notify.BeginWarm();
     LOG_INFO(Render_Vulkan,
              "Nx2Perf graphics_warm: {} ({} MB) queued on {} low priority threads, starts after "
              "the compute warm-up",
@@ -2051,12 +2058,13 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
                 std::scoped_lock lock{reader->mutex};
                 if (reader->begin == std::chrono::steady_clock::time_point{}) {
                     reader->begin = std::chrono::steady_clock::now();
+                    shader_notify.SetWarmProgress(2, 0, reader->known_total);
                 }
             }
             static const GuessMissing guess{};
             GraphicsPipelineLibraryCache::SetNoRetainOnThisThread(true);
             ShaderPools pools;
-            while (!stop.stop_requested() && !warm_cancel) {
+            while (WaitForWarmTurn(stop)) {
                 FileEnvironment env;
                 GraphicsPipelineCacheKey key{};
                 {
@@ -2132,6 +2140,7 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
                 if (complete && !stop.stop_requested() && !warm_cancel) {
                     WriteWarmMarker(warm_file, title_file, device, reader->read);
                 }
+                shader_notify.EndWarm();
                 LOG_INFO(Render_Vulkan,
                          "Nx2Perf graphics_warm: finished, {} built, {} failed, {:.0f} s",
                          reader->built.load(), reader->failed_builds.load(),
@@ -2141,6 +2150,23 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
             }
         });
     }
+}
+
+bool PipelineCache::WaitForWarmTurn(std::stop_token stop) {
+    while (!stop.stop_requested() && !warm_cancel && !shader_notify.WarmMayBuild()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    }
+    // Idle priority and off the cores pinned to the GPU threads, like the quiet prebuild.
+    PlacePrebuildThread(true);
+    return !stop.stop_requested() && !warm_cancel;
+}
+
+vk::PipelineCache& PipelineCache::WarmPipelineCache() {
+    static const bool app_cache = [] {
+        const char* value = std::getenv("EDEN_NX2_WARM_APP_CACHE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return app_cache ? vulkan_pipeline_cache : no_pipeline_cache;
 }
 
 void PipelineCache::QueueVulkanPipelineCacheFlush() {
@@ -2286,6 +2312,11 @@ void PipelineCache::TickFrame() {
     constexpr u64 EvictCheckFrames = 600;
     if (frame_count % EvictCheckFrames == 0) {
         EvictUnusedPipelines();
+        if (device.IsExtGraphicsPipelineLibrarySupported()) {
+            // A library goes unused once every pipeline linked from it is evicted and destroyed.
+            constexpr size_t MaxLibraries = 4096;
+            graphics_libraries.TrimUnused(MaxLibraries);
+        }
     }
 }
 
@@ -2733,7 +2764,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         .libraries_only = libraries_only,
     };
     return std::make_unique<GraphicsPipeline>(
-        scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache,
+        scheduler, buffer_cache, texture_cache,
+        libraries_only ? WarmPipelineCache() : vulkan_pipeline_cache,
         libraries_only ? nullptr : &shader_notify, device, descriptor_pool,
         guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
         render_pass_cache, key, std::move(modules), infos, std::move(emit_stages),
@@ -2908,7 +2940,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
 
 ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     ShaderPools& pools, const ComputePipelineCacheKey& key, Shader::Environment& env,
-    PipelineStatistics* statistics, bool build_in_parallel) try {
+    PipelineStatistics* statistics, bool build_in_parallel, bool warm) try {
     auto hash = key.Hash();
     if (device.HasBrokenCompute()) {
         LOG_ERROR(Render_Vulkan, "Skipping {:#016x}", hash);
@@ -2971,8 +3003,10 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     }
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     return {.pipeline = std::make_unique<ComputePipeline>(
-                device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
-                descriptor_buffer_ring, thread_worker, statistics, &shader_notify, program.info,
+                device, scheduler, warm ? WarmPipelineCache() : vulkan_pipeline_cache,
+                descriptor_pool, guest_descriptor_queue,
+                descriptor_buffer_ring, thread_worker, statistics,
+                warm ? nullptr : &shader_notify, program.info,
                 std::move(spv_module), key.unique_hash),
             .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
                                                         : std::vector<std::pair<u32, u32>>{},

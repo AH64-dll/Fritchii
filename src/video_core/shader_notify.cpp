@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 
 #include "video_core/shader_notify.h"
 
@@ -29,6 +30,15 @@ int ShaderNotify::ShadersBuilding() noexcept {
         }
     }
     return now_building - report_base;
+}
+
+bool ShaderNotify::WarmMayBuild() const noexcept {
+    static const bool while_playing = [] {
+        const char* value = std::getenv("EDEN_NX2_WARM_WHILE_PLAYING");
+        return value != nullptr && value[0] == '1';
+    }();
+    return while_playing || emulation_paused.load(std::memory_order::relaxed) ||
+           warm_requested.load(std::memory_order::relaxed);
 }
 
 } // namespace VideoCore

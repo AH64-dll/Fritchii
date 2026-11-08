@@ -37,6 +37,28 @@ public:
         return progress;
     }
 
+    /// A warm-up (compute or graphics) started or ended; WarmActive while any has work left.
+    void BeginWarm() noexcept {
+        warm_running.fetch_add(1, std::memory_order::relaxed);
+    }
+    void EndWarm() noexcept {
+        warm_running.fetch_sub(1, std::memory_order::relaxed);
+    }
+    [[nodiscard]] bool WarmActive() const noexcept {
+        return warm_running.load(std::memory_order::relaxed) > 0;
+    }
+
+    /// The warm-up never competes with the game for the CPU and the driver: it builds only while
+    /// emulation is paused, while the player runs it from the menu (Prepare Shaders Now), or
+    /// always with EDEN_NX2_WARM_WHILE_PLAYING=1.
+    void SetEmulationPaused(bool paused) noexcept {
+        emulation_paused.store(paused, std::memory_order::relaxed);
+    }
+    void SetWarmRequested(bool requested) noexcept {
+        warm_requested.store(requested, std::memory_order::relaxed);
+    }
+    [[nodiscard]] bool WarmMayBuild() const noexcept;
+
     void MarkShaderComplete() noexcept {
         ++num_complete;
     }
@@ -51,6 +73,9 @@ private:
     std::atomic<u32> warm_kind{};
     std::atomic<size_t> warm_done{};
     std::atomic<size_t> warm_total{};
+    std::atomic<int> warm_running{};
+    std::atomic<bool> emulation_paused{};
+    std::atomic<bool> warm_requested{};
     int report_base{};
 
     bool completed{};

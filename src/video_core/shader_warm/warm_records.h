@@ -22,10 +22,11 @@ namespace VideoCommon::ShaderWarm {
 /// Warm files and the runtime caches they are built from use the pipeline cache version: the
 /// emulator loads a warm file only when it matches, so the two must move together.
 constexpr u32 WarmCacheVersion = VideoCommon::VulkanPipelineCacheVersion;
-/// Older runtime cache versions with the same record layout, newest first: their records still
-/// give the draw state guesses when the current version has no cache yet (just after a bump).
-/// Only extend this list when the record layout is unchanged (52 to 54 are identical).
-constexpr std::array<u32, 2> CompatibleRuntimeCacheVersions{53, 52};
+/// Other runtime cache versions with the same record layout, newest first: zortos293/Lichii
+/// builds write 53 and 54 (the records this build copies at boot, vk_pipeline_cache.cpp). Their
+/// records still give the draw state guesses when this version has no cache yet. Only extend
+/// this list when the record layout is unchanged (52 to 54 are identical).
+constexpr std::array<u32, 2> CompatibleRuntimeCacheVersions{54, 53};
 /// Whether a runtime cache file of `version` can be read for the draw state guesses.
 constexpr bool IsReadableRuntimeCacheVersion(u32 version) {
     if (version == WarmCacheVersion) {

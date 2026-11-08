@@ -31,6 +31,9 @@ bool ShaderWarmFilesExist(u64 title_id);
 /// Removes both warm-up files of the title. Returns false and fills `error` on failure.
 bool DeleteShaderWarmFiles(u64 title_id, std::string& error);
 
+/// The NVIDIA shader cache size tip the first time it is asked for, empty after that.
+QString TakeShaderCacheTip();
+
 /// Modeless window that builds a game's shader warm-up files on a worker thread and shows the
 /// stage, the progress and the result. Closing it while it works stops the build first.
 class ShaderWarmDialog : public QDialog {

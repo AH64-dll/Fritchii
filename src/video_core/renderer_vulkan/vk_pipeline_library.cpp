@@ -112,6 +112,33 @@ std::shared_ptr<const GplLibrary> GraphicsPipelineLibraryCache::GetOrCreate(
     return library;
 }
 
+void GraphicsPipelineLibraryCache::TrimUnused(size_t max_entries) {
+    std::scoped_lock lock{mutex};
+    if (entries.size() <= max_entries) {
+        return;
+    }
+    size_t trimmed = 0;
+    for (auto it = entries.begin(); it != entries.end() && entries.size() > max_entries;) {
+        Entry& entry = *it->second;
+        bool unused = false;
+        {
+            std::scoped_lock entry_lock{entry.mutex};
+            // Failed keys stay (they are not retried); a library only the map holds is unused.
+            unused = entry.done && entry.library && entry.library.use_count() == 1;
+        }
+        if (unused) {
+            it = entries.erase(it);
+            ++trimmed;
+        } else {
+            ++it;
+        }
+    }
+    if (trimmed != 0) {
+        LOG_INFO(Render_Vulkan, "Nx2Perf gpl: {} unused libraries released, {} left", trimmed,
+                 entries.size());
+    }
+}
+
 void GraphicsPipelineLibraryCache::RecordLink(bool optimized, std::chrono::nanoseconds time) {
     const size_t index = optimized ? 1 : 0;
     const u64 ns = static_cast<u64>(time.count());

@@ -17,6 +17,7 @@
 #include <QVBoxLayout>
 
 #include "common/settings.h"
+#include "qt_common/config/uisettings.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "yuzu/shader_warm_dialog.h"
 
@@ -33,6 +34,17 @@ bool ShaderWarmFilesExist(u64 title_id) {
 
 bool DeleteShaderWarmFiles(u64 title_id, std::string& error) {
     return ShaderWarm::DeleteWarmFiles(title_id, &error);
+}
+
+QString TakeShaderCacheTip() {
+    if (UISettings::values.shader_warm_cache_tip_shown.GetValue()) {
+        return {};
+    }
+    UISettings::values.shader_warm_cache_tip_shown.SetValue(true);
+    return ShaderWarmDialog::tr(
+        "Tip for NVIDIA GPUs: the compiled shaders are kept in the driver's shader cache. In the "
+        "NVIDIA Control Panel, Manage 3D settings, set Shader Cache Size to 10 GB or Unlimited; "
+        "a full cache throws them away and the warm-up has to run again.");
 }
 
 namespace {
@@ -194,11 +206,18 @@ void ShaderWarmDialog::OnFinished(const ShaderWarm::Result& result, bool stopped
                     tr("Skipped (could not be read or converted): %L1")
                         .arg(static_cast<qulonglong>(result.skipped));
         }
-        text += QStringLiteral("\n\n") + tr("The warm-up runs by itself when the game starts.");
+        text += QStringLiteral("\n\n") +
+                tr("Next, start the game: the shaders are compiled for your GPU while the game "
+                   "is paused, or right away with Emulation > Prepare Shaders Now (a title "
+                   "screen is a good place). It never slows the game down on its own, and it "
+                   "is done once per driver version.");
         if (!ShaderLibrariesOn()) {
             text += QLatin1Char(' ') +
                     tr("The graphics part also needs Shader libraries, in Configure, Graphics, "
                        "Advanced.");
+        }
+        if (const QString tip = TakeShaderCacheTip(); !tip.isEmpty()) {
+            text += QStringLiteral("\n\n") + tip;
         }
     } else if (stopped) {
         stage_label->setText(tr("Shader warm-up stopped."));
