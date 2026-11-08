@@ -117,10 +117,51 @@ class CriticalPathTest(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertAlmostEqual(median, 0.1)
 
+    def test_list_queue(self):
+        rows = self.result["queue"]["rows"]
+        self.assertEqual([r["seq"] for r in rows], [7])
+        self.assertEqual(rows[0]["depth"], 0)
+        self.assertAlmostEqual(rows[0]["parts"]["idle"], 100.0)
+        frames = self.result["queue"]["frames"]
+        self.assertEqual(frames[0]["count"], 1)
+
     def test_report_runs(self):
         text = critical_path.report(self.result)
         self.assertIn("Validation", text)
+        self.assertIn("queue depth at submit", text)
         json.dumps(critical_path.to_json(self.result))
+
+
+PRESENT = 60
+PRESENT_NAMES = {**NAMES, PRESENT: "VulkanPresent"}
+
+
+class PendingWaitTest(unittest.TestCase):
+    """The walk reaches the present thread inside its wait for the next frame: the path is on
+    the thread that will queue the frame, not on the waiting present thread."""
+
+    def test_present_wait_goes_to_the_queuing_thread(self):
+        trace_events = [{"name": "thread_name", "ph": "M", "pid": 1, "tid": tid, "args": {"name": name}}
+                        for tid, name in PRESENT_NAMES.items()]
+        for at in (0, 10000, 20000):
+            trace_events.append(span(GUEST, "guest present", at, at + 50))
+        trace_events += [
+            span(BACK, "present: wait for free frame", 10000, 12000),
+            span(BACK, "draw", 12000, 19000),
+            mark(BACK, "syncpoint: guest increment", 19000, id=5, value=1),
+            span(GUEST, "present: wait for frame fence", 15000, 20000, syncpoint=5, value=1),
+            span(PRESENT, "present: wait for frame", 5000, 25000),
+            span(WORKER, "worker: wait for work", 8000, 13000),
+            mark(WORKER, "present: frame queued", 24000, frame=1),
+        ]
+        path = os.path.join(tempfile.mkdtemp(), "timeline.json")
+        write_trace(path, trace_events)
+        trace = critical_path.load(path)
+        result = critical_path.analyse(trace, critical_path.Walker(trace))
+        by = result["frames"][1]["by"]
+        self.assertFalse([k for k in by if k[0] == "present"], by)
+        self.assertAlmostEqual(by[("back", "busy", "draw")], 7.0)
+        self.assertAlmostEqual(result["frames"][1]["path_ms"], 10.0)
 
 
 if __name__ == "__main__":

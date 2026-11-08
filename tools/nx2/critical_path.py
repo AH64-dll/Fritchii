@@ -81,7 +81,9 @@ WAITS = {
     "worker: wait for work": ("wait", "back", ("at_end",)),
     "fence: wait for work": ("wait", "back", ("at_end",)),
     "fence: wait for fence": ("wait", "gpu", ("gpu_any",)),
-    "present: wait for frame": ("wait", "worker", ("marker", "present: frame queued")),
+    # The frame is queued by whoever runs the renderer's recorded present (the Vulkan worker, or
+    # the back under the split when the worker runs inline): see Walker.resolve's pending rule.
+    "present: wait for frame": ("wait", "back", ("marker", "present: frame queued")),
     "present: wait for free frame": ("wait", "present", ("at_end",)),
     "present: wait for frame render": ("wait", "gpu", ("gpu_any",)),
     "present-wait: wait for work": ("wait", "present", ("at_end",)),
@@ -131,6 +133,16 @@ class Trace:
             tids = [tid for tid in self.spans if self.role(tid) == role]
             self._tids[role] = max(tids, key=lambda tid: len(self.spans[tid])) if tids else None
         return self._tids[role]
+
+    def recorder(self, names):
+        """The host thread (not a guest core) that records these markers most, or None."""
+        key = ("recorder",) + tuple(names)
+        if key not in self._tids:
+            tids = collections.Counter(m[1] for name in names for m in self.instants.get(name, ()))
+            tid = tids.most_common(1)[0][0] if tids else None
+            self._tids[key] = tid if tid is not None and self.role(tid) not in ("guest", "other") \
+                else None
+        return self._tids[key]
 
     def qpc_to_us(self, qpc):
         """An ETW time stamp (performance counter) on the timeline's clock."""
@@ -348,6 +360,13 @@ class Walker:
         if how in ("marker", "wake_window"):
             floor = low if how == "marker" else max(low, t - self.wake_window)
             marker = self.latest_marker(resolver[1:], floor, t)
+            if marker is None and how == "marker" and span[1] > t + EPS and target != "guest":
+                # Pending: the walk arrived inside the wait, and what ends it comes after t (the
+                # present thread idles a whole frame for the next one). Whoever will end it is
+                # what the path is on at t: the thread that records the marker, else the stage.
+                other = trace.recorder(resolver[1:]) or trace.tid_of(target)
+                if other is not None and other != tid:
+                    return other, t
             if marker is None:
                 add(tid, low, t, role, "unknown" if low <= span[0] + EPS else "latency",
                     f"{name} (waker unknown)")
@@ -454,7 +473,7 @@ def analyse(trace, walker, top=10):
             "p90_ms": p90_ms, "bands": bands, "median_frame": median_frame,
             "stage_kind": stage_kind, "detail": detail, "longest": longest,
             "unexplained": unexplained, "examples": examples, "pacing": pacing,
-            "lists": list_latency(trace)}
+            "lists": list_latency(trace), "queue": list_queue(trace, presents)}
 
 
 def list_latency(trace):
@@ -466,6 +485,126 @@ def list_latency(trace):
               "front begin -> back": [back[s] - front[s] for s in back if s in front]}
     return {k: (len(v), statistics.median(v) / 1000.0 if v else 0.0,
                 percentile(v, 0.9) / 1000.0) for k, v in stages.items()}
+
+
+class Cumulative:
+    """Time covered by sorted, non-overlapping intervals before any moment."""
+
+    def __init__(self, intervals):
+        self.begins = [b for b, _e in intervals]
+        self.ends = [e for _b, e in intervals]
+        self.before = [0.0]
+        for b, e in intervals:
+            self.before.append(self.before[-1] + e - b)
+
+    def at(self, x):
+        index = bisect.bisect_right(self.begins, x) - 1
+        if index < 0:
+            return 0.0
+        return self.before[index] + min(x, self.ends[index]) - self.begins[index]
+
+    def within(self, low, high):
+        return self.at(high) - self.at(low)
+
+
+QUEUE_IDLE = {"idle": "idle", "pending sleep": "idle (pending sleep)"}
+
+
+def front_classes(trace):
+    """The front's time as (begin, end, class): drains by site (its waits for the back), its
+    waits for the host GPU, idle, and otherwise parsing: a list between its begin and end
+    markers ("parsing other lists"), or a suspended list's methods once its semaphore released
+    ("resume pending: resumed lists", the rest of that span "resume pending: polling")."""
+    front = trace.tid_of("front")
+    if front is None:
+        return []
+    begins = {m[2].get("seq"): m[0] for m in trace.instants.get("front: list begin", ())}
+    ends = {m[2].get("seq"): m[0] for m in trace.instants.get("front: list end", ())}
+    lists = sorted((begins[s], ends[s]) for s in begins if s in ends and ends[s] >= begins[s])
+    spans = trace.spans[front]
+    resumes = [(s[0], s[1]) for s in spans if s[2] == "resume pending"]  # never nested in one another
+    resume_begins = [r[0] for r in resumes]
+
+    def resuming(t):
+        index = bisect.bisect_right(resume_begins, t) - 1
+        return index >= 0 and t < resumes[index][1]
+
+    out = []
+    li = 0
+    for begin, end, index in trace.pieces[front][1]:
+        if index == -2 or end <= begin:
+            continue
+        name = spans[index][2] if index >= 0 else None
+        target = WAITS.get(name, ("busy", None))[1] if name is not None else None
+        if target == "back":
+            out.append((begin, end, f"drain: {name}"))
+            continue
+        if target == "gpu":
+            out.append((begin, end, f"host GPU wait: {name}"))
+            continue
+        if name in QUEUE_IDLE:
+            out.append((begin, end, QUEUE_IDLE[name]))
+            continue
+        if name == "resume pending":
+            out.append((begin, end, "resume pending: polling"))
+            continue
+        # Split the piece at list boundaries: inside a list it is parsing.
+        t = begin
+        while li < len(lists) and lists[li][1] <= t:
+            li += 1
+        k = li
+        while t < end:
+            if k < len(lists) and lists[k][0] <= t < lists[k][1]:
+                until = min(end, lists[k][1])
+                out.append((t, until, "parsing other lists"))
+            else:
+                until = min(end, lists[k][0]) if k < len(lists) else end
+                out.append((t, until, "resume pending: resumed lists" if resuming(t)
+                            else "front: between lists"))
+            t = until
+            while k < len(lists) and lists[k][1] <= t:
+                k += 1
+    return out
+
+
+def list_queue(trace, presents):
+    """Where each command list's guest submit -> front begin went on the front, and how many
+    lists were queued (submitted, not begun) when it was submitted; per frame, the queue depth
+    when the frame's last list was submitted."""
+    submit = {m[2].get("seq"): m[0] for m in trace.instants.get("submit list", ())}
+    begin = {m[2].get("seq"): m[0] for m in trace.instants.get("front: list begin", ())}
+    if not submit or not begin:
+        return None
+    by_class = collections.defaultdict(list)
+    for b, e, cls in front_classes(trace):
+        by_class[cls].append((b, e))
+    cumulative = {cls: Cumulative(v) for cls, v in by_class.items()}
+    submit_ts = sorted(submit.values())
+    begin_ts = sorted(begin[s] for s in begin if s in submit)
+
+    def depth(at):
+        # Lists submitted before `at` that the front had not begun by then (FIFO).
+        return max(bisect.bisect_left(submit_ts, at) - bisect.bisect_left(begin_ts, at), 0)
+
+    rows = []
+    for seq, ts in submit.items():
+        if seq not in begin or begin[seq] < ts:
+            continue
+        window = begin[seq] - ts
+        parts = {cls: c.within(ts, begin[seq]) for cls, c in cumulative.items()}
+        parts["front: untracked"] = max(window - sum(parts.values()), 0.0)
+        rows.append({"seq": seq, "submit": ts, "window": window, "depth": depth(ts),
+                     "parts": parts})
+    rows.sort(key=lambda r: r["submit"])
+    frames = []
+    starts = [r["submit"] for r in rows]
+    for start, end in zip(presents, presents[1:]):
+        index = bisect.bisect_left(starts, end) - 1
+        if index >= 0 and rows[index]["submit"] >= start:
+            last = rows[index]
+            frames.append({"depth": last["depth"], "window": last["window"],
+                           "count": index - bisect.bisect_left(starts, start) + 1})
+    return {"rows": rows, "frames": frames}
 
 
 def list_at(trace, tid, t):
@@ -530,7 +669,47 @@ def report(result, top_spans=25):
     w("Command lists through the stages (count, median ms, p90 ms)")
     for name, (count, med, p90) in result["lists"].items():
         w(f"  {name:<30}{count:>7}{med:9.3f}{p90:9.3f}")
+    queue = result.get("queue")
+    if queue and queue["rows"]:
+        report_queue(queue, w)
     return "\n".join(out)
+
+
+def report_queue(queue, w):
+    rows = queue["rows"]
+    windows = [r["window"] for r in rows]
+    cut = percentile(windows, 0.9)
+    slow = [r for r in rows if r["window"] >= cut]
+    classes = sorted({c for r in rows for c in r["parts"]},
+                     key=lambda c: -sum(r["parts"].get(c, 0.0) for r in rows))
+    w("")
+    w(f"Guest submit -> front begin, what the front did meanwhile ({len(rows)} lists; the "
+      f"slowest tenth: {len(slow)} lists, window >= {cut / 1000.0:.2f} ms)")
+    w(f"  {'ms per list':<30}{'mean':>8}{'median':>8}{'p90':>8}{'share':>8}"
+      f"{'slow mean':>11}{'slow share':>12}")
+    total, slow_total = sum(windows), sum(r["window"] for r in slow)
+    for cls in ["window"] + classes:
+        values = [r["window"] if cls == "window" else r["parts"].get(cls, 0.0) for r in rows]
+        slow_values = [r["window"] if cls == "window" else r["parts"].get(cls, 0.0) for r in slow]
+        if sum(values) < 1e-9 and cls != "window":
+            continue
+        w(f"  {cls:<30}{statistics.mean(values) / 1000.0:8.3f}"
+          f"{statistics.median(values) / 1000.0:8.3f}{percentile(values, 0.9) / 1000.0:8.3f}"
+          f"{sum(values) / max(total, 1e-9):8.1%}"
+          f"{statistics.mean(slow_values) / 1000.0:11.3f}{sum(slow_values) / max(slow_total, 1e-9):12.1%}")
+    depths = [r["depth"] for r in rows]
+    w(f"  queue depth at submit (lists submitted, not begun): median {statistics.median(depths):.0f}, "
+      f"p90 {percentile(depths, 0.9):.0f}, max {max(depths)}")
+    frames = queue["frames"]
+    if frames:
+        last_depths = [f["depth"] for f in frames]
+        last_windows = [f["window"] / 1000.0 for f in frames]
+        counts = [f["count"] for f in frames]
+        w(f"  per frame ({len(frames)}): lists submitted median {statistics.median(counts):.0f}; "
+          f"queue depth when the frame's last list was submitted median "
+          f"{statistics.median(last_depths):.0f}, p90 {percentile(last_depths, 0.9):.0f}, "
+          f"max {max(last_depths)}; that list's submit -> front begin median "
+          f"{statistics.median(last_windows):.3f} ms, p90 {percentile(last_windows, 0.9):.3f} ms")
 
 
 def to_json(result):
@@ -553,6 +732,11 @@ def to_json(result):
                         for (t, label), ms in result["unexplained"].items()],
         "pacing": result["pacing"],
         "lists": {k: {"count": c, "median_ms": m, "p90_ms": p} for k, (c, m, p) in result["lists"].items()},
+        "queue": None if not result.get("queue") else {
+            "lists": [{"seq": r["seq"], "window_ms": r["window"] / 1000.0, "depth": r["depth"],
+                       "parts_ms": {c: round(v / 1000.0, 4) for c, v in r["parts"].items() if v}}
+                      for r in result["queue"]["rows"]],
+            "frames": result["queue"]["frames"]},
     }
 
 
