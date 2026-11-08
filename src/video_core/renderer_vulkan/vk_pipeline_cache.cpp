@@ -45,6 +45,7 @@
 #include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/ir_opt/oot_visual_workaround.h"
 #include "shader_recompiler/program_header.h"
+#include "video_core/async_translate.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
@@ -4118,6 +4119,47 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
         window = now;
     }
 }
+
+// EDEN_NX2_ASYNC_TRANSLATE=3: GPU-thread builds translate from environment snapshots, and every
+// read they recorded is answered again from the live state right after. Any difference is a
+// snapshot gap (or a texture descriptor that needed a cache flush): the first 16 are logged with
+// their pipeline, and the counts every 10 s. GPU thread only.
+void NoteSnapshotCheck(const GraphicsPipelineCacheKey& key, size_t bytes,
+                       std::span<Shader::Environment* const> envs) {
+    static u32 pipelines{}, logged{};
+    static size_t copied{}, reads{}, differing{}, gave_up{};
+    static auto window = std::chrono::steady_clock::now();
+    ++pipelines;
+    copied += bytes;
+    for (Shader::Environment* const env : envs) {
+        auto& graphics_env = static_cast<GraphicsEnvironment&>(*env);
+        const auto check = graphics_env.CheckAgainstLive();
+        reads += check.reads;
+        differing += check.differing;
+        if (graphics_env.GuardedReadFailed()) {
+            ++gave_up;
+        }
+        if (check.differing != 0 && logged < 16) {
+            ++logged;
+            LOG_WARNING(Render_Vulkan,
+                        "Environment snapshot differs from the live state: {} reads of {} in {} "
+                        "stage {}, first: {}",
+                        check.differing, check.reads, PipelineShaders(key),
+                        static_cast<u32>(env->ShaderStage()), check.first);
+        }
+        graphics_env.ReleaseSnapshotBytes();
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window > std::chrono::seconds{10}) {
+        LOG_INFO(Render_Vulkan,
+                 "Environment snapshots in the last 10 s: {} pipelines, {} KB copied, {} reads "
+                 "checked, {} differ, {} guarded reads gave up",
+                 pipelines, copied / 1024, reads, differing, gave_up);
+        pipelines = 0;
+        copied = reads = differing = gave_up = 0;
+        window = now;
+    }
+}
 } // Anonymous namespace
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
@@ -4129,8 +4171,17 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
         ReportRuntimePipeline("Graphics", begin, PipelineShaders(graphics_key), t_build_split);
     };
     GraphicsEnvironments environments;
-    GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
+    const bool snapshot_check = VideoCommon::AsyncTranslateMode() == 3;
+    const size_t snapshot_bytes =
+        GetGraphicsEnvironments(environments, graphics_key.unique_hashes, snapshot_check);
     t_build_split.environments = std::chrono::steady_clock::now() - begin;
+    SCOPE_EXIT {
+        // Right after the translation (the SPIR-V and the driver compile may still be queued),
+        // before the GPU thread changes any state.
+        if (snapshot_check) {
+            NoteSnapshotCheck(graphics_key, snapshot_bytes, environments.Span());
+        }
+    };
 
     std::shared_ptr<ShaderPools> emit_pools;
     auto reservation = emission_budget.TryAcquire(

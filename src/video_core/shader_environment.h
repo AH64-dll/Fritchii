@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <type_traits>
 #include "common/container/unordered_map.h"
 #include <vector>
@@ -111,7 +112,23 @@ public:
     }
     bool HasNativeInstructions() const override;
 
+    /// Whether a guarded guest memory read gave up (a page table writer kept its lock): the
+    /// translation saw zeros there, so its result must not be used.
+    [[nodiscard]] bool GuardedReadFailed() const noexcept {
+        return guarded_read_failed;
+    }
+
+    /// The first of the recorded reads (constant buffer values, texture types and formats,
+    /// storage pointer classes, replacements, the viewport transform state) whose answer differs
+    /// from `other`'s, described; empty when they all match.
+    [[nodiscard]] std::string FirstReadDifference(const GenericEnvironment& other) const;
+
 protected:
+    /// ReadBlockGuarded of the memory manager; zeros and GuardedReadFailed when it gave up.
+    void ReadGuestGuarded(GPUVAddr address, void* data, size_t size);
+    /// IsFullyMappedRangeGuarded; false and GuardedReadFailed when it gave up.
+    bool IsMappedGuarded(GPUVAddr address, size_t size);
+
     std::optional<u64> TryFindSize();
     virtual std::optional<u32> ReadTrapGuardConstant(u32, u32) { return std::nullopt; }
 
@@ -123,8 +140,10 @@ protected:
     size_t native_source_size{};
     std::shared_ptr<const LoweredNativeCode> lowered_native;
 
+    /// `live`: read with ReadBlock even when the reads are guarded (the checks against the live
+    /// state, on the GPU thread).
     Tegra::Texture::TICEntry ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
-                                             bool via_header_index, u32 raw);
+                                             bool via_header_index, u32 raw, bool live = false);
 
     Tegra::MemoryManager* gpu_memory{};
     GPUVAddr program_base{};
@@ -152,6 +171,10 @@ protected:
 
     bool has_unbound_instructions = false;
     bool has_hle_engine_state = false;
+    /// Guest memory is read through the guarded reads (a snapshot environment, which may be
+    /// translated off the GPU thread).
+    bool guarded_reads = false;
+    bool guarded_read_failed = false;
 };
 
 class GraphicsEnvironment final : public GenericEnvironment {
@@ -177,9 +200,58 @@ public:
 
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override;
 
+    /// EDEN_NX2_ASYNC_TRANSLATE: copies what the translation reads from the engine and from
+    /// constant buffers (the stage's constant buffer table and the bytes of each enabled buffer,
+    /// the texture pool registers, the viewport transform state, the HLE replace entries), so the
+    /// program can be translated later, on another thread, with the answers it would get now.
+    /// From then on the environment never reads the engine, and reads guest memory only for
+    /// texture descriptors, storage pointer checks and unbound instructions, through the guarded
+    /// reads. GPU thread, right after construction. Returns the bytes copied.
+    size_t TakeSnapshot();
+
+    /// Frees the copied constant buffer bytes once translated (the recorded reads and the
+    /// texture pool registers stay).
+    void ReleaseSnapshotBytes();
+
+    [[nodiscard]] bool HasSnapshot() const noexcept {
+        return snapshot != nullptr;
+    }
+
+    struct LiveCheck {
+        size_t reads{};     ///< Recorded reads answered again
+        size_t differing{}; ///< Of them, answered differently now
+        std::string first;  ///< The first that differs, described
+    };
+    /// GPU thread, right after translating from the snapshot: every recorded read answered again
+    /// from the engine and guest memory as they are now (EDEN_NX2_ASYNC_TRANSLATE=3).
+    [[nodiscard]] LiveCheck CheckAgainstLive();
+
 private:
+    /// What TakeSnapshot copies.
+    struct Snapshot {
+        std::array<Tegra::Engines::ConstBufferInfo,
+                   Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers>
+            const_buffers{};
+        /// Bytes of each enabled buffer as Read<u32> sees them, one word past its size.
+        std::array<std::vector<u32>, Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers> words;
+        ::Common::unordered_map<u64, Shader::ReplaceConstant> replace_entries;
+        GPUVAddr tic_address{};
+        u32 tic_limit{};
+        bool via_header_index{};
+        u32 viewport_transform_state{};
+    };
+
+    /// The engine's answers as they are now, without recording them.
+    [[nodiscard]] u32 LiveCbufValue(u32 cbuf_index, u32 cbuf_offset) const;
+    [[nodiscard]] bool LiveStoragePointer(u64 key) const;
+    [[nodiscard]] std::optional<Shader::ReplaceConstant> LiveReplaceConstBuffer(u32 bank,
+                                                                                u32 offset) const;
+    [[nodiscard]] Tegra::Texture::TICEntry LiveTextureInfo(u32 handle);
+
     Tegra::Engines::Maxwell3D* maxwell3d{};
     size_t stage_index{};
+    /// Shared: the environments are copied (they declare a destructor, so they have no moves).
+    std::shared_ptr<Snapshot> snapshot;
 };
 
 class ComputeEnvironment final : public GenericEnvironment {
