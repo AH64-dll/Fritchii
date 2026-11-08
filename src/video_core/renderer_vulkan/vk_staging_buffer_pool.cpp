@@ -15,6 +15,7 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/literals.h"
+#include "video_core/churn_counters.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -244,6 +245,8 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         buffer_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
     vk::Buffer buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
+    VideoCommon::Churn::Add(VideoCommon::Churn::StagingBuffers);
+    VideoCommon::Churn::Add(VideoCommon::Churn::StagingBytes, buffer_ci.size);
     if (device.HasDebuggingToolAttached()) {
         ++buffer_index;
         buffer.SetObjectNameEXT(fmt::format("Staging Buffer {}", buffer_index).c_str());
