@@ -537,7 +537,8 @@ public:
     };
     static constexpr size_t NativeBankUploadCapacity = 32;
     struct NativeBankUploads {
-        std::array<NativeBankUpload, NativeBankUploadCapacity> pages{};
+        /// Only the first `count` are set (left uninitialized: one of these per bank bind).
+        std::array<NativeBankUpload, NativeBankUploadCapacity> pages;
         size_t count = 0;
     };
 
