@@ -44,6 +44,7 @@
 #include "util/util.h"
 #include "yuzu/game/game_list.h"
 #include "yuzu/nup_dialogs.h"
+#include "yuzu/shader_warm_dialog.h"
 
 #include "applets/qt_amiibo_settings.h"
 #include "applets/qt_controller.h"
@@ -1112,6 +1113,11 @@ void MainWindow::InitializeWidgets() {
     message_label->setAlignment(Qt::AlignLeft);
     statusBar()->addPermanentWidget(message_label, 1);
 
+    shader_warm_label = new QLabel();
+    shader_warm_label->setToolTip(
+        tr("Shaders prepared ahead of time so the game stutters less when it first uses them.\n"
+           "It never slows the game down: it builds while the game is paused, or right away "
+           "from Emulation > Prepare Shaders Now."));
     shader_building_label = new QLabel();
     shader_building_label->setToolTip(tr("The amount of shaders currently being built"));
     res_scale_label = new QLabel();
@@ -1128,8 +1134,8 @@ void MainWindow::InitializeWidgets() {
         tr("Time taken to emulate a Switch frame, not counting framelimiting or v-sync. For "
            "full-speed emulation this should be at most 16.67 ms."));
 
-    for (auto& label : {shader_building_label, res_scale_label, emu_speed_label, game_fps_label,
-                        emu_frametime_label}) {
+    for (auto& label : {shader_warm_label, shader_building_label, res_scale_label, emu_speed_label,
+                        game_fps_label, emu_frametime_label}) {
         label->setVisible(false);
         label->setFrameStyle(QFrame::NoFrame);
         label->setContentsMargins(4, 0, 4, 0);
@@ -1623,6 +1629,10 @@ void MainWindow::ConnectWidgetEvents() {
             &MainWindow::OnGameListVerifyIntegrity);
     connect(game_list, &GameList::ConvertToNupRequested, this,
             &MainWindow::OnGameListConvertToNup);
+    connect(game_list, &GameList::PrepareShaderWarmRequested, this,
+            &MainWindow::OnGameListPrepareShaderWarm);
+    connect(game_list, &GameList::DeleteShaderWarmRequested, this,
+            &MainWindow::OnGameListDeleteShaderWarm);
     connect(game_list, &GameList::ExtractNupRequested, this, &MainWindow::OnGameListExtractNup);
     connect(game_list, &GameList::EditNupMetadataRequested, this,
             &MainWindow::OnGameListEditNupMetadata);
@@ -1674,6 +1684,11 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Open_Mods_Page, &MainWindow::OnOpenModsPage);
     connect_menu(ui->action_Open_UserHandbook, &MainWindow::OnOpenUserHandbook);
     connect_menu(ui->action_Restart, &MainWindow::OnRestartGame);
+    action_prepare_shaders_now = new QAction(tr("Prepare &Shaders Now"), this);
+    action_prepare_shaders_now->setEnabled(false);
+    ui->menu_Emulation->insertAction(ui->action_Configure, action_prepare_shaders_now);
+    ui->menu_Emulation->insertSeparator(ui->action_Configure);
+    connect_menu(action_prepare_shaders_now, &MainWindow::OnPrepareShadersNow);
     connect_menu(ui->action_Configure, &MainWindow::OnConfigure);
     connect_menu(ui->action_Configure_Current_Game, &MainWindow::OnConfigurePerGame);
 
@@ -1839,6 +1854,9 @@ void MainWindow::UpdateMenuState() {
 
     for (QAction* action : running_actions) {
         action->setEnabled(emulation_running);
+    }
+    if (action_prepare_shaders_now) {
+        action_prepare_shaders_now->setEnabled(emulation_running);
     }
 
     ui->action_Firmware_From_Folder->setEnabled(!emulation_running);
@@ -2080,6 +2098,14 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         QMessageBox::information(this, tr("Conversion in Progress"),
                                  tr("This game cannot be started while its dump is being "
                                     "converted."));
+        return;
+    }
+    if (shader_warm_dialog && shader_warm_dialog->IsRunning()) {
+        QMessageBox::information(this, tr("Shader Warm-up in Progress"),
+                                 tr("Games cannot be started while the shader warm-up is being "
+                                    "prepared. Wait for it to finish or cancel it."));
+        shader_warm_dialog->raise();
+        shader_warm_dialog->activateWindow();
         return;
     }
     if (boot_in_progress || close_pending) {
@@ -2340,6 +2366,10 @@ bool MainWindow::OnShutdownBegin() {
         return false;
     }
 
+    if (shader_warm_run_dialog) {
+        shader_warm_run_dialog->close();
+    }
+
     if (ui->action_Fullscreen->isChecked()) {
         HideFullscreen();
     }
@@ -2483,6 +2513,7 @@ void MainWindow::OnEmulationStopped() {
 
     // Disable status bar updates
     status_bar_update_timer.stop();
+    shader_warm_label->setVisible(false);
     shader_building_label->setVisible(false);
     res_scale_label->setVisible(false);
     emu_speed_label->setVisible(false);
@@ -4387,6 +4418,164 @@ void MainWindow::OnGameListConvertToNup(const std::string& game_path) {
     }));
 }
 
+void MainWindow::OnGameListPrepareShaderWarm(u64 program_id, const std::string& game_path) {
+    if (shader_warm_dialog) {
+        if (shader_warm_dialog->IsRunning()) {
+            shader_warm_dialog->raise();
+            shader_warm_dialog->activateWindow();
+            return;
+        }
+        shader_warm_dialog->close();
+    }
+    if (QtCommon::emu_thread != nullptr) {
+        QMessageBox::information(this, tr("Prepare Shaders"),
+                                 tr("Close the running game first."));
+        return;
+    }
+    if (nup_running && game_path == nup_source_path) {
+        QMessageBox::information(this, tr("Prepare Shaders"),
+                                 tr("This game is being converted. Try again when it is done."));
+        return;
+    }
+
+    const auto path = std::filesystem::path{std::u8string{game_path.begin(), game_path.end()}};
+    QString name;
+    if (const auto loader = Loader::GetLoader(
+            *QtCommon::system, QtCommon::vfs->OpenFile(game_path, FileSys::OpenMode::Read))) {
+        std::string title;
+        if (loader->ReadTitle(title) == Loader::ResultStatus::Success) {
+            name = QString::fromStdString(title);
+        }
+    }
+    if (name.isEmpty()) {
+        name = QFileInfo(QString::fromStdString(game_path)).completeBaseName();
+    }
+
+    shader_warm_dialog = new ShaderWarmDialog(*QtCommon::system, path, program_id, name, this);
+    connect(shader_warm_dialog, &QDialog::finished, shader_warm_dialog, &QObject::deleteLater);
+    shader_warm_dialog->show();
+    shader_warm_dialog->Start();
+}
+
+void MainWindow::OnGameListDeleteShaderWarm(u64 program_id) {
+    if (shader_warm_dialog && shader_warm_dialog->IsRunning() &&
+        shader_warm_dialog->TitleId() == program_id) {
+        // The builder writes this title's files: deleting them under it would lose the result or
+        // fail it. Other titles' files are in their own folders.
+        QMessageBox::information(this, tr("Delete Shader Warm-up"),
+                                 tr("Shaders are being prepared. Try again when it is done."));
+        shader_warm_dialog->raise();
+        shader_warm_dialog->activateWindow();
+        return;
+    }
+    if (QMessageBox::question(this, tr("Delete Shader Warm-up"),
+                              tr("Delete the shader warm-up files of this game? You can prepare "
+                                 "them again at any time."),
+                              QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) {
+        return;
+    }
+    std::string error;
+    if (!DeleteShaderWarmFiles(program_id, error)) {
+        QMessageBox::critical(this, tr("Delete Shader Warm-up"),
+                              tr("The files could not be deleted: %1")
+                                  .arg(QString::fromStdString(error)));
+    }
+}
+
+void MainWindow::OnPrepareShadersNow() {
+    if (!emulation_running || !QtCommon::system->IsPoweredOn()) {
+        return;
+    }
+    if (shader_warm_run_dialog) {
+        shader_warm_run_dialog->show();
+        shader_warm_run_dialog->raise();
+        shader_warm_run_dialog->activateWindow();
+        return;
+    }
+    auto& notify = QtCommon::system->GPU().ShaderNotify();
+    if (!notify.WarmActive()) {
+        QMessageBox::information(
+            this, tr("Prepare Shaders Now"),
+            tr("This game has no shader warm-up left to build.\n\nTo make one, close the game, "
+               "right-click it in the game list and choose Prepare shaders (warm-up). A warm-up "
+               "that ran to the end runs again only after a driver update."));
+        return;
+    }
+    // Started from the menu: it builds while the game runs, until it is done or stopped.
+    notify.SetWarmRequested(true);
+
+    auto* dialog = new QProgressDialog(this);
+    dialog->setWindowTitle(tr("Prepare Shaders Now"));
+    dialog->setCancelButtonText(tr("Stop"));
+    dialog->setRange(0, 0);
+    dialog->setMinimumDuration(0);
+    dialog->setAutoClose(false);
+    dialog->setAutoReset(false);
+    dialog->setWindowModality(Qt::NonModal);
+    dialog->setMinimumWidth(460);
+    auto* label = new QLabel(dialog);
+    label->setWordWrap(true);
+    dialog->setLabel(label);
+    shader_warm_run_dialog = dialog;
+
+    const QString note =
+        tr("The game keeps running and can stutter or slow down until this is done; pausing it "
+           "makes this faster. Stop keeps what is built: the rest builds while the game is "
+           "paused, or the next time you start this.");
+    const QString tip = TakeShaderCacheTip();
+    auto* timer = new QTimer(dialog);
+    const auto finish = [this, dialog, timer] {
+        timer->stop();
+        if (emulation_running && QtCommon::system->IsPoweredOn()) {
+            QtCommon::system->GPU().ShaderNotify().SetWarmRequested(false);
+        }
+        dialog->deleteLater();
+    };
+    const auto update = [this, dialog, timer, note, tip] {
+        if (!emulation_running || !QtCommon::system->IsPoweredOn() ||
+            QtCommon::system->IsShuttingDown()) {
+            dialog->close();
+            return;
+        }
+        auto& shader_notify = QtCommon::system->GPU().ShaderNotify();
+        QString text;
+        if (!shader_notify.WarmActive()) {
+            timer->stop();
+            shader_notify.SetWarmRequested(false);
+            dialog->setRange(0, 1);
+            dialog->setValue(1);
+            dialog->setCancelButtonText(tr("Close"));
+            text = tr("Shaders are ready.");
+        } else {
+            const auto warm = shader_notify.GetWarmProgress();
+            const auto done = static_cast<qulonglong>(warm.done);
+            const auto total = static_cast<qulonglong>(warm.total);
+            text = warm.kind == 1   ? tr("Building compute shaders")
+                   : warm.kind == 2 ? tr("Building graphics shaders")
+                                    : tr("Starting");
+            if (warm.kind != 0 && total > 0) {
+                text += QStringLiteral(": ") + tr("%L1 / %L2").arg(done).arg(total);
+                dialog->setRange(0, 1000);
+                dialog->setValue(static_cast<int>((std::min<qulonglong>)(done * 1000 / total, 1000)));
+            } else {
+                dialog->setRange(0, 0);
+            }
+            text += QStringLiteral("\n\n") + note;
+        }
+        if (!tip.isEmpty()) {
+            text += QStringLiteral("\n\n") + tip;
+        }
+        dialog->setLabelText(text);
+    };
+    // Stop, Close, the window's close button and Escape all end it.
+    connect(dialog, &QProgressDialog::canceled, this, finish);
+    connect(dialog, &QDialog::rejected, this, finish);
+    connect(timer, &QTimer::timeout, dialog, update);
+    update();
+    timer->start(250);
+    dialog->show();
+}
+
 void MainWindow::OnGameListExtractNup(const std::string& game_path) {
     if (nup_running) {
         return;
@@ -4956,6 +5145,32 @@ void MainWindow::UpdateStatusBar() {
         shader_building_label->setVisible(true);
     } else {
         shader_building_label->setVisible(false);
+    }
+
+    const auto warm = shader_notify.GetWarmProgress();
+    if (warm.kind == 1 || warm.kind == 2) {
+        const auto done = static_cast<qulonglong>(warm.done);
+        const auto total = static_cast<qulonglong>(warm.total);
+        QString text;
+        if (warm.kind == 1) {
+            text = total > 0 ? tr("Shader warm-up: compute %L1 / %L2").arg(done).arg(total)
+                             : tr("Shader warm-up: compute %L1").arg(done);
+        } else if (total > 0) {
+            const int percent = static_cast<int>((std::min<qulonglong>)(done * 100 / total, 100));
+            text = tr("Shader warm-up: graphics %L1 / %L2 (%3%)")
+                       .arg(done)
+                       .arg(total)
+                       .arg(percent);
+        } else {
+            text = tr("Shader warm-up: graphics %L1").arg(done);
+        }
+        if (!shader_notify.WarmMayBuild()) {
+            text += QLatin1Char(' ') + tr("(waits while you play)");
+        }
+        shader_warm_label->setText(text);
+        shader_warm_label->setVisible(true);
+    } else {
+        shader_warm_label->setVisible(false);
     }
 
     const auto res_info = Settings::values.resolution_info;

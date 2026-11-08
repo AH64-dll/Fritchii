@@ -333,6 +333,11 @@ public:
         return properties.properties.driverVersion;
     }
 
+    /// Returns the PCI device ID of the physical device.
+    u32 GetDeviceID() const {
+        return properties.properties.deviceID;
+    }
+
     /// Returns the device name.
     std::string_view GetModelName() const {
         return properties.properties.deviceName;

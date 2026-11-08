@@ -494,12 +494,25 @@ GraphicsPipeline::GraphicsPipeline(
             const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
             Validate();
             if (library_cache) {
+                const bool has_module = std::ranges::any_of(
+                    spv_modules, [](const vk::ShaderModule& module) { return bool(module); });
                 bool made{};
                 try {
                     made = MakeLibraryPipeline(render_pass);
                 } catch (const vk::Exception& exception) {
+                    if (libraries_only) {
+                        // Warm-up: counted by the warm-up and logged once at its end.
+                        LOG_DEBUG(Render_Vulkan, "Nx2Perf gpl: warm {:016x} linking failed: {}",
+                                  key.Hash(), exception.what());
+                        throw;
+                    }
                     LOG_ERROR(Render_Vulkan, "Nx2Perf gpl: pipeline {:016x} linking failed: {}",
                               key.Hash(), exception.what());
+                }
+                if (!made && libraries_only && has_module) {
+                    // A warm-up build whose library the driver did not make: reported as a
+                    // failed build (Failed()), not counted as built.
+                    throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
                 }
                 if (!made && !libraries_only) {
                     library_cache->RecordFallback();
@@ -513,9 +526,21 @@ GraphicsPipeline::GraphicsPipeline(
                 MakePipeline(render_pass);
             }
         } catch (const Shader::Exception& exception) {
-            LOG_ERROR(Render_Vulkan, "Graphics pipeline {:016x}: {}", key.Hash(), exception.what());
+            if (libraries_only) {
+                LOG_DEBUG(Render_Vulkan, "Warm graphics pipeline {:016x}: {}", key.Hash(),
+                          exception.what());
+            } else {
+                LOG_ERROR(Render_Vulkan, "Graphics pipeline {:016x}: {}", key.Hash(),
+                          exception.what());
+            }
             throw;
         } catch (const vk::Exception& exception) {
+            if (libraries_only) {
+                // Warm-up guesses the driver refuses: counted by the warm-up, logged at its end.
+                LOG_DEBUG(Render_Vulkan, "Warm graphics pipeline {:016x} build failed: {}",
+                          key.Hash(), exception.what());
+                throw;
+            }
             LOG_CRITICAL(Render_Vulkan,
                          "Graphics pipeline build failed: {} (stages: tcs={} tes={} geom={}, "
                          "patch control points {}, device max patch size {})",

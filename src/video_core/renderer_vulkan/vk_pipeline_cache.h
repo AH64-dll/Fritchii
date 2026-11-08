@@ -15,6 +15,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
+#include <stop_token>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <type_traits>
@@ -139,17 +141,22 @@ public:
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 
+    /// What a graphics warm-up entry came to: built, not buildable (a guess the translation
+    /// rejects, which another warm-up would reject too), or refused by the driver.
+    enum class WarmResult { Built, Unbuildable, DriverFailed };
+
     /// Graphics pipeline libraries (EDEN_NX2_GPL): builds the pre-rasterization and fragment
     /// shader libraries of the pipeline `key` would make, on the calling thread, with no draw and
-    /// no pipeline kept (for a warm-up). `pools` must be the calling thread's own. False when the
-    /// device has no libraries, the pipeline takes the monolithic route, or a build failed.
+    /// no pipeline kept (for a warm-up). `pools` must be the calling thread's own. Unbuildable
+    /// when the device has no libraries or the pipeline takes the monolithic route, DriverFailed
+    /// when a library build failed.
     /// The key may hold a single stage (no partner): a vertex-only key builds just that vertex
     /// program's pre-rasterization library (vertex SPIR-V does not depend on the fragment
     /// stage); a fragment-only key builds just the fragment library, emitted as if the partner
     /// writes every varying (the common variant). The key's state (attribute types, render
     /// target formats, depth and raster state) is what the libraries are keyed and built with.
-    bool WarmGraphicsLibraries(ShaderPools& pools, const GraphicsPipelineCacheKey& key,
-                               std::span<Shader::Environment* const> envs);
+    WarmResult WarmGraphicsLibraries(ShaderPools& pools, const GraphicsPipelineCacheKey& key,
+                                     std::span<Shader::Environment* const> envs);
 
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
@@ -220,7 +227,7 @@ private:
                                                      const ComputePipelineCacheKey& key,
                                                      Shader::Environment& env,
                                                      PipelineStatistics* statistics,
-                                                     bool build_in_parallel);
+                                                     bool build_in_parallel, bool warm = false);
 
     void SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                       const vk::PipelineCache& pipeline_cache, u32 cache_version);
@@ -229,6 +236,38 @@ private:
                                               u32 expected_cache_version);
 
     void QueueVulkanPipelineCacheFlush();
+
+    /// The title's warm-compute.bin (ShaderWarm::ComputeWarmPath, EDEN_NX2_COMPUTE_WARM=<file>
+    /// overrides): compute programs prepared from the game files are converted (missing reads
+    /// guessed) and built in the background, then thrown away. Nothing uses them; they only fill
+    /// the driver's shader cache, so a dispatch that later converts to the same SPIR-V finds the
+    /// driver build ready instead of waiting seconds for it.
+    void StartComputeWarm(u64 title_id);
+    std::vector<std::jthread> compute_warm_threads;
+    std::atomic<bool> compute_warm_done{true};
+
+    /// The title's warm-graphics.bin (ShaderWarm::GraphicsWarmPath, EDEN_NX2_GRAPHICS_WARM=<file>
+    /// overrides; needs graphics pipeline libraries): vertex and fragment programs prepared from
+    /// the game files are built as single-stage libraries in the background after the compute
+    /// warm-up, then released; the driver's disk cache keeps them, so a later pipeline with those
+    /// stages costs a link.
+    void StartGraphicsWarm(u64 title_id);
+    std::vector<std::jthread> graphics_warm_threads;
+
+    /// Set as soon as emulation is asked to stop (the loading stop token): the warm-ups end
+    /// after their current build instead of compiling on until the cache is destroyed, which
+    /// kept shutdown waiting on driver compiles.
+    std::atomic<bool> warm_cancel{false};
+    std::unique_ptr<std::stop_callback<std::function<void()>>> warm_stop_callback;
+
+    /// Waits until the warm-up may build (ShaderNotify::WarmMayBuild). False when it is to stop.
+    bool WaitForWarmTurn(std::stop_token stop);
+
+    /// The pipeline cache warm-up builds go through: none by default, so the tens of thousands
+    /// of warm-up programs stay in the driver's disk cache and out of vulkan_pipelines.bin (which
+    /// is loaded into memory at every boot). EDEN_NX2_WARM_APP_CACHE=1 uses ours.
+    [[nodiscard]] vk::PipelineCache& WarmPipelineCache();
+    vk::PipelineCache no_pipeline_cache;
 
     const Device& device;
     Scheduler& scheduler;

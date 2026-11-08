@@ -1194,6 +1194,37 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
     is_proprietary_driver = texture_bound == 2 || Shader::Ampere::HasNativeAddressMap(code);
 }
 
+bool FileEnvironment::RecordFits(std::ifstream& file, u64 bytes_left) {
+    // Code size and the five table counts, then seven u32 fields (see Deserialize).
+    std::array<u64, 6> counts{};
+    constexpr u64 HeaderSize = sizeof(counts) + 7 * sizeof(u32);
+    if (bytes_left < HeaderSize) {
+        return false;
+    }
+    const auto start = file.tellg();
+    file.read(reinterpret_cast<char*>(counts.data()), sizeof(counts));
+    file.seekg(start);
+    // Bytes per unit of each count: code bytes, then one table entry (key and value).
+    constexpr std::array<u64, 6> UnitSizes{
+        1,
+        sizeof(u32) + sizeof(Shader::TextureType),
+        sizeof(u32) + sizeof(Shader::TexturePixelFormat),
+        sizeof(u64) + sizeof(u32),
+        sizeof(u64) + sizeof(u8),
+        sizeof(u64) + sizeof(Shader::ReplaceConstant),
+    };
+    const u64 left = bytes_left - HeaderSize;
+    u64 body = 0;
+    for (size_t i = 0; i < counts.size(); ++i) {
+        // Each count alone at most `left` first, so the sum below cannot overflow.
+        if (counts[i] > left) {
+            return false;
+        }
+        body += counts[i] * UnitSizes[i];
+    }
+    return body <= left;
+}
+
 void FileEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
     DumpImpl(pipeline_hash, shader_hash, code, read_highest, read_lowest, initial_offset, stage);
 }
@@ -1220,6 +1251,9 @@ std::vector<u64> FileEnvironment::MappedStoragePointerKeys() const {
 bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
     const auto it = storage_pointer_types.find(MakeCbufKey(index, offset));
     if (it == storage_pointer_types.end()) {
+        if (guess) {
+            return index == 0 ? guess->storage_pointer_bank0 : guess->storage_pointer_other;
+        }
         throw Shader::LogicError("Uncached storage pointer classification c{}[{:#x}]", index,
                                  offset);
     }
@@ -1229,6 +1263,9 @@ bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
 bool FileEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
     const auto it = storage_pointer_types.find(MakeIndirectCbufKey(index, offset, indirect));
     if (it == storage_pointer_types.end()) {
+        if (guess) {
+            return index == 0 ? guess->storage_pointer_bank0 : guess->storage_pointer_other;
+        }
         throw Shader::LogicError("Uncached storage pointer table classification c{}[{:#x}]+{:#x}",
                                  index, offset, indirect);
     }
@@ -1245,6 +1282,9 @@ u64 FileEnvironment::ReadInstruction(u32 address) {
 u32 FileEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
     const auto it{cbuf_values.find(MakeCbufKey(cbuf_index, cbuf_offset))};
     if (it == cbuf_values.end()) {
+        if (guess) {
+            return cbuf_index == 0 ? guess->cbuf_bank0 : guess->cbuf_other;
+        }
         throw Shader::LogicError("Uncached read texture type");
     }
     return it->second;
@@ -1253,6 +1293,9 @@ u32 FileEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
 Shader::TextureType FileEnvironment::ReadTextureType(u32 handle) {
     const auto it{texture_types.find(handle)};
     if (it == texture_types.end()) {
+        if (guess) {
+            return guess->texture_type;
+        }
         throw Shader::LogicError("Uncached read texture type");
     }
     return it->second;
@@ -1261,6 +1304,9 @@ Shader::TextureType FileEnvironment::ReadTextureType(u32 handle) {
 Shader::TexturePixelFormat FileEnvironment::ReadTexturePixelFormat(u32 handle) {
     const auto it{texture_pixel_formats.find(handle)};
     if (it == texture_pixel_formats.end()) {
+        if (guess) {
+            return guess->pixel_format;
+        }
         throw Shader::LogicError("Uncached read texture pixel format");
     }
     return it->second;

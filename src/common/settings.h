@@ -632,6 +632,17 @@ struct Values {
     SwitchableSetting<bool> use_graphics_pipeline_library{
         linkage, true, "use_graphics_pipeline_library", Category::RendererAdvanced};
 
+    // Threads of the shader warm-up (compute and graphics, each). EDEN_NX2_WARM_THREADS overrides.
+    SwitchableSetting<u32, true> shader_warm_threads{linkage,
+                                                     4,
+                                                     1,
+                                                     32,
+                                                     "shader_warm_threads",
+                                                     Category::RendererAdvanced,
+                                                     Specialization::Countable,
+                                                     true,
+                                                     true};
+
     SwitchableSetting<bool> enable_compute_pipelines{linkage, false, "enable_compute_pipelines",
                                                      Category::RendererAdvanced};
 

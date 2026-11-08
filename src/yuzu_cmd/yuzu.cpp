@@ -56,6 +56,7 @@
 #include "video_core/gpu.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
+#include "video_core/shader_warm/shader_warm_builder.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3.h"
 #ifdef HAS_OPENGL
 #include "yuzu_cmd/emu_window/emu_window_sdl3_gl.h"
@@ -478,6 +479,87 @@ static bool EditNup(const Core::LaunchParams& lp) {
     }
 }
 
+/// Hidden test hook (not in --help): builds a game's shader warm-up files without booting it.
+///   yuzu-cmd --build-warm <game file> <title id hex> <output dir> [--defaults | cache ...]
+/// With pipeline cache files, the draw state guesses come from them; --defaults uses the
+/// built-in guesses; neither uses the title's own pipeline cache when it exists.
+static bool BuildWarm(Core::System& system, int argc, char** argv) {
+    namespace ShaderWarm = VideoCommon::ShaderWarm;
+    if (argc < 5) {
+        fmt::print(stderr, "usage: --build-warm <game> <title id> <output dir> [--defaults | cache ...]\n");
+        return false;
+    }
+    system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
+    system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
+    const u64 title_id = std::strtoull(argv[3], nullptr, 16);
+    ShaderWarm::BuildOptions options;
+    options.output_dir = Common::FS::ToU8String(argv[4]);
+    std::vector<std::filesystem::path> caches;
+    bool defaults = false;
+    for (int i = 5; i < argc; ++i) {
+        if (std::string_view{argv[i]} == "--defaults") {
+            defaults = true;
+        } else {
+            caches.emplace_back(Common::FS::ToU8String(argv[i]));
+        }
+    }
+    if (defaults || !caches.empty()) {
+        options.runtime_caches = caches;
+    }
+    std::string last_stage;
+    auto last_print = std::chrono::steady_clock::now();
+    const auto begin = last_print;
+    const auto on_progress = [&](const ShaderWarm::Progress& progress) {
+        const auto now = std::chrono::steady_clock::now();
+        if (progress.stage == last_stage && now - last_print < std::chrono::seconds{5}) {
+            return;
+        }
+        last_stage = progress.stage;
+        last_print = now;
+        fmt::print("{:7.1f} s  {}: {} / {}\n",
+                   std::chrono::duration<double>(now - begin).count(), progress.stage,
+                   progress.done, progress.total);
+        std::fflush(stdout);
+    };
+    const auto result = ShaderWarm::BuildWarmFilesWith(
+        system, Common::FS::ToU8String(argv[2]), title_id, options, on_progress, {});
+    // The error can hold a Windows path: escape it so the summary stays valid JSON.
+    std::string error;
+    for (const char c : result.error) {
+        switch (c) {
+        case '"':
+            error += "\\\"";
+            break;
+        case '\\':
+            error += "\\\\";
+            break;
+        case '\n':
+            error += "\\n";
+            break;
+        case '\r':
+            error += "\\r";
+            break;
+        case '\t':
+            error += "\\t";
+            break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+                error += fmt::format("\\u{:04x}", static_cast<unsigned>(c));
+            } else {
+                error += c;
+            }
+            break;
+        }
+    }
+    fmt::print("{{\"ok\": {}, \"error\": \"{}\", \"compute\": {}, \"vertex\": {}, "
+               "\"fragment\": {}, \"skipped\": {}, \"seconds\": {:.1f}}}\n",
+               result.ok, error, result.compute_programs, result.vertex_programs,
+               result.fragment_programs, result.skipped,
+               std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+    std::fflush(stdout);
+    return result.ok;
+}
+
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #ifdef _WIN32
     SetUnhandledExceptionFilter(WriteCrashDump);
@@ -507,6 +589,10 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(true);
     Common::Log::Start();
+
+    if (argc > 1 && std::string_view{argv[1]} == "--build-warm") {
+        return BuildWarm(state->system, argc, argv) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    }
 
     int option_index = 0;
 #ifdef _WIN32

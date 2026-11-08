@@ -22,7 +22,13 @@ double Ms(u64 ns) {
 }
 
 constexpr std::array<const char*, 2> PART_NAMES{"pre-rasterization", "fragment"};
+
+thread_local bool no_retain_on_thread = false;
 } // Anonymous namespace
+
+void GraphicsPipelineLibraryCache::SetNoRetainOnThisThread(bool no_retain) noexcept {
+    no_retain_on_thread = no_retain;
+}
 
 bool GplOptimizeEnabled() {
     static const bool enabled = [] {
@@ -95,7 +101,42 @@ std::shared_ptr<const GplLibrary> GraphicsPipelineLibraryCache::GetOrCreate(
         entry->done = true;
     }
     entry->condition.notify_all();
+    if (no_retain_on_thread) {
+        // Threads already waiting on the entry hold it; later lookups build again, which the
+        // driver's disk cache answers in about a millisecond.
+        std::scoped_lock lock{mutex};
+        if (const auto it = entries.find(key); it != entries.end() && it->second == entry) {
+            entries.erase(it);
+        }
+    }
     return library;
+}
+
+void GraphicsPipelineLibraryCache::TrimUnused(size_t max_entries) {
+    std::scoped_lock lock{mutex};
+    if (entries.size() <= max_entries) {
+        return;
+    }
+    size_t trimmed = 0;
+    for (auto it = entries.begin(); it != entries.end() && entries.size() > max_entries;) {
+        Entry& entry = *it->second;
+        bool unused = false;
+        {
+            std::scoped_lock entry_lock{entry.mutex};
+            // Failed keys stay (they are not retried); a library only the map holds is unused.
+            unused = entry.done && entry.library && entry.library.use_count() == 1;
+        }
+        if (unused) {
+            it = entries.erase(it);
+            ++trimmed;
+        } else {
+            ++it;
+        }
+    }
+    if (trimmed != 0) {
+        LOG_INFO(Render_Vulkan, "Nx2Perf gpl: {} unused libraries released, {} left", trimmed,
+                 entries.size());
+    }
 }
 
 void GraphicsPipelineLibraryCache::RecordLink(bool optimized, std::chrono::nanoseconds time) {
