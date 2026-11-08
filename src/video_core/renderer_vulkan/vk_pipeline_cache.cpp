@@ -3795,7 +3795,11 @@ int AsyncDiscardMode() {
     // Read on first use (the first missing pipeline), after nx2_switches.txt was applied.
     static const int mode = [] {
         const char* value = std::getenv("EDEN_NX2_ASYNC_DISCARD");
-        const int parsed = value == nullptr ? 1 : value[0] == '0' ? 0 : value[0] == '2' ? 2 : 1;
+        // 2 by default since 2026-11-08: with an empty shader cache, mode 1 dropped draws into
+        // render-once layers for good (no "Press Start", empty NPC chat bubbles, wrong lighting);
+        // with 2 the owner saw perfect lighting and every text, only shader-compile stutter. A warm
+        // cache is unchanged. EDEN_NX2_ASYNC_DISCARD=1 restores the legacy rule.
+        const int parsed = value == nullptr ? 2 : value[0] == '0' ? 0 : value[0] == '1' ? 1 : 2;
         static constexpr std::array<const char*, 3> what{
             "wait for every unbuilt pipeline",
             "skip unbuilt pipelines by the legacy heuristic",
