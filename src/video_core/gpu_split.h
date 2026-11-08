@@ -806,6 +806,19 @@ public:
     /// after that release, so an acquire it meets needs no drain. EDEN_NX2_ACQUIRE_QUEUED=0 off.
     /// `miss` (when no payload): 1 no release recorded, 2 it already ran, 3 a later write.
     std::optional<u32> QueuedReleasePayload(u64 device, GPUVAddr address, u32* miss = nullptr);
+    /// EDEN_NX2_ACQUIRE_PRECHECK=2's reset check (puller.cpp PrecheckAudit): the payload of the
+    /// newest release recorded for the u32 at `device` (NoteRelease) while the back has not run
+    /// it (its ring position is past `done`), whatever was sent after it (unlike
+    /// QueuedReleasePayload); `position` gets that ring position. queued_releases keeps one
+    /// release per slot: a newer release to another word in the same slot hides it.
+    [[nodiscard]] std::optional<u32> QueuedReleaseTo(u64 device, u64 done, u64& position) const {
+        const QueuedRelease& release = queued_releases[(device >> 2) % queued_releases.size()];
+        if (release.device != device || release.position == 0 || release.position <= done) {
+            return std::nullopt;
+        }
+        position = release.position;
+        return release.payload;
+    }
     /// EXP12: the ring position past the queued work that may write the u32 at `device` without
     /// the front knowing its words, so a semaphore read that waits for or overlays the noted
     /// writes (EDEN_NX2_SEM_FAST) can't account for it: compute and copies (their QMD and report
