@@ -19,7 +19,10 @@ namespace VideoCommon {
     static const int mode = [] {
         const char* const value = std::getenv("EDEN_NX2_ASYNC_TRANSLATE");
         if (value == nullptr) {
-            return 0;
+            // 1 by default since 2026-11-08: verify mode 362 compared, 0 differ, no invalid SPIR-V
+            // under the validation layer; empty-cache walk: GPU-thread pipeline time 7.5 -> 4.4 s,
+            // frames over 50 ms 77 -> 64. EDEN_NX2_ASYNC_TRANSLATE=0 translates on the GPU thread.
+            return 1;
         }
         const int parsed = std::atoi(value);
         return parsed >= 0 && parsed <= 3 ? parsed : 0;
