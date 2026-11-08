@@ -1082,6 +1082,74 @@ bool PreloadAllPipelines() {
     }();
     return all;
 }
+
+/// Memory log (LogMemoryUse): builds of disk cache records queued (at boot or in the background)
+/// and not done yet, the builds done, and the file bytes of the records the queued builds hold in
+/// memory. Globals, as a build dropped at shutdown can end after the cache's members.
+std::atomic<size_t> g_prebuild_pending{};
+std::atomic<size_t> g_prebuild_done{};
+std::atomic<u64> g_prebuild_held_bytes{};
+/// When the last LoadDiskResources began, for the prebuild times.
+std::chrono::steady_clock::time_point g_disk_load_start{};
+
+/// Held by a queued build of disk cache records: counts the build as pending and its records'
+/// bytes as held until the build is done or dropped (the task holding it is destroyed).
+class PrebuildTicket {
+public:
+    explicit PrebuildTicket(u64 bytes_) : bytes{bytes_} {
+        g_prebuild_pending.fetch_add(1, std::memory_order_relaxed);
+        g_prebuild_held_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    PrebuildTicket(PrebuildTicket&& other) noexcept
+        : bytes{std::exchange(other.bytes, 0)}, live{std::exchange(other.live, false)} {}
+    PrebuildTicket& operator=(PrebuildTicket&&) = delete;
+    PrebuildTicket(const PrebuildTicket&) = delete;
+    PrebuildTicket& operator=(const PrebuildTicket&) = delete;
+    ~PrebuildTicket() {
+        if (live) {
+            g_prebuild_pending.fetch_sub(1, std::memory_order_relaxed);
+            g_prebuild_held_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+        }
+    }
+    /// Records read later and held from then on (EDEN_NX2_PREBUILD_STREAM): released with the rest.
+    void Adopt(u64 more) noexcept {
+        bytes += more;
+    }
+    void Done() noexcept {
+        g_prebuild_done.fetch_add(1, std::memory_order_relaxed);
+    }
+
+private:
+    u64 bytes;
+    bool live{true};
+};
+
+/// One line every 10 s: this process's working set and commit, the system's commit, and what
+/// the disk cache prebuild still holds. One GetProcessMemoryInfo and one GlobalMemoryStatusEx.
+void LogMemoryUse() {
+    constexpr double MiB = 1024.0 * 1024.0;
+    constexpr double GiB = MiB * 1024.0;
+    const Common::ProcessMemoryUsage usage = Common::GetProcessMemoryUsage();
+    LOG_INFO(Render_Vulkan,
+             "Memory: working set {:.0f} MiB (peak {:.0f}), private commit {:.0f} MiB (peak "
+             "{:.0f}), system commit {:.1f} of {:.1f} GiB, {:.1f} GiB RAM free; prebuild {} "
+             "builds queued, {} done, {:.0f} MiB of records held",
+             static_cast<double>(usage.working_set) / MiB,
+             static_cast<double>(usage.peak_working_set) / MiB,
+             static_cast<double>(usage.private_bytes) / MiB,
+             static_cast<double>(usage.peak_private_bytes) / MiB,
+             static_cast<double>(usage.system_commit) / GiB,
+             static_cast<double>(usage.system_commit_limit) / GiB,
+             static_cast<double>(usage.available_physical) / GiB,
+             g_prebuild_pending.load(std::memory_order_relaxed),
+             g_prebuild_done.load(std::memory_order_relaxed),
+             static_cast<double>(g_prebuild_held_bytes.load(std::memory_order_relaxed)) / MiB);
+}
+
+double SecondsSinceDiskLoad() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_disk_load_start)
+        .count();
+}
 } // Anonymous namespace
 
 namespace {
@@ -1670,6 +1738,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     if (title_id == 0) {
         return;
     }
+    g_disk_load_start = std::chrono::steady_clock::now();
     if (!pipeline_cache_filename.empty()) {
         // A later load (another title or program) stops the earlier warm-ups and waits for them,
         // so StartComputeWarm and StartGraphicsWarm can start this title's and warm_cancel is
@@ -1731,7 +1800,16 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     size_t skipped_pipelines = 0;
     size_t queued_graphics = 0;
     using GraphicsRecords = std::vector<std::vector<FileEnvironment>>;
-    std::vector<std::pair<GraphicsPipelineCacheKey, GraphicsRecords>> deferred_graphics;
+    /// The records of one pipeline and their size in the file (for the memory log).
+    struct DiskRecords {
+        GraphicsRecords envs;
+        u64 bytes{};
+    };
+    struct ComputeCandidates {
+        std::vector<FileEnvironment> envs;
+        u64 bytes{};
+    };
+    std::vector<std::pair<GraphicsPipelineCacheKey, DiskRecords>> deferred_graphics;
     // Keys of graphics pipelines only another driver stored (see load_graphics).
     std::unordered_set<u64> rekeyed_pipelines;
     std::unordered_set<u64> native_pipelines;
@@ -1755,11 +1833,20 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     // A rebuilt translation is cached beside the stale one. Choose between them before building, so
     // loading only ever adds entries (see OrderComputeTranslations), and take the next when a
     // translation fails.
-    ::Common::unordered_map<ComputePipelineCacheKey, std::vector<FileEnvironment>> compute_envs;
+    ::Common::unordered_map<ComputePipelineCacheKey, ComputeCandidates> compute_envs;
     // The same for graphics: a pipeline whose record failed to load is stored again when the GPU
     // thread builds it, and its records are tried newest first.
-    std::vector<std::pair<GraphicsPipelineCacheKey, GraphicsRecords>> graphics_records;
+    std::vector<std::pair<GraphicsPipelineCacheKey, DiskRecords>> graphics_records;
     ::Common::unordered_map<GraphicsPipelineCacheKey, size_t> graphics_record_index;
+    // Each record's size in the file: records follow the header (magic and version, 12 bytes)
+    // back to back, and both loaders end at the record's end (after its key).
+    std::streamoff record_begin = 12;
+    const auto record_bytes{[&record_begin](std::ifstream& file) {
+        const std::streamoff end = file.tellg();
+        const u64 bytes = static_cast<u64>(end - record_begin);
+        record_begin = end;
+        return bytes;
+    }};
 
     if (device.IsKhrPipelineExecutablePropertiesEnabled()) {
         state.statistics = std::make_unique<PipelineStatistics>(device);
@@ -1767,12 +1854,16 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
         ComputePipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
-        compute_envs[key].push_back(std::move(env));
+        const u64 bytes = record_bytes(file);
+        ComputeCandidates& candidates = compute_envs[key];
+        candidates.envs.push_back(std::move(env));
+        candidates.bytes += bytes;
     }};
     const auto queue_compute{[&](const ComputePipelineCacheKey& key,
-                                 std::vector<FileEnvironment> candidates) {
-        workers.QueueWork([this, key, envs_ = std::move(candidates), &state,
-                           &callback]() mutable {
+                                 ComputeCandidates candidates) {
+        PrebuildTicket ticket{candidates.bytes};
+        workers.QueueWork([this, key, envs_ = std::move(candidates.envs),
+                           ticket_ = std::move(ticket), &state, &callback]() mutable {
             ShaderPools pools;
             ComputePipelineCacheEntry entry;
             for (auto& env : envs_) {
@@ -1782,6 +1873,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                     break;
                 }
             }
+            ticket_.Done();
             std::scoped_lock lock{state.mutex};
             if (entry.pipeline) {
                 compute_cache.emplace(key, std::move(entry));
@@ -1796,6 +1888,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
+        const u64 bytes = record_bytes(file);
 
         // Task/mesh pipelines carry their mesh registers since this format stored them (no
         // earlier record of this cache version holds one).
@@ -1874,11 +1967,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         (foreign ? rekeyed_pipelines : native_pipelines).insert(key.Hash());
         const auto [it, inserted] = graphics_record_index.try_emplace(key, graphics_records.size());
         if (inserted) {
-            graphics_records.emplace_back(key, GraphicsRecords{});
+            graphics_records.emplace_back(key, DiskRecords{});
         }
-        graphics_records[it->second].second.push_back(std::move(envs));
+        DiskRecords& records = graphics_records[it->second].second;
+        records.envs.push_back(std::move(envs));
+        records.bytes += bytes;
     }};
-    const auto queue_graphics{[&](const GraphicsPipelineCacheKey& key, GraphicsRecords records) {
+    const auto queue_graphics{[&](const GraphicsPipelineCacheKey& key, DiskRecords records) {
         const u64 hash = key.Hash();
         disk_pipelines.insert(hash);
         if (!PreloadAllPipelines() &&
@@ -1892,8 +1987,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
         ++queued_graphics;
 
-        workers.QueueWork([this, key, records_ = std::move(records), &state, &callback]() mutable {
+        PrebuildTicket ticket{records.bytes};
+        workers.QueueWork([this, key, records_ = std::move(records.envs),
+                           ticket_ = std::move(ticket), &state, &callback]() mutable {
             auto pipeline{CreateCachedGraphicsPipeline(key, records_, state.statistics.get())};
+            ticket_.Done();
 
             std::scoped_lock lock{state.mutex};
             if (pipeline) {
@@ -1915,13 +2013,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
                                load_graphics);
     for (auto& [key, records] : graphics_records) {
-        std::ranges::reverse(records);
+        std::ranges::reverse(records.envs);
         queue_graphics(key, std::move(records));
     }
     graphics_records.clear();
     graphics_record_index.clear();
     for (auto& [key, candidates] : compute_envs) {
-        OrderComputeTranslations(candidates);
+        OrderComputeTranslations(candidates.envs);
         queue_compute(key, std::move(candidates));
     }
     compute_envs.clear();
@@ -1951,6 +2049,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+    LOG_INFO(Render_Vulkan, "Prebuild: {} boot builds done {:.1f} s after the disk cache load began",
+             state.total, SecondsSinceDiskLoad());
 
     const size_t background_count =
         (std::min)(deferred_graphics.size(), BackgroundPipelineLimit(queued_graphics));
@@ -1982,8 +2082,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         // found, which the game is likelier to need soon than its oldest entries.
         for (auto& deferred :
              std::views::reverse(deferred_graphics) | std::views::take(background_count)) {
+            PrebuildTicket ticket{deferred.second.bytes};
             background_workers->QueueWork([this, key = deferred.first,
-                                           records_ = std::move(deferred.second)]() mutable {
+                                           records_ = std::move(deferred.second.envs),
+                                           ticket_ = std::move(ticket)]() mutable {
                 thread_local const size_t slot =
                     background_slots.fetch_add(1, std::memory_order_relaxed);
                 for (;;) {
@@ -2004,6 +2106,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 if (build) {
                     pipeline = CreateCachedGraphicsPipeline(key, records_, nullptr);
                 }
+                ticket_.Done();
                 std::unique_lock lock{background_mutex};
                 if (pipeline && !background_claimed.contains(key)) {
                     background_ready.emplace(key, std::move(pipeline));
@@ -2021,6 +2124,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                              "{} built by the GPU thread first",
                              seconds, background_ready.size() + background_taken, background_taken,
                              background_claimed.size());
+                    LOG_INFO(Render_Vulkan,
+                             "Prebuild: background done {:.1f} s after the disk cache load began",
+                             SecondsSinceDiskLoad());
                     background_claimed.clear();
                     background_active.store(false, std::memory_order_release);
                     ReportDiskRecordFailures();
@@ -2828,6 +2934,14 @@ PipelineCache::WarmResult PipelineCache::WarmGraphicsLibraries(
 
 void PipelineCache::TickFrame() {
     ++frame_count;
+    if (frame_count % 60 == 0) {
+        static std::chrono::steady_clock::time_point last_memory_log{};
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_memory_log >= std::chrono::seconds{10}) {
+            last_memory_log = now;
+            LogMemoryUse();
+        }
+    }
     if (device.IsExtGraphicsPipelineLibrarySupported()) {
         graphics_libraries.Report();
     }

@@ -88,4 +88,28 @@ u64 GetProcessPageFaults() {
 #endif
 }
 
+ProcessMemoryUsage GetProcessMemoryUsage() {
+    ProcessMemoryUsage usage{};
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(),
+                                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                                sizeof(counters))) {
+        usage.working_set = counters.WorkingSetSize;
+        usage.peak_working_set = counters.PeakWorkingSetSize;
+        usage.private_bytes = counters.PrivateUsage;
+        usage.peak_private_bytes = counters.PeakPagefileUsage;
+    }
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        usage.system_commit = status.ullTotalPageFile - status.ullAvailPageFile;
+        usage.system_commit_limit = status.ullTotalPageFile;
+        usage.available_physical = status.ullAvailPhys;
+    }
+#endif
+    return usage;
+}
+
 } // namespace Common
