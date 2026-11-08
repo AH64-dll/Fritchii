@@ -470,17 +470,19 @@ std::map<u32, u32> Constants(const std::vector<u32>& code) {
     return constants;
 }
 
-void RequireHmmaMatrixTypes(const std::vector<u32>& code, u32 columns = 8) {
+void RequireHmmaMatrixTypes(const std::vector<u32>& code, u32 columns = 8, u32 rows = 16) {
     const auto constants = Constants(code);
     const auto types = Instructions(code, OP_TYPE_COOPERATIVE_MATRIX);
     REQUIRE(types.size() == 3);
+    std::array<u32, 3> rows_by_use{};
     std::array<u32, 3> columns_by_use{};
     for (const auto& words : types) {
         REQUIRE(words.size() == 6);
         REQUIRE(constants.at(words[2]) == 3); // Subgroup scope
-        REQUIRE(constants.at(words[3]) == 16);
+        rows_by_use.at(constants.at(words[5])) = constants.at(words[3]);
         columns_by_use.at(constants.at(words[5])) = constants.at(words[4]);
     }
+    REQUIRE(rows_by_use == std::array<u32, 3>{rows, 16, rows});          // A, B, accumulator
     REQUIRE(columns_by_use == std::array<u32, 3>{16, columns, columns}); // A, B, accumulator
 }
 
@@ -654,6 +656,30 @@ TEST_CASE("16x16x16 cooperative HMMA runs both depths through shared memory",
         REQUIRE(Instructions(code, OP_COOPERATIVE_MATRIX_MUL_ADD).size() == 3);
         REQUIRE(Instructions(code, OP_COOPERATIVE_MATRIX_STORE).size() == 3);
         REQUIRE(Instructions(code, 202).empty()); // OpBitFieldUExtract
+        REQUIRE(Instructions(code, 57).empty());  // OpFunctionCall
+        REQUIRE(Instructions(code, 345).empty()); // OpGroupNonUniformShuffle
+        REQUIRE(fixture.program.shared_memory_size == 2 * 384 * 4);
+    }
+}
+
+TEST_CASE("8x16x16 cooperative HMMA runs each HMMA as two products through shared memory",
+          "[video_core][tensor][ampere]") {
+    for (const auto& [depth, version] : {std::pair{16U, 0x00010500U}, std::pair{16U, 0x00010600U},
+                                        std::pair{8U, 0x00010600U}}) {
+        TensorProgram fixture{3, depth};
+        fixture.profile.supported_spirv = version;
+        fixture.profile.support_cooperative_hmma_8x16x16 = true;
+        const auto code = fixture.Emit("cooperative-8x16x16-k" + std::to_string(depth) + "-" +
+                                       std::to_string(version));
+        REQUIRE(code[1] == version);
+        REQUIRE(HasCapability(code, CAPABILITY_COOPERATIVE_MATRIX));
+        RequireVulkanMemoryModel(code);
+        RequireHmmaMatrixTypes(code, 16, 8);
+        REQUIRE(fixture.program.info.uses_cooperative_matrix);
+        // Per HMMA: B once, then A and C for each half.
+        REQUIRE(Instructions(code, OP_COOPERATIVE_MATRIX_LOAD).size() == 15);
+        REQUIRE(Instructions(code, OP_COOPERATIVE_MATRIX_MUL_ADD).size() == 6);
+        REQUIRE(Instructions(code, OP_COOPERATIVE_MATRIX_STORE).size() == 6);
         REQUIRE(Instructions(code, 57).empty());  // OpFunctionCall
         REQUIRE(Instructions(code, 345).empty()); // OpGroupNonUniformShuffle
         REQUIRE(fixture.program.shared_memory_size == 2 * 384 * 4);

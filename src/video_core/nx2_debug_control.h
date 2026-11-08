@@ -218,6 +218,16 @@ inline std::atomic<int> g_idle_pause{-1};
 /// by cause, records and verify mismatches every 10 s while set. Off by default; 7 = memo, verify
 /// and auto-off. Measure the back's "read handles", "fill image views" and "push descriptors"
 /// zones (the sampler lookups move from the first to the second with the memo on).
+/// EXP33 = 1 (zortos293/Lichii#337 by Inc0rporate; QueryCacheBase::CounterReport and
+/// FenceManager::SignalFence): at fence behaviour Default without GPU accuracy High (or
+/// EDEN_NX2_ACCURATE_PARTS bit 1), a fence-flagged query report is no longer treated as
+/// synchronized: the query stays registered until its fence runs, and that fence is made even
+/// when empty and runs the report's operation once the host GPU passed the work before it
+/// (VideoCore::g_signaling_query_report_fence), as with delayed fences. Other fences are skipped
+/// as before. Read once per report, live. #337's fix for Ocarina's white flashes on leaves and
+/// walls at low accuracy; ours already has #215's FlushQueryResults wait (EXP30 trims it), so
+/// off by default, not measured yet: white flash watch, and the front's semaphore waits (the
+/// reports land later than with the fence skipped).
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 
