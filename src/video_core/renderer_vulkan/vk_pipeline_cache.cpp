@@ -1104,7 +1104,9 @@ void DestroyPipelinesWithProgress(Container& pipelines) {
 } // Anonymous namespace
 
 PipelineCache::~PipelineCache() {
-    // Stop the warm-ups and background builds first: their builds use the members below.
+    // Stop the warm-ups and background builds first: their builds use the members below. The
+    // stop callback goes first, as it writes the flags below.
+    warm_stop_callback.reset();
     warm_cancel = true;
     background_stop.store(true, std::memory_order_relaxed);
     graphics_warm_threads.clear();
