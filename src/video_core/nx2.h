@@ -81,7 +81,6 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
     return (g_nx2_command_list_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
 }
 
-/// A new emulation session starts: no page has been written by its GPU yet.
 // Query results written when their host work completes (counter reports): per 16-byte slot
 // hash, how many the back issued and how many completed. Equal counts mean the words in memory
 // are final, so the split's front can read them without draining the back.
@@ -94,6 +93,9 @@ inline std::array<std::atomic<u32>, Nx2AsyncReportSlots> g_nx2_async_reports_com
 }
 
 [[nodiscard]] inline bool Nx2AsyncReportsSettled(u64 device_address, u64 size) {
+    if (size == 0) {
+        return true;
+    }
     for (u64 slot = device_address >> 4; slot <= (device_address + size - 1) >> 4; ++slot) {
         const u64 index = slot % Nx2AsyncReportSlots;
         if (g_nx2_async_reports_completed[index].load(std::memory_order_acquire) !=
@@ -104,6 +106,80 @@ inline std::array<std::atomic<u32>, Nx2AsyncReportSlots> g_nx2_async_reports_com
     return true;
 }
 
+// Bumped after every completed report; threads in Nx2WaitAsyncReportsSettled wait on it
+// (zortos293/Lichii#559).
+inline std::atomic<u32> g_nx2_async_reports_generation{};
+inline std::atomic<u32> g_nx2_async_reports_waiters{};
+
+/// A report was issued to device_address (the thread that owns the query cache).
+inline void Nx2IssueAsyncReport(u64 device_address) {
+    g_nx2_async_reports_issued[Nx2AsyncReportSlot(device_address)].fetch_add(
+        1, std::memory_order_release);
+}
+
+/// A report's host work completed and its words are in memory (the fencing thread).
+inline void Nx2CompleteAsyncReport(u64 device_address) {
+    g_nx2_async_reports_completed[Nx2AsyncReportSlot(device_address)].fetch_add(
+        1, std::memory_order_release);
+    g_nx2_async_reports_generation.fetch_add(1, std::memory_order_seq_cst);
+    if (g_nx2_async_reports_waiters.load(std::memory_order_seq_cst) != 0) {
+        g_nx2_async_reports_generation.notify_all();
+    }
+}
+
+/// One asynchronous report's issued/completed pair. Complete counts it once, and destruction
+/// does if nothing did: an operation dropped without running (fences discarded when emulation
+/// stops) would otherwise leave its slot unequal for good, and a later wait on that slot would
+/// never end. Owned by the report's operation (shared by its copies); not thread-safe, as the
+/// operation runs or is dropped on one thread at a time.
+class Nx2AsyncReport {
+public:
+    explicit Nx2AsyncReport(u64 device_address_) : device_address{device_address_} {}
+    ~Nx2AsyncReport() {
+        Complete();
+    }
+    Nx2AsyncReport(const Nx2AsyncReport&) = delete;
+    Nx2AsyncReport& operator=(const Nx2AsyncReport&) = delete;
+
+    void Issue() {
+        if (!issued) {
+            issued = true;
+            Nx2IssueAsyncReport(device_address);
+        }
+    }
+    void Complete() {
+        if (issued && !completed) {
+            completed = true;
+            Nx2CompleteAsyncReport(device_address);
+        }
+    }
+
+private:
+    u64 device_address;
+    bool issued{};
+    bool completed{};
+};
+
+/// Blocks until every report issued so far to [device_address, device_address + size) is in
+/// memory. Only for the thread that issues reports, so none can be issued while it waits; the
+/// fences carrying them must already be submitted. A slot shared with another address only
+/// waits for that report too.
+inline void Nx2WaitAsyncReportsSettled(u64 device_address, u64 size) {
+    if (Nx2AsyncReportsSettled(device_address, size)) {
+        return;
+    }
+    g_nx2_async_reports_waiters.fetch_add(1, std::memory_order_seq_cst);
+    for (;;) {
+        const u32 generation = g_nx2_async_reports_generation.load(std::memory_order_seq_cst);
+        if (Nx2AsyncReportsSettled(device_address, size)) {
+            break;
+        }
+        g_nx2_async_reports_generation.wait(generation, std::memory_order_seq_cst);
+    }
+    g_nx2_async_reports_waiters.fetch_sub(1, std::memory_order_relaxed);
+}
+
+/// A new emulation session starts: no page has been written by its GPU yet.
 inline void Nx2ClearGpuWrittenPages() {
     for (auto& word : g_nx2_gpu_written_pages) {
         word.store(0, std::memory_order_relaxed);

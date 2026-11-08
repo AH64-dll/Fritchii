@@ -64,6 +64,7 @@ enum class Zone : u32 {
     ListSubmitWait,
     ListGpuWait,
     MemoryQuery, ///< Device::QueryDeviceMemoryUsage, the driver's memory budget query (EXP29)
+    QueryDmaWait, ///< Macro DMA reads of reports waiting for query results (FlushQueryResults)
     Count,
 };
 
@@ -76,6 +77,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
     "fence skipped", "method", "split drain", "split wait",
     "writer wait", "list submit wait", "list GPU wait", "memory query",
+    "query DMA wait",
 };
 
 // Read once, when the GPU thread starts (Initialize): Enabled() runs several times per method
@@ -167,6 +169,7 @@ inline thread_local ThreadData t_data;
     case Zone::WriterWait:
     case Zone::ListSubmitWait:
     case Zone::ListGpuWait:
+    case Zone::QueryDmaWait:
         return true;
     default:
         return false;

@@ -36,6 +36,7 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/gpu_split.h"
+#include "video_core/gpu_wait_site.h"
 #include "video_core/native_query_trace.h"
 #include "video_core/native_indirect_reset.h"
 #include "video_core/render_trace.h"
@@ -2155,6 +2156,24 @@ u64 RasterizerVulkan::FenceWorkEpoch() const {
 
 void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
     if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
+        return;
+    }
+    // GPU profile zone "query DMA wait": these waits per second and their ms per second, either
+    // way below (the A/B measure for EXP30).
+    VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::QueryDmaWait};
+    if (VideoCore::Nx2Debug::Experiment(30) != 0) {
+        // EXP30 (zortos293/Lichii#559): the fence carries the reports still waiting for one; on
+        // the split's back its submission may be deferred, and the fencing thread would wait
+        // for this thread to submit it. Then wait for the reports themselves, not for an
+        // operation queued behind everything: the work submitted after them (a few ms of GPU
+        // time while walking) cannot write them.
+        fence_manager.SignalFence([] {});
+        scheduler.FlushDeferred();
+        // From 12 bytes before the read: a 16-byte report (value, then timestamp) starting there
+        // still has words in it, and its slot is the one before the read's.
+        const DAddr wait_begin = addr >= 12 ? addr - 12 : DAddr{0};
+        VideoCommon::BackWaitScope wait_scope{"RasterizerVulkan::FlushQueryResults (own reports)"};
+        Tegra::Nx2WaitAsyncReportsSettled(wait_begin, addr + size - wait_begin);
         return;
     }
     // Below High GPU accuracy a fence runs its own callback at once, so wait for an operation
