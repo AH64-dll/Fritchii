@@ -144,6 +144,12 @@ public:
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
 
+    /// Whether the last CurrentGraphicsPipeline returned null because its draw was skipped for an
+    /// unbuilt pipeline (asynchronous shaders), not because there is no pipeline to build.
+    [[nodiscard]] bool LastLookupSkipped() const noexcept {
+        return discard_decision.serial == lookup_serial && discard_decision.skip;
+    }
+
     void TickFrame();
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline();
@@ -222,6 +228,31 @@ private:
         bool skip{};
     };
     mutable DiscardDecision discard_decision;
+    /// Counts one decision for the 10 s line, and lists a persistent target the first time a
+    /// draw into it misses its pipeline. GPU thread.
+    void NoteDiscardDecision(bool skip, const VideoCommon::DrawTargets& targets) const;
+    /// TickFrame: the EDEN_NX2_ASYNC_DISCARD counts of the last 10 s.
+    void ReportAsyncDiscard();
+    /// EDEN_NX2_ASYNC_DISCARD counts (fable_answer_18 1c), GPU thread only. Lookups by class of
+    /// their targets (index: VideoCommon::DrawTargetClass), a lookup that repeats the one before
+    /// (same pipeline key and target, same frame: the rasterizer's second lookups) counted once.
+    struct DiscardStats {
+        std::array<u32, 3> skipped{};
+        std::array<u32, 3> waited{};
+        /// GPU thread time in the translate queue's capped Wait for a draw that waits
+        std::chrono::steady_clock::duration queue_wait{};
+        std::chrono::nanoseconds held_at_window{}; ///< GraphicsPipeline::HoldTimeTotal then
+        std::chrono::steady_clock::time_point window{};
+        // The last lookup counted.
+        GraphicsPipelineCacheKey last_key{};
+        u64 last_frame{~u64{0}};
+        GPUVAddr last_target{};
+        VideoCommon::DrawTargetClass last_kind{};
+        bool last_skip{};
+    };
+    mutable DiscardStats discard_stats;
+    /// Persistent targets listed so far (32 at most per session).
+    mutable std::unordered_set<GPUVAddr> listed_persistent_targets;
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
 

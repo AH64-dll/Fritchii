@@ -64,6 +64,7 @@
 #include "video_core/renderer_vulkan/vk_cooperative_hmma_test.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/texture_cache/formatter.h"
 #include "video_core/renderer_vulkan/vk_pipeline_translate_queue.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -3617,6 +3618,7 @@ void ReportWorstFrame() {
 void PipelineCache::TickFrame() {
     ++frame_count;
     ReportWorstFrame();
+    ReportAsyncDiscard();
     if (translate_queue) {
         TickTranslations();
     }
@@ -3812,16 +3814,78 @@ bool PipelineCache::DrawMayBeSkipped() const {
     const int mode = AsyncDiscardMode();
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
-    bool recurring = true;
-    if (mode == 2 && native) {
-        recurring = texture_cache.ClassifyDrawTargets().kind ==
-                    VideoCommon::DrawTargetClass::Recurring;
-    }
+    // Classified in every mode, for the counts (with 1, the persistent column is what today's
+    // rule drops for good); it runs per missing pipeline, not per draw.
+    const VideoCommon::DrawTargets targets = texture_cache.ClassifyDrawTargets();
+    const bool recurring =
+        mode != 2 || !native || targets.kind == VideoCommon::DrawTargetClass::Recurring;
     const bool skip = CanDiscardPendingDraw(native, maxwell3d->regs.zeta_enable != 0,
                                             draw_state.draw_element_count,
                                             draw_state.draw_element_count, mode != 0, recurring);
     discard_decision = DiscardDecision{.serial = lookup_serial, .skip = skip};
+    NoteDiscardDecision(skip, targets);
     return skip;
+}
+
+void PipelineCache::NoteDiscardDecision(bool skip, const VideoCommon::DrawTargets& targets) const {
+    auto& stats = discard_stats;
+    const bool repeat = stats.last_frame == frame_count && stats.last_skip == skip &&
+                        stats.last_kind == targets.kind && stats.last_target == targets.gpu_addr &&
+                        stats.last_key == graphics_key;
+    if (repeat) {
+        return;
+    }
+    stats.last_frame = frame_count;
+    stats.last_skip = skip;
+    stats.last_kind = targets.kind;
+    stats.last_target = targets.gpu_addr;
+    stats.last_key = graphics_key;
+    const size_t index = static_cast<size_t>(targets.kind);
+    ++(skip ? stats.skipped : stats.waited)[index];
+    constexpr size_t MaxListedTargets = 32;
+    if (targets.kind != VideoCommon::DrawTargetClass::Persistent || targets.gpu_addr == 0 ||
+        listed_persistent_targets.size() >= MaxListedTargets ||
+        !listed_persistent_targets.insert(targets.gpu_addr).second) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Async discard: draw into persistent target {:#x} {}x{} {} {} for its pipeline "
+             "{:016x} (EDEN_NX2_ASYNC_DISCARD={}; each target listed once, {} of {})",
+             targets.gpu_addr, targets.width, targets.height, targets.format,
+             skip ? "skipped" : "waits", graphics_key.Hash(), AsyncDiscardMode(),
+             listed_persistent_targets.size(), MaxListedTargets);
+}
+
+void PipelineCache::ReportAsyncDiscard() {
+    auto& stats = discard_stats;
+    const auto now = std::chrono::steady_clock::now();
+    if (stats.window == std::chrono::steady_clock::time_point{}) {
+        stats.window = now;
+        stats.held_at_window = GraphicsPipeline::HoldTimeTotal();
+        return;
+    }
+    if (now - stats.window < std::chrono::seconds{10}) {
+        return;
+    }
+    const auto held_total = GraphicsPipeline::HoldTimeTotal();
+    const auto held = held_total - stats.held_at_window;
+    const auto& skipped = stats.skipped;
+    const auto& waited = stats.waited;
+    if (skipped[0] + skipped[1] + skipped[2] + waited[0] + waited[1] + waited[2] != 0) {
+        const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+        LOG_INFO(Render_Vulkan,
+                 "Async discard in the last 10 s (EDEN_NX2_ASYNC_DISCARD={}): lookups of "
+                 "unbuilt pipelines skipped {} recurring, {} first-time, {} persistent; waited "
+                 "{} recurring, {} first-time, {} persistent; {:.1f} ms of draws held for "
+                 "unbuilt pipelines, {:.1f} ms of GPU thread waiting for translations",
+                 AsyncDiscardMode(), skipped[0], skipped[1], skipped[2], waited[0], waited[1],
+                 waited[2], ms(held), ms(stats.queue_wait));
+    }
+    stats.skipped = {};
+    stats.waited = {};
+    stats.queue_wait = {};
+    stats.held_at_window = held_total;
+    stats.window = now;
 }
 
 namespace {
@@ -4484,7 +4548,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::AdoptTranslation(bool& pending)
         const auto begin = std::chrono::steady_clock::now();
         job = translate_queue->Wait(graphics_key, TranslateWaitCap);
         ++translate_stats.waits;
-        translate_stats.wait_time += std::chrono::steady_clock::now() - begin;
+        const auto waited = std::chrono::steady_clock::now() - begin;
+        translate_stats.wait_time += waited;
+        discard_stats.queue_wait += waited;
         if (!job) {
             translate_queue->Abandon(graphics_key);
             ++translate_stats.fallbacks;
