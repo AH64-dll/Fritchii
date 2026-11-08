@@ -6,6 +6,7 @@
 #include <array>
 #include <chrono>
 #include <optional>
+#include <string>
 
 #include "common/common_types.h"
 #include "video_core/nx2_debug_control.h"
@@ -47,15 +48,17 @@ namespace VideoCommon::QmdPrediction {
     return Mode() != 0;
 }
 
-/// EXP13=2 or 3: the front's QMD scheduler copy predicts.
+/// EXP13=2, 3 or 4: the front's QMD scheduler copy predicts.
 [[nodiscard]] inline bool MirrorMode() {
     const int mode = Mode();
-    return mode == 2 || mode == 3;
+    return mode >= 2 && mode <= 4;
 }
 
-/// EXP13=3: the predictions meet acquires (while the feed has not turned itself off).
+/// EXP13=3 (the narrow feed: records of QMDs a schedule runs at once) or 4 (the full feed): the
+/// predictions meet acquires (while the feed has not turned itself off).
 [[nodiscard]] inline bool FeedRequested() {
-    return Mode() == 3;
+    const int mode = Mode();
+    return mode == 3 || mode == 4;
 }
 
 /// EXP13=2 records only: Report, a compute report semaphore (0x6c3) or a 3D payload report;
@@ -107,6 +110,11 @@ struct Record {
     u64 read_done;
     u64 overlay_position;
     u64 block_position;
+    /// Made by a schedule (action 2 or 3) of the signal's own QMD that ran at once: no base
+    /// dependency count, no deferred decrements, not a chained dependent or a decrement's run
+    /// (fable_answer_6 6g (c)). The narrow feed (EXP13=3) only takes these (and non-QMD
+    /// releases).
+    bool simple;
 };
 /// Front, EXP13=2: a release sent at ring `position` (of the QMD at `qmd`, 0 for others) to the
 /// u32 at `device`, which held `before` in guest memory then.
@@ -144,6 +152,16 @@ void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing site);
 /// Front, EXP13=2: the records are complete for the work sent from `position` on (the copy just
 /// started over), or not any more (`valid` false: it stopped).
 void SetRecordsValid(bool valid, u64 position);
+/// Front, EXP13=2-4: the copy recorded every release of the work sent up to `position` (the end
+/// of the signal it just ran). Record first, compare after (6g (a)): the back's releases of
+/// entries after the previous one that found no record wait for this, and the phantom sweep
+/// runs here.
+void Settle(u64 position);
+/// Front, EXP13=2-4: where the copy's latest QMD read came from (for the unpredicted lines).
+void NoteReadSource(Source source);
+/// The copy's scheduler table state for a QMD, as text (the unpredicted lines).
+using QmdProbe = std::string (*)(u64 qmd);
+void SetQmdProbe(QmdProbe probe);
 
 /// Back: the release just made by the entry at `entry_position`, of the QMD at `qmd`.
 /// `slots`: the QMD's three release slots' flags and payload words as the back read them
