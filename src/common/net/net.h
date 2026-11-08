@@ -28,6 +28,10 @@ struct AssetInfo {
     u64 size{};
 };
 
+// The lowercase hex of a GitHub asset digest such as "sha256:<64 hex digits>", or nullopt when it
+// is not a well-formed SHA-256 digest.
+std::optional<std::string> ParseSha256Digest(std::string_view digest);
+
 // How a Linux build is installed, which decides between the AppImage and the tar.gz.
 enum class LinuxPackage { Any, AppImage, Archive };
 

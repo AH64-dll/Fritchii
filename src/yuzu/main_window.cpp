@@ -447,11 +447,11 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     show();
 
 #ifdef ENABLE_UPDATE_CHECKER
-    if (UISettings::values.check_for_updates) {
-        update_future = QtConcurrent::run([]() { return UpdateChecker::Check(); });
-        update_watcher.connect(&update_watcher, &QFutureWatcher<QString>::finished, this,
-                               &MainWindow::OnEmulatorUpdateAvailable);
-        update_watcher.setFuture(update_future);
+    connect(&update_watcher, &QFutureWatcher<UpdateChecker::CheckResult>::finished, this,
+            &MainWindow::OnEmulatorUpdateAvailable);
+    // A swap that a crash interrupted is finished or undone before anything else.
+    if (!Updater::FinishPendingSwap(this) && UISettings::values.check_for_updates) {
+        StartUpdateCheck(false);
     }
 #endif
 
@@ -1792,6 +1792,25 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_About, &MainWindow::OnAbout);
     connect_menu(ui->action_Eden_Dependencies, &MainWindow::OnEdenDependencies);
     connect_menu(ui->action_Data_Manager, &MainWindow::OnDataDialog);
+
+#ifdef ENABLE_UPDATE_CHECKER
+    auto* check_action = new QAction(tr("Check for Updates..."), this);
+    ui->menu_Help->insertAction(ui->action_About, check_action);
+    connect(check_action, &QAction::triggered, this, &MainWindow::OnCheckForUpdates);
+
+    auto* rollback_action = new QAction(tr("Roll Back to the Previous Version..."), this);
+    rollback_action->setVisible(false);
+    ui->menu_Help->insertAction(ui->action_About, rollback_action);
+    connect(ui->menu_Help, &QMenu::aboutToShow, this, [this, rollback_action] {
+        rollback_action->setVisible(Updater::RollbackVersion().has_value());
+        rollback_action->setEnabled(!emulation_running && !boot_in_progress);
+    });
+    connect(rollback_action, &QAction::triggered, this, [this] {
+        if (!emulation_running && !boot_in_progress) {
+            Updater::RollBack(this);
+        }
+    });
+#endif
 }
 
 void MainWindow::UpdateMenuState() {
@@ -2482,6 +2501,17 @@ void MainWindow::OnEmulationStopped() {
     QtCommon::system->HIDCore().ReloadInputDevices();
     UpdateStatusButtons();
     LOG_INFO(Frontend, "Emulation cleanup completed");
+#ifdef ENABLE_UPDATE_CHECKER
+    if (pending_update && !close_pending) {
+        QTimer::singleShot(0, this, [this] {
+            if (pending_update && !emulation_running && !boot_in_progress) {
+                const auto result = std::move(*pending_update);
+                pending_update.reset();
+                ShowUpdate(result);
+            }
+        });
+    }
+#endif
     if (close_pending) {
         QTimer::singleShot(0, this, &QWidget::close);
     } else if (!boot_in_progress) {
@@ -4682,33 +4712,75 @@ void MainWindow::OnCaptureScreenshot() {
 }
 
 #ifdef ENABLE_UPDATE_CHECKER
-void MainWindow::OnEmulatorUpdateAvailable() {
-    const auto result = update_future.result();
-    if (result.failure == UpdateChecker::Failure::RateLimited) {
-        statusBar()->showMessage(
-            tr("Could not check for updates: GitHub rate limit reached. Lichii will try again at "
-               "the next start."),
-            15000);
+void MainWindow::StartUpdateCheck(bool manual) {
+    if (update_watcher.isRunning()) {
+        update_check_manual |= manual;
         return;
     }
-    if (result.failure == UpdateChecker::Failure::Http) {
-        statusBar()->showMessage(
-            tr("Could not check for updates: GitHub answered with HTTP %1.").arg(result.status),
-            15000);
+    update_check_manual = manual;
+    update_future = QtConcurrent::run([]() { return UpdateChecker::Check(); });
+    update_watcher.setFuture(update_future);
+}
+
+void MainWindow::OnCheckForUpdates() {
+    StartUpdateCheck(true);
+}
+
+void MainWindow::OnEmulatorUpdateAvailable() {
+    const auto result = update_future.result();
+    const bool manual = std::exchange(update_check_manual, false);
+    if (result.failure != UpdateChecker::Failure::None) {
+        QString text;
+        switch (result.failure) {
+        case UpdateChecker::Failure::RateLimited:
+            text = tr("Could not check for updates: GitHub rate limit reached. Fritchii will try "
+                      "again at the next start.");
+            break;
+        case UpdateChecker::Failure::Http:
+            text =
+                tr("Could not check for updates: GitHub answered with HTTP %1.").arg(result.status);
+            break;
+        default:
+            text = tr("Could not check for updates. Check your internet connection.");
+            break;
+        }
+        // The check at startup stays quiet when offline.
+        if (manual) {
+            QMessageBox::warning(this, tr("Check for Updates"), text);
+        } else if (result.failure != UpdateChecker::Failure::Network) {
+            statusBar()->showMessage(text, 15000);
+        }
         return;
     }
     if (!result.update) {
+        if (manual) {
+            QMessageBox::information(this, tr("Check for Updates"),
+                                     tr("You have the latest version (%1).")
+                                         .arg(QString::fromLatin1(Common::g_build_version)));
+        }
         return;
     }
 
     const auto& release = *result.update;
     const auto now = static_cast<unsigned long long>(QDateTime::currentSecsSinceEpoch());
-    if (UISettings::values.skipped_update_tag.GetValue() == release.tag ||
-        UISettings::values.update_remind_at.GetValue() > now) {
+    if (!manual && (UISettings::values.skipped_update_tag.GetValue() == release.tag ||
+                    UISettings::values.update_remind_at.GetValue() > now)) {
         return;
     }
+    if (emulation_running || boot_in_progress) {
+        pending_update = result;
+        statusBar()->showMessage(tr("%1 is available. It will be offered when the game closes.")
+                                     .arg(QString::fromStdString(release.title)),
+                                 15000);
+        return;
+    }
+    ShowUpdate(result);
+}
 
-    UpdateDialog dialog(release, this);
+void MainWindow::ShowUpdate(const UpdateChecker::CheckResult& result) {
+    const auto& release = *result.update;
+    const auto now = static_cast<unsigned long long>(QDateTime::currentSecsSinceEpoch());
+    UpdateDialog dialog(release, result.asset, this);
     switch (dialog.exec()) {
     case UpdateDialog::SkipVersion:
         UISettings::values.skipped_update_tag = release.tag;

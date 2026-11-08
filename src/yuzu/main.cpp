@@ -32,6 +32,9 @@
 #endif
 
 #include "main_window.h"
+#ifdef ENABLE_UPDATE_CHECKER
+#include "updater/update_dialog.h"
+#endif
 
 #ifdef _WIN32
 #include <QScreen>
@@ -176,6 +179,10 @@ static void LoadNx2Switches(const char* argv0) {
 }
 
 int main(int argc, char* argv[]) {
+#ifdef ENABLE_UPDATE_CHECKER
+    // Before the switches are added to the environment, which a restart must not inherit.
+    Updater::PrepareLaunch();
+#endif
     LoadNx2Switches(argv[0]);
 #if YUZU_ROOM
     bool launch_room = false;

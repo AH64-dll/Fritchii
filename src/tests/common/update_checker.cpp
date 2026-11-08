@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <string>
 #include <thread>
+#include <vector>
+#include <fmt/format.h>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include "common/httplib.h"
@@ -233,4 +236,184 @@ TEST_CASE("Release requests handle HTTP failures without throwing", "[updater]")
     const auto response =
         Common::Net::MakeRequest("http://127.0.0.1:" + std::to_string(port), "/releases");
     CHECK(response.has_value() == (status == 200));
+}
+
+namespace {
+
+using UpdateChecker::FritchiiVersion;
+
+const std::string ValidDigest =
+    "sha256:597200A1BFFA3D2ECFB2F3F2A464515D57D7F6DC674060F16719830C790BADA7";
+
+Common::Net::Release MakeFritchiiRelease(const std::string& tag,
+                                         const std::vector<std::string>& urls,
+                                         const std::string& digest = ValidDigest) {
+    nlohmann::json assets = nlohmann::json::array();
+    for (const auto& url : urls) {
+        assets.push_back(
+            {{"browser_download_url", url}, {"size", u64{68126892}}, {"digest", digest}});
+    }
+    const nlohmann::json json{
+        {"tag_name", tag}, {"name", "Fritchii " + tag}, {"prerelease", true}, {"assets", assets}};
+    return Common::Net::Release::FromJson(json, "https://api.github.com", "Frizti/Lichii").value();
+}
+
+std::string GitHubUrl(std::string_view repo, std::string_view tag, std::string_view name) {
+    return fmt::format("https://github.com/Frizti/{}/releases/download/{}/{}", repo, tag, name);
+}
+
+} // namespace
+
+TEST_CASE("Fritchii versions compare numerically with one decimal", "[updater]") {
+    CHECK(UpdateChecker::ParseFritchiiVersion("4") == FritchiiVersion{4, 0});
+    CHECK(UpdateChecker::ParseFritchiiVersion("3.5") == FritchiiVersion{3, 5});
+    CHECK(UpdateChecker::ParseFritchiiVersion("12") == FritchiiVersion{12, 0});
+    CHECK(FritchiiVersion{3, 5} < FritchiiVersion{4, 0});
+    CHECK(FritchiiVersion{4, 0} < FritchiiVersion{4, 1});
+    CHECK(FritchiiVersion{4, 9} < FritchiiVersion{5, 0});
+    CHECK(FritchiiVersion{9, 0} < FritchiiVersion{10, 0});
+    CHECK(FritchiiVersion{4, 1}.ToString() == "4.1");
+    CHECK(FritchiiVersion{4, 0}.ToString() == "4");
+
+    const std::string invalid = GENERATE("", "0", "04", "4.", "4.0", "4.10", "4.a", "v4", " 4",
+                                         "4 ", "-1", "+4", "4.1.2", ".5", "99999999999");
+    CHECK_FALSE(UpdateChecker::ParseFritchiiVersion(invalid));
+}
+
+TEST_CASE("Fritchii tags and build versions accept the old Frizti names", "[updater]") {
+    CHECK(UpdateChecker::ParseFritchiiTag("fritchii-v4") == FritchiiVersion{4, 0});
+    CHECK(UpdateChecker::ParseFritchiiTag("fritchii-v4.1") == FritchiiVersion{4, 1});
+    CHECK(UpdateChecker::ParseFritchiiTag("frizti-v3") == FritchiiVersion{3, 0});
+    CHECK(UpdateChecker::ParseFritchiiTag("frizti-v3.5") == FritchiiVersion{3, 5});
+    CHECK(UpdateChecker::ParseBuildVersion("Fritchii v4") == FritchiiVersion{4, 0});
+    CHECK(UpdateChecker::ParseBuildVersion("Frizti v3.5") == FritchiiVersion{3, 5});
+
+    const std::string tag =
+        GENERATE("", "fritchii-v", "fritchii-4", "Fritchii-v4", "fritchii-v4-rc", "frizti-v4.0",
+                 "build-71", "v4", "lichii-frizti-v4");
+    CHECK_FALSE(UpdateChecker::ParseFritchiiTag(tag));
+    const std::string version = GENERATE("", "build-71", "Lichii", "abc1234567-nx2", "Fritchii v",
+                                         "Fritchii v4 ", "fritchii v4", "Fritchii 4");
+    CHECK_FALSE(UpdateChecker::ParseBuildVersion(version));
+}
+
+TEST_CASE("GitHub digests are parsed only when they are SHA-256", "[updater]") {
+    CHECK(Common::Net::ParseSha256Digest(ValidDigest) ==
+          "597200a1bffa3d2ecfb2f3f2a464515d57d7f6dc674060f16719830c790bada7");
+    const std::string digest =
+        GENERATE(std::string{}, std::string{"sha256:"}, "sha256:" + std::string(63, 'a'),
+                 "sha256:" + std::string(65, 'a'), "sha256:" + std::string(63, 'a') + "g",
+                 "SHA256:" + std::string(64, 'a'), "md5:" + std::string(64, 'a'),
+                 " sha256:" + std::string(64, 'a'), std::string(64, 'a'));
+    CHECK_FALSE(Common::Net::ParseSha256Digest(digest));
+}
+
+TEST_CASE("Fritchii selects only the Windows package from the Frizti repository", "[updater]") {
+    const auto source = UpdateChecker::DefaultSource();
+    CHECK(source.origin == "https://api.github.com");
+    CHECK(source.api_path == "/repos/Frizti/Lichii/releases?per_page=100");
+    CHECK_FALSE(source.test);
+
+    const std::string tag = "fritchii-v5";
+    const std::string repo = GENERATE("Lichii", "Fritchii");
+    const auto release = MakeFritchiiRelease(
+        tag, {GitHubUrl(repo, tag, "Fritchii-v5-debug-symbols-not-needed-to-play.zip"),
+              GitHubUrl(repo, tag, "Fritchii-v5-Windows-x64.zip")});
+    const auto asset = UpdateChecker::SelectFritchiiAsset(release, source);
+    REQUIRE(asset);
+    CHECK(asset->filename == "Fritchii-v5-Windows-x64.zip");
+    CHECK(asset->url == "https://github.com");
+    CHECK(asset->path == "/Frizti/" + repo + "/releases/download/fritchii-v5/" + asset->filename);
+    CHECK(asset->sha256 == "597200a1bffa3d2ecfb2f3f2a464515d57d7f6dc674060f16719830c790bada7");
+    CHECK(asset->size == 68126892);
+
+    // Selected, but the dialog refuses to install it without a digest.
+    const auto no_digest = MakeFritchiiRelease(
+        tag, {GitHubUrl(repo, tag, "Fritchii-v5-Windows-x64.zip")}, "sha256:short");
+    const auto unverified = UpdateChecker::SelectFritchiiAsset(no_digest, source);
+    REQUIRE(unverified);
+    CHECK(unverified->sha256.empty());
+}
+
+TEST_CASE("Fritchii ignores debug zips, old asset names and lookalike URLs", "[updater]") {
+    const std::string url = GENERATE(
+        GitHubUrl("Lichii", "fritchii-v5", "Fritchii-v5-debug-symbols-not-needed-to-play.zip"),
+        GitHubUrl("Lichii", "fritchii-v5", "Lichii-Frizti-v5-Windows-x64.zip"),
+        GitHubUrl("Lichii", "fritchii-v5", "Fritchii-v4-Windows-x64.zip"),
+        GitHubUrl("Lichii", "fritchii-v4", "Fritchii-v5-Windows-x64.zip"),
+        GitHubUrl("Other", "fritchii-v5", "Fritchii-v5-Windows-x64.zip"),
+        std::string{"https://github.com/zortos293/Lichii/releases/download/fritchii-v5/"
+                    "Fritchii-v5-Windows-x64.zip"},
+        std::string{"http://github.com/Frizti/Lichii/releases/download/fritchii-v5/"
+                    "Fritchii-v5-Windows-x64.zip"},
+        std::string{"https://github.com.evil.com/Frizti/Lichii/releases/download/fritchii-v5/"
+                    "Fritchii-v5-Windows-x64.zip"},
+        std::string{"http://127.0.0.1:8000/Fritchii-v5-Windows-x64.zip"},
+        std::string{"https://github.com/Frizti/Lichii/archive/refs/tags/fritchii-v5.zip"});
+    const auto release = MakeFritchiiRelease("fritchii-v5", {url});
+    CHECK_FALSE(UpdateChecker::SelectFritchiiAsset(release, UpdateChecker::DefaultSource()));
+}
+
+TEST_CASE("Fritchii picks the newest newer release that has a package", "[updater]") {
+    const auto make = [](const std::string& tag, const std::string& name) {
+        return MakeFritchiiRelease(tag, {GitHubUrl("Lichii", tag, name)});
+    };
+    const auto releases = std::array{
+        make("frizti-v3", "Lichii-Frizti-v3-Windows-x64.zip"),
+        make("fritchii-v4", "Fritchii-v4-Windows-x64.zip"),
+        make("fritchii-v5", "Fritchii-v5-debug-symbols-not-needed-to-play.zip"),
+        make("fritchii-v4.1", "Fritchii-v4.1-Windows-x64.zip"),
+        make("build-99", "lichii-windows-x86_64.zip"),
+    };
+    const auto source = UpdateChecker::DefaultSource();
+    const auto select = [&](FritchiiVersion current) {
+        const auto update = UpdateChecker::SelectFritchiiUpdate(releases, current, source);
+        return update ? update->tag : std::string{};
+    };
+    CHECK(select({3, 5}) == "fritchii-v4.1");
+    CHECK(select({4, 0}) == "fritchii-v4.1");
+    CHECK(select({4, 1}).empty());
+    CHECK(select({6, 0}).empty());
+    CHECK_FALSE(UpdateChecker::SelectFritchiiUpdate({}, {4, 0}, source));
+}
+
+TEST_CASE("EDEN_UPDATE_URL takes https anywhere and plain http only on loopback", "[updater]") {
+    const auto local = UpdateChecker::ParseSourceOverride("http://127.0.0.1:8000/releases.json");
+    REQUIRE(local);
+    CHECK(local->origin == "http://127.0.0.1:8000");
+    CHECK(local->api_path == "/releases.json");
+    CHECK(local->test);
+    CHECK(UpdateChecker::ParseSourceOverride("http://localhost:8000")->api_path == "/");
+    CHECK(UpdateChecker::ParseSourceOverride("http://LocalHost/x.json"));
+    CHECK(UpdateChecker::ParseSourceOverride("http://[::1]:8000/x.json")->origin ==
+          "http://[::1]:8000");
+    CHECK(UpdateChecker::ParseSourceOverride("https://example.com/r.json")->origin ==
+          "https://example.com");
+
+    const std::string url =
+        GENERATE("", "127.0.0.1:8000/r.json", "http://example.com/r.json",
+                 "http://127.0.0.1.evil.com/r.json", "http://10.0.0.1/r.json",
+                 "http://localhost@evil.com/r.json", "ftp://127.0.0.1/r.json", "file:///C:/r.json",
+                 "http://127.0.0.1 /r.json", "http:///r.json", "https://");
+    CHECK_FALSE(UpdateChecker::ParseSourceOverride(url));
+}
+
+TEST_CASE("A test source accepts packages only from its own origin", "[updater]") {
+    const auto source = UpdateChecker::ParseSourceOverride("http://127.0.0.1:8000/releases.json");
+    REQUIRE(source);
+    const auto local =
+        MakeFritchiiRelease("fritchii-v5", {"http://127.0.0.1:8000/Fritchii-v5-Windows-x64.zip"});
+    const auto asset = UpdateChecker::SelectFritchiiAsset(local, *source);
+    REQUIRE(asset);
+    CHECK(asset->url == "http://127.0.0.1:8000");
+    CHECK(asset->path == "/Fritchii-v5-Windows-x64.zip");
+
+    const std::string url =
+        GENERATE(std::string{"http://127.0.0.1:9000/Fritchii-v5-Windows-x64.zip"},
+                 std::string{"http://127.0.0.1:80000/Fritchii-v5-Windows-x64.zip"},
+                 std::string{"http://127.0.0.1:8000/../Fritchii-v5-Windows-x64.zip"},
+                 std::string{"http://127.0.0.1:8000/x?/Fritchii-v5-Windows-x64.zip"},
+                 GitHubUrl("Lichii", "fritchii-v5", "Fritchii-v5-Windows-x64.zip"));
+    CHECK_FALSE(
+        UpdateChecker::SelectFritchiiAsset(MakeFritchiiRelease("fritchii-v5", {url}), *source));
 }
