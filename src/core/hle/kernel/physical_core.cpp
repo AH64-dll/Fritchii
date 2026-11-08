@@ -53,10 +53,54 @@ void IdlePause() {
 #endif
 }
 
+/// EDEN_NX2_CORE_LOCK=1 (boot switch, off by default; from zortos293/Lichii#641, where it is on):
+/// the core context lock is a KSpinLock (spins briefly, then an address wait) instead of a
+/// std::mutex, and Idle sleeps on an address wait on the interrupt flag instead of a condition
+/// variable; Interrupt sets the flag and signals the JIT under the lock and wakes the sleeper
+/// after releasing it. This sits on the scheduler's thread-state path (OnThreadStateChanged ->
+/// scheduler lock Unlock -> RescheduleCores -> Interrupt), 10-16% of each guest core in Castle
+/// Town. #641 also moved the waits to its own WaitOnAddress wrapper because libstdc++'s
+/// std::atomic::wait goes through winpthreads on MinGW; here std::atomic::wait is used, which on
+/// MSVC's STL (the clang-cl builds) already is WaitOnAddress. Read once per core at kernel setup,
+/// so a core never mixes the two locks.
+bool CoreLockEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_CORE_LOCK");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 } // Anonymous namespace
 
+/// Locks the core context with whichever lock EDEN_NX2_CORE_LOCK chose.
+class PhysicalCore::ScopedGuard {
+public:
+    explicit ScopedGuard(PhysicalCore& core) : m_core{core} {
+        if (m_core.m_core_lock) {
+            m_core.m_fast_guard.Lock();
+        } else {
+            m_core.m_guard.lock();
+        }
+    }
+
+    ~ScopedGuard() {
+        if (m_core.m_core_lock) {
+            m_core.m_fast_guard.Unlock();
+        } else {
+            m_core.m_guard.unlock();
+        }
+    }
+
+    YUZU_NON_COPYABLE(ScopedGuard);
+    YUZU_NON_MOVEABLE(ScopedGuard);
+
+private:
+    PhysicalCore& m_core;
+};
+
 PhysicalCore::PhysicalCore(KernelCore& kernel, std::size_t core_index)
-    : m_core_index{core_index}
+    : m_core_index{core_index}, m_core_lock{CoreLockEnabled()}
 {
     m_is_single_core = !kernel.IsMulticore();
 }
@@ -71,7 +115,7 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
 
     const auto EnterContext = [&]() {
         // Lock the core context.
-        std::scoped_lock lk{m_guard};
+        ScopedGuard lk{*this};
 
         // Check if we are already interrupted. If we are, we can just stop immediately.
         if (m_is_interrupted) {
@@ -102,7 +146,7 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
         interface->UnlockThread(thread);
 
         // Lock the core context.
-        std::scoped_lock lk{m_guard};
+        ScopedGuard lk{*this};
 
         // On exit, we no longer are running.
         m_arm_interface = nullptr;
@@ -297,6 +341,14 @@ void PhysicalCore::Idle(KernelCore& kernel) {
             }
         }
     }
+    if (m_core_lock) {
+        // EDEN_NX2_CORE_LOCK: the wait compares the flag before sleeping, so a store made
+        // after the load still wakes it (Interrupt notifies after every store).
+        while (!m_is_interrupted.load(std::memory_order_acquire)) {
+            m_is_interrupted.wait(false, std::memory_order_acquire);
+        }
+        return;
+    }
     std::unique_lock lk{m_guard};
     m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });
 }
@@ -306,6 +358,19 @@ bool PhysicalCore::IsInterrupted() const {
 }
 
 void PhysicalCore::Interrupt() {
+    if (m_core_lock) {
+        {
+            ScopedGuard lk{*this};
+            m_is_interrupted.store(true, std::memory_order_seq_cst);
+            if (m_arm_interface != nullptr) {
+                m_arm_interface->SignalInterrupt(m_current_thread);
+            }
+        }
+        // Wakes Idle if it sleeps; WaitOnAddress makes this cheap when nobody does.
+        m_is_interrupted.notify_all();
+        return;
+    }
+
     // Lock core context.
     std::scoped_lock lk{m_guard};
 
@@ -329,7 +394,7 @@ void PhysicalCore::Interrupt() {
 }
 
 void PhysicalCore::ClearInterrupt() {
-    std::scoped_lock lk{m_guard};
+    ScopedGuard lk{*this};
     m_is_interrupted = false;
 }
 
