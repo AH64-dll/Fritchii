@@ -451,6 +451,8 @@ struct FenceWriterStats {
 struct QmdPredictionCheck {
     u64 device;
     u64 sequence;
+    /// EXP13=2: the reduction lower bound computed for it (fable_answer_6 6c).
+    std::optional<VideoCommon::QmdPrediction::Bound> bound;
 };
 std::optional<QmdPredictionCheck> CheckQmdPrediction(DmaPusher& dma_pusher,
                                                      const Puller::PendingAcquire& acquire) {
@@ -463,6 +465,23 @@ std::optional<QmdPredictionCheck> CheckQmdPrediction(DmaPusher& dma_pusher,
     if (!device) {
         return std::nullopt;
     }
+    if (Prediction::MirrorMode()) {
+        // The word first, then the back's position: a record past that position had not run
+        // when the word was read, so it is not in it (6c section 3, steps 2-3).
+        const u32 word = dma_pusher.memory_manager.Read<u32>(acquire.address);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const u64 done = split.ConsumedNow();
+        const auto bound = Prediction::CheckAcquire({
+            .device = *device,
+            .address = acquire.address,
+            .operation = acquire.operation,
+            .value = acquire.value,
+            .word = word,
+            .done = done,
+            .gpu_dirty = Nx2IsGpuWritten(*device),
+        });
+        return QmdPredictionCheck{*device, Prediction::BackSequence(), bound};
+    }
     const auto queued = Prediction::QueuedPayloads(*device, split.ConsumedNow());
     const bool meets = std::any_of(queued.payloads.begin(),
                                    queued.payloads.begin() + queued.count,
@@ -471,16 +490,21 @@ std::optional<QmdPredictionCheck> CheckQmdPrediction(DmaPusher& dma_pusher,
                             : queued.count != 0 ? Prediction::Coverage::WrongValue
                             : queued.any        ? Prediction::Coverage::AlreadyRan
                                                 : Prediction::Coverage::None);
-    return QmdPredictionCheck{*device, Prediction::BackSequence()};
+    return QmdPredictionCheck{*device, Prediction::BackSequence(), std::nullopt};
 }
 
-void QmdPredictionMetBy(const QmdPredictionCheck& check, const Puller::PendingAcquire& acquire,
-                        bool met) {
+void QmdPredictionMetBy(DmaPusher& dma_pusher, const QmdPredictionCheck& check,
+                        const Puller::PendingAcquire& acquire, bool met) {
     namespace Prediction = VideoCommon::QmdPrediction;
     using MetBy = Prediction::MetBy;
     if (!met) {
         Prediction::NoteMetBy(MetBy::Unmet);
         return;
+    }
+    if (check.bound) {
+        // Safety: once met, the word must be at least the bound (counted, nothing else).
+        Prediction::CheckBound(*check.bound,
+                               dma_pusher.memory_manager.Read<u32>(acquire.address));
     }
     const auto release = Prediction::BackReleaseSince(check.device, check.sequence);
     if (!release) {
@@ -920,7 +944,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             const auto qmd_check = CheckQmdPrediction(dma_pusher, acquire);
             met_now = ReleaseFencesForReadable(dma_pusher, this, acquire);
             if (qmd_check) {
-                QmdPredictionMetBy(*qmd_check, acquire, met_now || waiters.Latched(this));
+                QmdPredictionMetBy(dma_pusher, *qmd_check, acquire,
+                                   met_now || waiters.Latched(this));
             }
         } else {
             ReleaseFences(dma_pusher);
