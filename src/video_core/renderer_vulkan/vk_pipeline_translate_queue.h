@@ -73,8 +73,12 @@ struct TranslationJob {
 class TranslateQueue {
 public:
     using Translate = std::function<void(TranslationJob&)>;
+    /// Takes a pipeline that is not to be used, on the GPU thread: the pipeline cache destroys it
+    /// once the GPU and its queued build are done with it (TickFrame), never on a translation
+    /// thread.
+    using Retire = std::function<void(std::unique_ptr<GraphicsPipeline>)>;
 
-    TranslateQueue(size_t threads, size_t max_in_flight, Translate translate);
+    TranslateQueue(size_t threads, size_t max_in_flight, Translate translate, Retire retire);
     /// Joins the threads (a translation in progress finishes); queued jobs are dropped.
     ~TranslateQueue();
 
@@ -108,8 +112,14 @@ public:
     /// have not come back, and the cache adopts them between frames.
     [[nodiscard]] std::vector<std::unique_ptr<TranslationJob>> TakeFinished();
 
-    /// Destroys a finished job's pipeline on a translation thread: one never bound, whose
-    /// destructor may wait for its driver compile, which the GPU thread must not.
+    /// Hands the pipelines of jobs abandoned while they translated (swept, or built on the GPU
+    /// thread meanwhile) to `retire`. GPU thread, between frames.
+    void RetireAbandoned();
+
+    /// Drops a job that is not to be used: its pipeline (never bound) goes to `retire`. GPU
+    /// thread. Its destructor would wait for the driver compile, or run the whole build where
+    /// it runs when no worker took it yet, so it is destroyed once its build is done
+    /// (fable_answer_18 2b).
     void Discard(std::unique_ptr<TranslationJob> job);
 
     [[nodiscard]] size_t InFlight() const;
@@ -127,9 +137,12 @@ private:
     mutable std::mutex mutex;
     std::condition_variable done_condition;
     std::unordered_map<GraphicsPipelineCacheKey, Entry> entries;
+    /// Jobs whose entry was abandoned while they translated, for RetireAbandoned. Under `mutex`.
+    std::vector<std::unique_ptr<TranslationJob>> abandoned;
     u64 next_id{1};
     const size_t max_in_flight;
     Translate translate;
+    Retire retire;
     /// Last: destroyed (its threads joined) before the state above.
     std::unique_ptr<Common::ThreadWorker> threads;
 };

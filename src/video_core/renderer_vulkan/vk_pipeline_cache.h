@@ -382,6 +382,13 @@ private:
     void EvictUnusedPipelines();
     u64 frame_count{};
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
+    /// Pipelines the translate queue did not use (discarded, stale, abandoned, rejected by the
+    /// verify mode), handed over on the GPU thread: destroyed by TickFrame once the GPU and
+    /// their queued build are done with them, never on a translation thread (fable_answer_18
+    /// 2b). Beside evicted_pipelines rather than in it: one whose build waits behind the boot
+    /// prebuild would hold the evictions behind it there, as that deque is freed from the front.
+    std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> retired_translations; ///< (tick, pipeline)
+    void RetireTranslatedPipeline(std::unique_ptr<GraphicsPipeline> pipeline);
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
 
     ::Common::unordered_map<ComputePipelineCacheKey, ComputePipelineCacheEntry> compute_cache;
@@ -391,6 +398,10 @@ private:
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
 
     ShaderPools main_pools;
+    /// EDEN_NX2_ASYNC_TRANSLATE=2: the GPU thread's reference translation at enqueue uses these
+    /// rather than releasing main_pools under whatever the GPU thread's own builds hold
+    /// (fable_answer_18 2c, the fallback). Made on first use, only in that mode.
+    std::unique_ptr<ShaderPools> verify_pools;
     std::mutex spare_pools_mutex;
     std::vector<std::shared_ptr<ShaderPools>> spare_pools;
 

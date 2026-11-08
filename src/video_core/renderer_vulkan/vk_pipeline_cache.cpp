@@ -808,7 +808,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             const size_t threads = TranslateThreads();
             translate_queue = std::make_unique<TranslateQueue>(
                 threads, MaxTranslationsInFlight,
-                [this](TranslationJob& job) { TranslateOnWorker(job); });
+                [this](TranslationJob& job) { TranslateOnWorker(job); },
+                [this](std::unique_ptr<GraphicsPipeline> pipeline) {
+                    RetireTranslatedPipeline(std::move(pipeline));
+                });
             LOG_INFO(Render_Vulkan,
                      "EDEN_NX2_ASYNC_TRANSLATE={}: new pipelines of draws that may be skipped are "
                      "translated on {} threads{}",
@@ -1676,6 +1679,7 @@ PipelineCache::~PipelineCache() {
     DestroyPipelinesWithProgress(background_ready);
     DestroyPipelinesWithProgress(graphics_cache);
     DestroyPipelinesWithProgress(evicted_pipelines);
+    DestroyPipelinesWithProgress(retired_translations);
 }
 
 void PipelineCache::NoteDiskRecordFailure(std::string_view kind, u64 hash, const char* reason) {
@@ -3636,6 +3640,11 @@ void PipelineCache::TickFrame() {
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
         evicted_pipelines.pop_front();
     }
+    // A retired translation's build may still be queued on the pipeline workers: destroying it
+    // now would wait for that build, or run it here on the GPU thread.
+    std::erase_if(retired_translations, [this](const auto& entry) {
+        return scheduler.IsFree(entry.first) && entry.second->IsBuilt();
+    });
     while (!retired_compute_pipelines.empty() &&
            scheduler.IsFree(retired_compute_pipelines.front().first) &&
            retired_compute_pipelines.front().second->IsBuildTaskDone()) {
@@ -3651,6 +3660,12 @@ void PipelineCache::TickFrame() {
             constexpr size_t MaxLibraries = 4096;
             graphics_libraries.TrimUnused(MaxLibraries);
         }
+    }
+}
+
+void PipelineCache::RetireTranslatedPipeline(std::unique_ptr<GraphicsPipeline> pipeline) {
+    if (pipeline) {
+        retired_translations.emplace_back(scheduler.CurrentTick(), std::move(pipeline));
     }
 }
 
@@ -4510,10 +4525,14 @@ bool PipelineCache::EnqueueTranslation() {
         GetGraphicsEnvironments(live, graphics_key.unique_hashes);
         job->reference = std::make_unique<TranslationRecord>();
         job->reference->translate_only = true;
-        main_pools.ReleaseContents();
+        // Pools of its own: nothing else on the GPU thread holds IR in them.
+        if (!verify_pools) {
+            verify_pools = std::make_unique<ShaderPools>();
+        }
+        verify_pools->ReleaseContents();
         [[maybe_unused]] const auto none =
-            CreateGraphicsPipeline(main_pools, graphics_key, live.Span(), nullptr, true, nullptr,
-                                   nullptr, false, job->reference.get());
+            CreateGraphicsPipeline(*verify_pools, graphics_key, live.Span(), nullptr, true,
+                                   nullptr, nullptr, false, job->reference.get());
         job->reference_envs = live.envs;
         job->record = std::make_unique<TranslationRecord>();
     }
@@ -4609,6 +4628,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::AdoptJob(std::unique_ptr<Transl
     case TranslationJob::Outcome::NoPipeline:
     case TranslationJob::Outcome::Pending:
         ++translate_stats.no_pipeline;
+        // A pipeline made before a failure on its thread is retired, not destroyed here.
+        translate_queue->Discard(std::move(job));
         return nullptr;
     }
     retry = true;
@@ -4658,9 +4679,9 @@ void PipelineCache::TranslateOnWorker(TranslationJob& job) {
     if (std::ranges::any_of(job.envs, [](const GraphicsEnvironment& env) {
             return env.GuardedReadFailed();
         })) {
-        // Translated with zeros where a read gave up: dropped here (its destructor may wait for
-        // the driver compile), translated again from a fresh snapshot.
-        job.pipeline.reset();
+        // Translated with zeros where a read gave up: never used, translated again from a fresh
+        // snapshot. The pipeline stays in the job: the GPU thread retires it (AdoptJob, Discard)
+        // rather than destroying it on this thread.
         job.outcome = TranslationJob::Outcome::Retry;
     } else if (job.reference && job.record) {
         verify_compared.fetch_add(1, std::memory_order_relaxed);
@@ -4670,8 +4691,8 @@ void PipelineCache::TranslateOnWorker(TranslationJob& job) {
                 LOG_WARNING(Render_Vulkan, "Async translate verify: {} differs: {}",
                             PipelineShaders(job.key), difference);
             }
-            // Never used: dropped here, built on the GPU thread from the live state.
-            job.pipeline.reset();
+            // Never used: retired by the GPU thread (AdoptJob, Discard), which builds the key
+            // itself from the live state.
             job.outcome = TranslationJob::Outcome::Differs;
         }
     }
@@ -4687,6 +4708,7 @@ void PipelineCache::TranslateOnWorker(TranslationJob& job) {
 }
 
 void PipelineCache::TickTranslations() {
+    translate_queue->RetireAbandoned();
     // Translations whose draws did not come back yet: adopted now, so the next draw finds them.
     for (auto& job : translate_queue->TakeFinished()) {
         const auto it = graphics_cache.find(job->key);
