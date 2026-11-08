@@ -153,6 +153,15 @@ inline std::atomic<int> g_idle_pause{-1};
 /// no GPU-written data (UploadNativeBank's upload, without its once-a-frame bank shadows: the
 /// check stays per bind, d79572d28a). Off by default; measure 1 and 2 first, then 4. Verify
 /// with EXP9=2 ("missed" stays 0) and the flash watch.
+/// EXP27 (keep the split's back fed, fewer submits; zortos293/Lichii#717), bits: 1 = the front
+/// publishes before it yields or sleeps polling suspended channels (PUBLISH_WAITS,
+/// GpuSplit::PublishBeforeWait), 2 = while the back found the ring empty, each entry is published
+/// at once (outside open Pairs and StateDelta blocks) and a publish takes back_waiting back so
+/// only the first wakes the back (PUBLISH_IDLE), 4 = the back prefetches the ring 128 words
+/// ahead (RING_PREFETCH), 8 = command list copies after a dispatch are submitted when the front
+/// waits for them, when the back goes idle or with the next submission, instead of at once
+/// (DISPATCH_BATCH, RasterizerVulkan::SubmitNx2ListCopies). Off by default; 1, 2 and 4 change
+/// only when work becomes visible, 8 changes submission timing (the #161 family: flash watch).
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 

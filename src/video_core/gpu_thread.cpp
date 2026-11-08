@@ -75,6 +75,11 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     scheduler.ResumePending(system.GPU());
                 }
                 if (!state.queue.TryPop(next)) {
+                    // EDEN_NX2_EXP27 & 1: what the resumed channels sent goes to the back before
+                    // this thread yields or sleeps (Commit publishes every 256 words).
+                    if (split.Active()) {
+                        split.PublishBeforeWait();
+                    }
                     // The CPU usually releases the semaphore soon after: poll for half a
                     // millisecond before sleeping, or every wait also waits out a host sleep
                     // (title 1 waits ~25 times a second).

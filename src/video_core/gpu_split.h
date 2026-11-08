@@ -362,6 +362,10 @@ public:
 
     /// Makes what was sent visible to the back.
     void Publish();
+    /// EDEN_NX2_EXP27 & 1 (zortos293/Lichii#717 EDEN_NX2_PUBLISH_WAITS): before the front yields
+    /// or sleeps polling suspended channels, it publishes what they sent (held-back work too),
+    /// so the back doesn't idle on work the front already decoded.
+    void PublishBeforeWait();
     /// Waits until the back executed everything sent so far.
     void Drain(DrainSite site = DrainSite::Other);
 
@@ -804,7 +808,12 @@ private:
     void Commit(size_t words, Effect effect) {
         write_position += words;
         writes.Entry(effect, write_position);
-        if (write_position - published_local >= publish_every) {
+        // EDEN_NX2_EXP27 & 2 (zortos293/Lichii#717 EDEN_NX2_PUBLISH_IDLE): a back that ran out
+        // of work gets each entry at once, except while a Pairs or StateDelta block is open
+        // (publishing ends the block).
+        if (write_position - published_local >= publish_every ||
+            (publish_idle && pairs_header == nullptr && delta_header == nullptr &&
+             back_idle.load(std::memory_order_relaxed))) {
             Publish();
         }
     }
@@ -939,6 +948,8 @@ private:
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
+    /// EXP27 & 2, read at each Publish: Commit publishes at once while back_idle is set.
+    bool publish_idle{};
     Tegra::Engines::EngineInterface* front_engine{};
     /// The open Pairs block's head (PairWrite), and its count.
     u64* pairs_header{};
@@ -992,6 +1003,9 @@ private:
     alignas(128) std::atomic<u64> consumed{};
     /// A position the front waits for (WaitFor): the back stores `consumed` once past it.
     alignas(128) std::atomic<u64> wait_target{~u64{0}};
+    /// The back found the ring empty (it spins, then sleeps): with EXP27 & 2 Commit publishes at
+    /// once. A hint only, stored when it changes.
+    alignas(128) std::atomic<bool> back_idle{};
     alignas(128) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
     /// The front sleeps in Backoff (#161: instead of yielding).

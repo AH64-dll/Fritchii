@@ -49,6 +49,19 @@ void Pause() {
 
 [[maybe_unused]] std::atomic<u32> g_back_thread_id{};
 
+/// EXP27 & 4: how far ahead of the entry it runs the back prefetches ring words (16 lines).
+constexpr u64 RingPrefetchWords = 128;
+
+void PrefetchRingLine(const u64* address) {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_prefetch(reinterpret_cast<const char*>(address), _MM_HINT_T0);
+#elif defined(__clang__) || defined(__GNUC__)
+    __builtin_prefetch(address, 0, 3);
+#else
+    static_cast<void>(address);
+#endif
+}
+
 } // Anonymous namespace
 
 void GpuSplit::CheckOwner(const char* where) {
@@ -178,6 +191,7 @@ void GpuSplit::Stop() {
     published_local = 0;
     consumed_cache = 0;
     publish_every = PublishEvery;
+    publish_idle = false;
     front_engine = nullptr;
     pairs_header = nullptr;
     pairs_count = 0;
@@ -189,6 +203,7 @@ void GpuSplit::Stop() {
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
+    back_idle.store(false, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
     front_waiting.store(false, std::memory_order_relaxed);
 }
@@ -236,13 +251,24 @@ void GpuSplit::Publish() {
     }
     published_local = write_position;
     publish_every = std::min<size_t>(publish_every * 2, PublishEvery);
+    publish_idle = (VideoCore::Nx2Debug::Experiment(27) & 2) != 0;
     published.store(write_position, std::memory_order_seq_cst);
-    if (back_waiting.load(std::memory_order_seq_cst)) {
+    // With EXP27 & 2 the flag is taken back here (zortos293/Lichii#717): the per-entry publishes
+    // until the back runs again don't wake it once more each. The back's wait ends on the first
+    // wake bump either way.
+    if (back_waiting.load(std::memory_order_seq_cst) &&
+        (!publish_idle || back_waiting.exchange(false, std::memory_order_seq_cst))) {
         wake.fetch_add(1, std::memory_order_seq_cst);
         wake.notify_one();
     }
     if ((++publishes & 1023) == 0) [[unlikely]] {
         ReportBatched();
+    }
+}
+
+void GpuSplit::PublishBeforeWait() {
+    if ((VideoCore::Nx2Debug::Experiment(27) & 1) != 0) {
+        Publish(); // Sends the held-back work first (RunPendingFlush)
     }
 }
 
@@ -1051,6 +1077,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
+            // EXP27 & 2: the front publishes each entry while this is set.
+            back_idle.store(true, std::memory_order_relaxed);
             // The front usually sends more within microseconds: spin briefly before sleeping.
             for (u32 spins = 0; spins < 8192 && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);
@@ -1082,9 +1110,26 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 continue;
             }
         }
+        if (back_idle.load(std::memory_order_relaxed)) {
+            back_idle.store(false, std::memory_order_relaxed);
+        }
         u64 last_store = read_position;
+        // EDEN_NX2_EXP27 & 4 (zortos293/Lichii#717 EDEN_NX2_RING_PREFETCH): prefetch the ring
+        // lines ahead of the entry, up to a line short of what the front published (a line it
+        // may still be writing would only bounce between the two cores).
+        const bool ring_prefetch = (VideoCore::Nx2Debug::Experiment(27) & 4) != 0;
+        u64 prefetched = read_position;
         while (read_position != available) {
             const size_t index = read_position & RingMask;
+            if (ring_prefetch) {
+                const u64 ahead = (std::min)(read_position + RingPrefetchWords,
+                                             available > 8 ? available - 8 : u64{0});
+                prefetched = (std::max)(prefetched, read_position);
+                while (prefetched + 8 <= ahead) {
+                    prefetched += 8;
+                    PrefetchRingLine(&ring[prefetched & RingMask]);
+                }
+            }
             back_entry_position = read_position;
             const size_t size =
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));

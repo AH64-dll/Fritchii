@@ -210,6 +210,14 @@ void Scheduler::FlushDeferred() {
     }
 }
 
+bool Scheduler::DeferFlushUntilWanted() {
+    if (!VideoCommon::GpuSplit::OnBackThread()) {
+        return false;
+    }
+    flush_pending = true;
+    return true;
+}
+
 bool Scheduler::WaitSubmitted(u64 tick) {
     if (IsSubmitted(tick)) {
         return true;
