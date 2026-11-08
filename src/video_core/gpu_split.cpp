@@ -601,6 +601,11 @@ GpuSplit::GuestWriters GpuSplit::QueuedGuestWriters(u64 done, GPUVAddr address, 
         }
         if (range.begin < end && device < range.end &&
             std::find(skip.begin(), skip.end(), range.position) == skip.end()) {
+            if (range.position > found.noted) {
+                found.range_kind = range.kind;
+                found.range_begin = range.begin;
+                found.range_end = range.end;
+            }
             noted(range.position, Cause::WriterRange);
             reached = true;
             break;
@@ -826,14 +831,14 @@ void GpuSplit::NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u
 
 void GpuSplit::NoteWriterRange(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
                                WriterKind kind) {
-    if (size != 0 && TryNoteWriterRange(memory, address, size) != ReleaseNote::Ranged) {
+    if (size != 0 && TryNoteWriterRange(memory, address, size, kind) != ReleaseNote::Ranged) {
         NoteUnboundedWriter(kind);
     }
 }
 
 void GpuSplit::NoteReleaseWriter(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
                                  bool at_run) {
-    ReleaseNote note = TryNoteWriterRange(memory, address, size);
+    ReleaseNote note = TryNoteWriterRange(memory, address, size, WriterKind::Release);
     if (note == ReleaseNote::Unmapped && !at_run) {
         // A fence callback translates it later, after functions queued meanwhile may map it.
         note = ReleaseNote::LateUnmapped;
@@ -845,7 +850,8 @@ void GpuSplit::NoteReleaseWriter(const Tegra::MemoryManager& memory, GPUVAddr ad
 }
 
 GpuSplit::ReleaseNote GpuSplit::TryNoteWriterRange(const Tegra::MemoryManager& memory,
-                                                   GPUVAddr address, u64 size) {
+                                                   GPUVAddr address, u64 size,
+                                                   WriterKind kind) {
     // As NoteWrite: a queued function may still remap the range, sparse pages are written through
     // their own backing. One device range only, as the reads compare device addresses.
     if (last_function_position > consumed_cache) {
@@ -855,7 +861,9 @@ GpuSplit::ReleaseNote GpuSplit::TryNoteWriterRange(const Tegra::MemoryManager& m
         address == writer_range_address && size == writer_range_size &&
         writer_range_function == last_function_position &&
         last_function_position <= consumed_cache) {
-        writer_ranges[(writer_range_count - 1) % writer_ranges.size()].position = write_position;
+        WriterRange& last = writer_ranges[(writer_range_count - 1) % writer_ranges.size()];
+        last.position = write_position;
+        last.kind = kind;
         return ReleaseNote::Ranged;
     }
     writer_range_memory = nullptr;
@@ -877,7 +885,7 @@ GpuSplit::ReleaseNote GpuSplit::TryNoteWriterRange(const Tegra::MemoryManager& m
         return ReleaseNote::Split;
     }
     writer_ranges[writer_range_count++ % writer_ranges.size()] = {write_position, *device,
-                                                                  *device + size};
+                                                                  *device + size, kind};
     writer_range_memory = &memory;
     writer_range_address = address;
     writer_range_size = size;
