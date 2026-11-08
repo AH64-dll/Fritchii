@@ -174,6 +174,9 @@ struct State {
     u32 violated_logged{};
     u64 foreign_landings{};
     u32 foreign_logged{};
+    /// Why a landing fit no record: every record of the word had landed; records of its kind
+    /// waited but none with its value; none of its kind waited. Per landing site (Nx2Landing).
+    std::array<std::array<u64, 3>, 5> foreign_by{};
     /// The newest plain record evicted before it landed, per bucket (its device; 0 for none):
     /// the word gets no bound until a plain landing there is attributed to it.
     std::array<u64, Buckets> evicted_plain{};
@@ -286,8 +289,10 @@ struct State {
                  "({:.0f} of the met by a release run before the check), {:.0f} still unmet; "
                  "QMD copy: QMD reads/s "
                  "{:.0f} from inline QMDs, {:.0f} from memory, {:.0f} after a wait; {:.0f} "
-                 "inline QMDs patched by uploads/s; {:.0f} resyncs/s, {:.0f} starts, {:.0f} "
-                 "auto-off; reduction bound would meet: {:.0f} "
+                 "inline QMDs patched by uploads/s; {:.0f} reads/s from upload shadows ({:.0f} "
+                 "shadows made, {:.0f} evicted, {:.0f} patched, {:.0f} uploads over 4 KB, "
+                 "{:.0f} not linear; {:.0f} overlays from memory and a patch); {:.0f} resyncs/s, "
+                 "{:.0f} starts, {:.0f} auto-off; reduction bound would meet: {:.0f} "
                  "GEQ, {:.0f} EQ, {:.0f} MASK",
                  Mode(), signal(Signal::Read), signal(Signal::Waiting), signal(Signal::Chained),
                  signal(Signal::Unmapped), rate(predicted[qmd]), rate(predicted_at_least),
@@ -303,7 +308,11 @@ struct State {
                  met(MetBy::QmdRelease), met(MetBy::QmdReduction), met(MetBy::DmaRelease),
                  met(MetBy::Other), met(MetBy::BeforeCheck), met(MetBy::Unmet),
                  mirrored(Mirror::Overlay), mirrored(Mirror::Memory), mirrored(Mirror::Waited),
-                 mirrored(Mirror::Patched), mirrored(Mirror::Resync), mirrored(Mirror::SessionStart),
+                 mirrored(Mirror::Patched), mirrored(Mirror::Shadow),
+                 mirrored(Mirror::ShadowCreated), mirrored(Mirror::ShadowEvicted),
+                 mirrored(Mirror::ShadowPatched), mirrored(Mirror::ShadowTooBig),
+                 mirrored(Mirror::ShadowNotLinear), mirrored(Mirror::OverlayFromMemory),
+                 mirrored(Mirror::Resync), mirrored(Mirror::SessionStart),
                  mirrored(Mirror::AutoOff), outcome(Outcome::GeqMet), outcome(Outcome::EqMet),
                  outcome(Outcome::MaskMet));
         if (Mode() == 2) {
@@ -318,7 +327,9 @@ struct State {
                      "payload, {:.0f} wrap guard; safety: {} checked, {} bound violated, {} not "
                      "landed yet; violations: {} went down, {} landings missing, {} other; "
                      "re-read later: {}/{}/{} recovered, {}/{}/{} never recovered in 100 ms (went "
-                     "down/landings missing/other); {} landings of unrecorded writes, {} "
+                     "down/landings missing/other); {} landings of unrecorded writes (all "
+                     "landed/no value fits/none of the kind, by site query completion {}, query "
+                     "immediate {}, QMD max {}, QMD reduction {}, report reduction {}), {} "
                      "phantom records swept, {} records evicted before landing; session totals: "
                      "{} checked, {} violated, {} not landed yet, {} landings of unrecorded "
                      "writes, {} phantoms; records/s "
@@ -338,7 +349,9 @@ struct State {
                      bound_checked, bound_violated, bound_unlanded, violations[0],
                      violations[1], violations[2], recovered[0], recovered[1], recovered[2],
                      never_recovered[0], never_recovered[1], never_recovered[2],
-                     foreign_landings, phantoms, evicted_unlanded, session_checked,
+                     foreign_landings, Rates(foreign_by[0], 1.0), Rates(foreign_by[1], 1.0),
+                     Rates(foreign_by[2], 1.0), Rates(foreign_by[3], 1.0),
+                     Rates(foreign_by[4], 1.0), phantoms, evicted_unlanded, session_checked,
                      session_violated, session_unlanded, session_foreign, session_phantoms,
                      Rates(reduction_ops[0], window),
                      Rates(reduction_ops[1], window), Rates(reduction_ops[2], window));
@@ -403,6 +416,7 @@ struct State {
         reduction_ops = {};
         bound_checked = bound_violated = bound_unlanded = 0;
         foreign_landings = 0;
+        foreign_by = {};
         evicted_unlanded = 0;
         matched_reductions = differs_reductions = unpredicted_reductions = 0;
         phantoms = 0;
@@ -641,10 +655,15 @@ void NoteRangeWait(u32 kind, s64 offset, u64 size) {
     }
 }
 
-void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing kind) {
+void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing site) {
     if (!MirrorMode()) {
         return;
     }
+    using Site = Tegra::Nx2Landing;
+    const Kind kind = site == Site::QmdMax ? Kind::AtLeast
+                      : site == Site::QmdReduction || site == Site::ReportReduction
+                          ? Kind::Reduction
+                          : Kind::Plain;
     auto& state = Get();
     std::scoped_lock lock{state.mutex};
     // The record it belongs to: reductions land in send order among themselves (synchronously,
@@ -652,6 +671,8 @@ void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing kind) {
     // land out of order with each other (query completions run on the fencing thread).
     Prediction* oldest = nullptr;
     bool any = false;
+    bool any_unlanded = false;
+    bool kind_unlanded = false;
     const size_t bucket = Bucket(device);
     for (Prediction& way : state.predictions[bucket]) {
         if (way.position == 0 || way.device != device) {
@@ -661,10 +682,14 @@ void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing kind) {
         if (way.landed) {
             continue;
         }
-        const bool fits = kind == Tegra::Nx2Landing::Reduction ? way.kind == Kind::Reduction
-                          : kind == Tegra::Nx2Landing::Max
-                              ? way.kind == Kind::AtLeast && way.payload <= value
-                              : way.kind == Kind::Plain && way.payload == value;
+        any_unlanded = true;
+        if (way.kind != kind) {
+            continue;
+        }
+        kind_unlanded = true;
+        const bool fits = kind == Kind::Reduction ? true
+                          : kind == Kind::AtLeast ? way.payload <= value
+                                                  : way.payload == value;
         if (fits && (oldest == nullptr || way.sequence < oldest->sequence)) {
             oldest = &way;
         }
@@ -673,7 +698,7 @@ void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing kind) {
         oldest->landed = true;
         return;
     }
-    if (kind == Tegra::Nx2Landing::Plain && state.evicted_plain[bucket] == device) {
+    if (kind == Kind::Plain && state.evicted_plain[bucket] == device) {
         state.evicted_plain[bucket] = 0; // The evicted plain record's, most likely
         return;
     }
@@ -682,6 +707,11 @@ void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing kind) {
     }
     ++state.foreign_landings;
     ++state.session_foreign;
+    const size_t reason = !any_unlanded ? 0 : kind_unlanded ? 1 : 2;
+    const size_t site_index = static_cast<size_t>(site);
+    if (site_index < state.foreign_by.size()) {
+        ++state.foreign_by[site_index][reason];
+    }
     if (state.foreign_logged < 8) {
         ++state.foreign_logged;
         std::string kinds;
@@ -698,14 +728,20 @@ void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing kind) {
                                      way.payload, way.landed ? " landed" : "");
             }
         }
+        constexpr std::array<const char*, 5> sites{"query completion", "query immediate",
+                                                   "QMD max", "QMD reduction",
+                                                   "report reduction"};
+        constexpr std::array<const char*, 3> reasons{
+            "every record of the word had landed", "no waiting record of its kind has its value",
+            "no record of its kind waits"};
         LOG_INFO(HW_GPU,
-                 "QMD release prediction (EXP13=2): a landing no record fits: device {:#x}, "
-                 "{} {:#x}; the word's records:{}",
-                 device,
-                 kind == Tegra::Nx2Landing::Plain ? "plain"
-                 : kind == Tegra::Nx2Landing::Max ? "max"
-                                                  : "reduction",
-                 value, kinds);
+                 "QMD release prediction (EXP13=2): a landing no record fits ({}): device {:#x}, "
+                 "{} {:#x} through the {} path; the word's records:{}",
+                 reasons[reason], device,
+                 kind == Kind::Plain     ? "plain"
+                 : kind == Kind::AtLeast ? "max"
+                                         : "reduction",
+                 value, site_index < sites.size() ? sites[site_index] : "?", kinds);
     }
 }
 

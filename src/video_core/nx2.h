@@ -457,9 +457,11 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
 // sets the hook once it records). The landing sites call it BEFORE they write the word, so a
 // front that reads the new word also finds the record marked.
 enum class Nx2Landing : u32 {
-    Plain,     ///< The payload (a query cache payload write)
-    Max,       ///< max(word, payload) (a QMD max release)
-    Reduction, ///< A reduction's result (QMD or compute report reduction)
+    QueryCompletion, ///< A query cache payload write when its fence or query completes (plain)
+    QueryImmediate,  ///< A query cache payload write as the back runs it (plain)
+    QmdMax,          ///< A QMD max release: max(word, payload)
+    QmdReduction,    ///< A QMD release reduction's result
+    ReportReduction, ///< A compute report semaphore reduction's result
 };
 inline std::atomic<void (*)(u64, u32, Nx2Landing)> g_nx2_landed_hook{};
 
