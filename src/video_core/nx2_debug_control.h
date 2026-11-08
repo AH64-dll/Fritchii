@@ -223,12 +223,6 @@ inline void LoadExperiments() {
         // after a full 1 ms sleep. Castle Town toggle, 4 balanced cycles: 45.9 -> 46.7 fps
         // (3 of 4 pairs positive). Other games and builds: untouched.
         g_experiments[24].store(3, std::memory_order_relaxed);
-        // EXP28 = 3 (zortos293/Lichii#717 wave 1, FENCE_TRIM/FOLD): fences whose only work is the
-        // payload host-sync are skipped (the sync rides the next fence), and fences with nothing
-        // to wait for join the newest queued one. Castle Town toggle, 4 balanced cycles: 41.4 ->
-        // 44.5 fps with every pair positive; fences made 5-6k/s -> 3.7-4.6k/s. Route with the
-        // flash watcher: no whole-screen flashes (largest 13 of 576 tiles, as on runs without it).
-        g_experiments[28].store(3, std::memory_order_relaxed);
         // EXP29 = 6: the exact parts of #717's micro bundle (TickWork's lock-free check, native
         // compute inline uploads not recorded); 1 (memory usage reuse) changes what the caches'
         // GC sees and stays off.
