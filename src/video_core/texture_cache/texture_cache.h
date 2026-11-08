@@ -541,6 +541,11 @@ void TextureCache<P>::TickFrame() {
     if constexpr (requires { runtime.CurrentTick(); }) {
         while (!gpu_sentenced_images.empty() &&
                runtime.IsFree(gpu_sentenced_images.front().tick)) {
+            // EXP42: the GPU is done with it, so its VkImage may go to the runtime's pool for
+            // the next image of its shape (fable_answer_12 2B).
+            if constexpr (requires(Image& image) { image.ReleaseToPool(); }) {
+                gpu_sentenced_images.front().image.ReleaseToPool();
+            }
             gpu_sentenced_bytes -= gpu_sentenced_images.front().bytes;
             gpu_sentenced_images.pop_front();
         }
@@ -555,6 +560,10 @@ void TextureCache<P>::TickFrame() {
             total_used_memory -= (std::min)(total_used_memory, bytes);
         }
         total_used_memory -= (std::min)(total_used_memory, gpu_sentenced_bytes);
+        // EXP42's pooled images are deleted images too: the pool caps and ages them itself.
+        if constexpr (requires { runtime.PooledImageBytes(); }) {
+            total_used_memory -= (std::min)(total_used_memory, runtime.PooledImageBytes());
+        }
     }
     // Every 600 frames: device memory in use against the collector's thresholds.
     // Skip expensive heap allocation, map construction, and sorting unless debug logging is explicitly enabled.
@@ -3242,6 +3251,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     const auto create_start = std::chrono::steady_clock::now();
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     rt_stats.create_ns += NsSince(create_start);
+    if constexpr (requires(const Image& image) { image.FromPool(); }) {
+        rt_stats.pooled_images += slot_images[new_image_id].FromPool() ? 1 : 0;
+    }
     if constexpr (requires(const Image& image) { image.OutOfMemory(); }) {
         if (slot_images[new_image_id].OutOfMemory()) {
             // Left out of the cache: lookups see no image (a null view) and make it again once

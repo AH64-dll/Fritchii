@@ -29,6 +29,7 @@
 
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/render_trace.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 
@@ -503,7 +504,8 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
                                   const ImageInfo& info, std::span<const VkFormat> view_formats,
                                   std::optional<VkFormat> format_override = {},
                                   bool unbacked = false, bool aliased = false,
-                                  bool may_fail = false) {
+                                  bool may_fail = false, TextureCacheRuntime* pool = nullptr,
+                                  ImagePoolKey* pool_key = nullptr, bool* pooled = nullptr) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -529,6 +531,37 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
 
         if (device.IsKhrImageFormatListSupported()) {
             image_ci.pNext = &image_format_list;
+        }
+    }
+    // EXP42: single-level, single-layer render targets can come from (and go back to) the pool.
+    constexpr VkImageUsageFlags attachment_usage =
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if (pool_key != nullptr && !unbacked && image_ci.imageType == VK_IMAGE_TYPE_2D &&
+        image_ci.mipLevels == 1 && image_ci.arrayLayers == 1 &&
+        image_ci.samples == VK_SAMPLE_COUNT_1_BIT && (image_ci.usage & attachment_usage) != 0) {
+        *pool_key = ImagePoolKey{
+            .valid = true,
+            .flags = image_ci.flags,
+            .type = image_ci.imageType,
+            .format = image_ci.format,
+            .width = image_ci.extent.width,
+            .height = image_ci.extent.height,
+            .depth = image_ci.extent.depth,
+            .levels = image_ci.mipLevels,
+            .layers = image_ci.arrayLayers,
+            .samples = image_ci.samples,
+            .tiling = image_ci.tiling,
+            .usage = image_ci.usage,
+            .view_formats = view_formats.data(),
+            .view_format_count = view_formats.size(),
+        };
+        if (pool != nullptr) {
+            if (vk::Image image = pool->TakePooledImage(*pool_key)) {
+                if (pooled != nullptr) {
+                    *pooled = true;
+                }
+                return image;
+            }
         }
     }
     if (unbacked) {
@@ -2889,7 +2922,79 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
     }
 }
 
+vk::Image TextureCacheRuntime::TakePooledImage(const ImagePoolKey& key) {
+    if (!key.valid || VideoCore::Nx2Debug::Experiment(42) == 0) {
+        return vk::Image{};
+    }
+    // Newest first: its memory is the most likely to be resident still.
+    for (auto it = image_pool.rbegin(); it != image_pool.rend(); ++it) {
+        if (it->key != key) {
+            continue;
+        }
+        vk::Image image = std::move(it->image);
+        image_pool_bytes -= it->bytes;
+        image_pool.erase(std::next(it).base());
+        ++image_pool_taken;
+        return image;
+    }
+    ++image_pool_missed;
+    return vk::Image{};
+}
+
+void TextureCacheRuntime::PoolImage(const ImagePoolKey& key, vk::Image image, u64 bytes) {
+    if (!key.valid || !image || bytes > ImagePoolMaxBytes) {
+        return;
+    }
+    image_pool.push_back(PooledImage{
+        .key = key,
+        .image = std::move(image),
+        .bytes = bytes,
+        .frame = image_pool_frame,
+    });
+    image_pool_bytes += bytes;
+    ++image_pool_given;
+    TrimImagePool(ImagePoolMaxBytes);
+}
+
+void TextureCacheRuntime::TrimImagePool(u64 max_bytes) {
+    while (!image_pool.empty() && image_pool_bytes > max_bytes) {
+        image_pool_bytes -= image_pool.front().bytes;
+        image_pool.pop_front();
+        ++image_pool_evicted;
+    }
+}
+
 void TextureCacheRuntime::TickFrame() {
+    ++image_pool_frame;
+    {
+        // EXP42's pool: images older than ImagePoolMaxFrames go, and all of them when the
+        // switch is off or device memory ran short (an image did not fit or could not be made).
+        const u32 pressure = memory_allocator.MemoryPressureEvents();
+        const u32 failed = memory_allocator.FailedImages();
+        const bool short_of_memory =
+            pressure != image_pool_seen_pressure || failed != image_pool_seen_failed;
+        image_pool_seen_pressure = pressure;
+        image_pool_seen_failed = failed;
+        const int pool_switch = VideoCore::Nx2Debug::Experiment(42);
+        if (pool_switch == 0 || short_of_memory) {
+            TrimImagePool(0);
+        }
+        while (!image_pool.empty() &&
+               image_pool_frame - image_pool.front().frame > ImagePoolMaxFrames) {
+            image_pool_bytes -= image_pool.front().bytes;
+            image_pool.pop_front();
+            ++image_pool_evicted;
+        }
+        if (image_pool_frame % 600 == 0 &&
+            (pool_switch != 0 || image_pool_taken + image_pool_given != 0)) {
+            LOG_INFO(Render_Vulkan,
+                     "Image pool (EXP42) last 600 frames: {} taken, {} missed, {} pooled, {} "
+                     "evicted; holds {} images, {} MiB",
+                     image_pool_taken, image_pool_missed, image_pool_given, image_pool_evicted,
+                     image_pool.size(), image_pool_bytes >> 20);
+            image_pool_taken = image_pool_missed = image_pool_given = image_pool_evicted = 0;
+        }
+    }
     while (!pending_byte_addressed_shadows.empty() &&
            scheduler.IsFree(pending_byte_addressed_shadows.front().tick)) {
         pending_byte_addressed_shadows.pop_front();
@@ -2951,7 +3056,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    IsUnwrittenSparse(runtime_.device, info, gpu_addr_),
                                UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
-                               true)),
+                               true, &runtime_, &original_pool_key, &from_pool)),
       aspect_mask(ImageAspectMask(info.format)) {
     if (OutOfMemory()) {
         return;
@@ -3027,6 +3132,37 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
 }
 
 Image::Image(const VideoCommon::NullImageParams& params) : VideoCommon::ImageBase{params} {}
+
+void Image::ReleaseToPool() {
+    using VideoCommon::ImageFlagBits;
+    if (runtime == nullptr || VideoCore::Nx2Debug::Experiment(42) == 0) {
+        return;
+    }
+    constexpr ImageFlagBits unusual = ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
+                                      ImageFlagBits::SparseTiles | ImageFlagBits::UnwrittenSparse |
+                                      ImageFlagBits::Unbacked;
+    if (True(flags & unusual)) {
+        return;
+    }
+    constexpr u64 MinPooledBytes = u64{256} << 10;
+    const auto give = [this](vk::Image& image, const ImagePoolKey& key) {
+        if (!key.valid || !image || image.IsUnbacked()) {
+            return;
+        }
+        // Dedicated allocations (block 0) and memory placed in host memory over budget are
+        // freed as before.
+        const vk::Image::MemoryBlock block = image.GetMemoryBlock();
+        if (block.block == 0 || block.size < MinPooledBytes || !image.IsDeviceLocal()) {
+            return;
+        }
+        if (ENABLE_MSAA_RESOLVE_CONSUME) {
+            runtime->EraseResolveShadow(*image);
+        }
+        runtime->PoolImage(key, std::move(image), block.size);
+    };
+    give(original_image, original_pool_key);
+    give(scaled_image, scaled_pool_key);
+}
 
 Image::~Image() {
     if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
@@ -4095,7 +4231,8 @@ bool Image::ScaleUp(bool ignore) {
         scaled_info.size.width = scaled_width;
         scaled_info.size.height = scaled_height;
         scaled_image = MakeImage(runtime->device, runtime->memory_allocator, scaled_info,
-                                 runtime->ViewFormats(info.format));
+                                 runtime->ViewFormats(info.format), {}, false, false, false,
+                                 runtime, &scaled_pool_key);
         ignore = false;
     }
     current_image = &Image::scaled_image;

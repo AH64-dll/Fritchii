@@ -286,6 +286,16 @@ inline std::atomic<int> g_idle_pause{-1};
 /// entries inside a method's data (the parameters GPU work writes) still wait. Against the
 /// built-in skip-everything this only adds waits. Entries that didn't wait for every writer are
 /// checked on the back ("EDEN_NX2_LIST_WAIT_SKIP: command list at ... was GPU-written": stays 0).
+/// EXP42 (live; VkImage pool, fable_answer_12 2B; vk_texture_cache.cpp): 1 = a deleted
+/// single-level, single-layer render target's VkImage (and its rescaled copy), once the GPU is done
+/// with it, is kept with its memory for the next image made with the same create info and view
+/// formats, instead of vkDestroyImage + vkCreateImage. Only device-local, non-dedicated images of
+/// 256 KiB or more; the pool holds at most 512 MiB, 180 frames each, and empties when the switch
+/// goes off or an image does not fit in device memory. A taken image starts uninitialized
+/// (UNDEFINED layout, contents discarded) as a new one does. Its bytes are left out of the
+/// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
+/// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 0 (default)
+/// = off.
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 
