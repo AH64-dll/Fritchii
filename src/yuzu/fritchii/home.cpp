@@ -8,6 +8,7 @@
 
 #include <QApplication>
 #include <QBoxLayout>
+#include <QDir>
 #include <QEvent>
 #include <QFileInfo>
 #include <QLabel>
@@ -78,6 +79,26 @@ bool IsBlank(const QPixmap& pixmap) {
     return true;
 }
 
+/// A cover the player put next to the game file: "<file name>.png" or "icon.png" (the same files
+/// Game Settings > Detect Icon looks at first). Read only; the game file is never changed.
+QPixmap LocalCover(const QString& game_path) {
+    const QFileInfo info(game_path);
+    const QDir dir = info.absoluteDir();
+    for (const QString& base : {info.completeBaseName(), QStringLiteral("icon")}) {
+        for (const char* ext : {".png", ".jpg", ".jpeg", ".webp"}) {
+            const QFileInfo candidate(dir.filePath(base + QLatin1String(ext)));
+            if (!candidate.isFile() || candidate.size() > 16 * 1024 * 1024) {
+                continue;
+            }
+            QPixmap pixmap;
+            if (pixmap.load(candidate.filePath())) {
+                return pixmap;
+            }
+        }
+    }
+    return {};
+}
+
 std::vector<Game> CollectGames(QStandardItemModel* model, const QPixmap& fallback) {
     std::vector<Game> games;
     std::set<QString> seen;
@@ -105,7 +126,10 @@ std::vector<Game> CollectGames(QStandardItemModel* model, const QPixmap& fallbac
             game.icon = item->data(Qt::DecorationRole).value<QPixmap>();
         }
         if (IsBlank(game.icon)) {
-            // No icon in the dump: Fritchii's own icon instead of an empty square.
+            game.icon = LocalCover(path);
+        }
+        if (IsBlank(game.icon)) {
+            // No icon in the dump and none next to it: Fritchii's own icon, not an empty square.
             game.icon = fallback;
         }
         games.push_back(std::move(game));

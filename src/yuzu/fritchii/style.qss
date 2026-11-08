@@ -180,7 +180,7 @@ QPushButton#FritchiiPlay {
     background: #a78bfa;
     color: #1c1433;
     border: none;
-    border-radius: 21px;
+    border-radius: 8px;
     min-height: 44px;
     max-height: 44px;
     padding: 0 30px;
