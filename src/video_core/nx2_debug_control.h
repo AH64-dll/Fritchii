@@ -167,6 +167,9 @@ inline std::atomic<int> g_idle_pause{-1};
 /// off its lock-free answer for image-free, never-GPU-written pages). For the washed-out hunt.
 /// EXP37 (live): 1 = nx2:gsv answers the driver's armed syncpoint waits right after each guest
 /// syncpoint increment (SyncpointManager guest increment hook), not only at its 500 us poll.
+/// EXP35=2 (live): every guest write of cached memory is collected for the back, not only writes to
+/// never-GPU-written pages. EXP60 (live): 1 = a guest read whose cache mutexes stay taken after a
+/// short spin is answered with a flush request served by the back (GetFlushArea).
 /// EXP27 (keep the split's back fed, fewer submits; zortos293/Lichii#717), bits: 1 = the front
 /// publishes before it yields or sleeps polling suspended channels (PUBLISH_WAITS,
 /// GpuSplit::PublishBeforeWait), 2 = while the back found the ring empty, each entry is published
