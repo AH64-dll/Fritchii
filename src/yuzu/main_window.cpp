@@ -450,8 +450,14 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     connect(&update_watcher, &QFutureWatcher<UpdateChecker::CheckResult>::finished, this,
             &MainWindow::OnEmulatorUpdateAvailable);
     // A swap that a crash interrupted is finished or undone before anything else.
-    if (!Updater::FinishPendingSwap(this) && UISettings::values.check_for_updates) {
-        StartUpdateCheck(false);
+    if (!Updater::FinishPendingSwap(this)) {
+        if (auto note = Updater::TakeRestartNote()) {
+            restart_note = std::move(*note);
+            QTimer::singleShot(0, this, &MainWindow::ShowRestartNote);
+        }
+        if (UISettings::values.check_for_updates) {
+            StartUpdateCheck(false);
+        }
     }
 #endif
 
@@ -2503,13 +2509,7 @@ void MainWindow::OnEmulationStopped() {
     LOG_INFO(Frontend, "Emulation cleanup completed");
 #ifdef ENABLE_UPDATE_CHECKER
     if (pending_update && !close_pending) {
-        QTimer::singleShot(0, this, [this] {
-            if (pending_update && !emulation_running && !boot_in_progress) {
-                const auto result = std::move(*pending_update);
-                pending_update.reset();
-                ShowUpdate(result);
-            }
-        });
+        QTimer::singleShot(0, this, &MainWindow::OfferPendingUpdate);
     }
 #endif
     if (close_pending) {
@@ -4755,8 +4755,9 @@ void MainWindow::OnEmulatorUpdateAvailable() {
     if (!result.update) {
         if (manual) {
             QMessageBox::information(this, tr("Check for Updates"),
-                                     tr("You have the latest version (%1).")
-                                         .arg(QString::fromLatin1(Common::g_build_version)));
+                                     tr("You have the latest version (%1 %2).")
+                                         .arg(QString::fromLatin1(Common::g_build_name),
+                                              QString::fromLatin1(Common::g_build_version)));
         }
         return;
     }
@@ -4767,14 +4768,39 @@ void MainWindow::OnEmulatorUpdateAvailable() {
                     UISettings::values.update_remind_at.GetValue() > now)) {
         return;
     }
+    pending_update = result;
     if (emulation_running || boot_in_progress) {
-        pending_update = result;
         statusBar()->showMessage(tr("%1 is available. It will be offered when the game closes.")
                                      .arg(QString::fromStdString(release.title)),
                                  15000);
         return;
     }
+    OfferPendingUpdate();
+}
+
+void MainWindow::OfferPendingUpdate() {
+    if (!pending_update || close_pending || emulation_running || boot_in_progress) {
+        // OnEmulationStopped offers it once the game is closed.
+        return;
+    }
+    // Wait for other dialogs, such as the first-launch frame rate question, to be answered.
+    const bool first_question_pending =
+        !launched_with_game && !Settings::values.oot_fps_asked.GetValue();
+    if (QApplication::activeModalWidget() != nullptr || first_question_pending) {
+        QTimer::singleShot(1000, this, &MainWindow::OfferPendingUpdate);
+        return;
+    }
+    const auto result = std::move(*pending_update);
+    pending_update.reset();
     ShowUpdate(result);
+}
+
+void MainWindow::ShowRestartNote() {
+    if (QApplication::activeModalWidget() != nullptr) {
+        QTimer::singleShot(1000, this, &MainWindow::ShowRestartNote);
+        return;
+    }
+    QMessageBox::information(this, tr("Fritchii"), restart_note);
 }
 
 void MainWindow::ShowUpdate(const UpdateChecker::CheckResult& result) {

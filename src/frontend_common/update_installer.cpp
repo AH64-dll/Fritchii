@@ -499,6 +499,35 @@ void CleanStaging(const fs::path& install_dir) {
     fs::remove_all(install_dir / StagingName, ec);
 }
 
+fs::path RunningExePath() {
+#ifdef _WIN32
+    std::wstring buffer(MAX_PATH, L'\0');
+    for (;;) {
+        const auto size =
+            GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (size == 0) {
+            return {};
+        }
+        if (size < buffer.size()) {
+            buffer.resize(size);
+            return fs::path{buffer};
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+#else
+    std::error_code ec;
+    auto path = fs::read_symlink("/proc/self/exe", ec);
+    return ec ? fs::path{} : path;
+#endif
+}
+
+bool IsUpdaterFolder(const fs::path& install_dir) {
+    return std::ranges::any_of(install_dir, [](const fs::path& part) {
+        const auto name = ToUtf8(part);
+        return EqualsIgnoreCase(name, OldName) || EqualsIgnoreCase(name, StagingName);
+    });
+}
+
 void WaitForReplacedProcess() {
     const char* value = std::getenv(RestartWaitVariable);
     if (value == nullptr || *value == '\0') {

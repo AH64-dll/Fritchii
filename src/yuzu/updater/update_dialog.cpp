@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <filesystem>
+#include <utility>
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFileInfo>
+#include <QMessageBox>
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QPushButton>
@@ -40,9 +42,38 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr wchar_t ExeName[] = L"lichii.exe";
+// Set for a restarted process to a note it shows once it is up, such as "v5 is installed".
+constexpr char RestartNoteVariable[] = "LICHII_UPDATE_NOTE";
+
+// Read in PrepareLaunch, before a swap can rename the running exe into update-old.
+fs::path& LaunchExe() {
+    static fs::path exe;
+    return exe;
+}
+
+QString& RestartNote() {
+    static QString note;
+    return note;
+}
 
 fs::path InstallDir() {
-    return fs::path{QCoreApplication::applicationDirPath().toStdWString()};
+    if (LaunchExe().empty()) {
+        LaunchExe() = UpdateInstaller::RunningExePath();
+    }
+    return LaunchExe().parent_path();
+}
+
+// A message box on top of the main window. The update dialog and the progress dialogs are closed
+// by the time these show, and a box parented to them can end up hidden.
+QMessageBox::StandardButton Notify(QWidget* window, QMessageBox::Icon icon, const QString& title,
+                                   const QString& text,
+                                   QMessageBox::StandardButtons buttons = QMessageBox::Ok) {
+    QMessageBox box(icon, title, text, buttons, window);
+    box.setWindowFlag(Qt::WindowStaysOnTopHint);
+    box.show();
+    box.raise();
+    box.activateWindow();
+    return static_cast<QMessageBox::StandardButton>(box.exec());
 }
 
 std::string PathText(const fs::path& path) {
@@ -172,13 +203,12 @@ void UpdateDialog::Download() {
         }
         LOG_WARNING(Frontend, "Cannot write to {}, downloading the update instead",
                     PathText(InstallDir()));
-        QtCommon::Frontend::Information(
-            tr("Update Needs to Be Installed by Hand"),
-            tr("Fritchii can't write to its folder (%1), so it can't update itself there. The "
-               "update will be downloaded instead: unzip it and copy its contents over your "
-               "Fritchii folder, or move Fritchii to a folder you can write to, such as "
-               "Documents.")
-                .arg(QDir::toNativeSeparators(QCoreApplication::applicationDirPath())));
+        Notify(parentWidget(), QMessageBox::Information, tr("Update Needs to Be Installed by Hand"),
+               tr("Fritchii can't write to its folder (%1), so it can't update itself there. The "
+                  "update will be downloaded instead: unzip it and copy its contents over your "
+                  "Fritchii folder, or move Fritchii to a folder you can write to, such as "
+                  "Documents.")
+                   .arg(QDir::toNativeSeparators(QString::fromStdWString(InstallDir().wstring()))));
     }
 #endif
     SaveToFolder();
@@ -200,14 +230,13 @@ void UpdateDialog::SaveToFolder() {
         return;
 
     // Download is complete. User may choose to open in the file manager.
-    auto button =
-        QtCommon::Frontend::Question(tr("Download Complete"),
-                                     tr("Successfully downloaded %1. Would you like to open its "
-                                        "folder?")
-                                         .arg(QString::fromStdString(m_asset.filename)),
-                                     QtCommon::Frontend::Yes | QtCommon::Frontend::No);
+    auto button = Notify(parentWidget(), QMessageBox::Question, tr("Download Complete"),
+                         tr("Successfully downloaded %1. Would you like to open its "
+                            "folder?")
+                             .arg(QString::fromStdString(m_asset.filename)),
+                         QMessageBox::Yes | QMessageBox::No);
 
-    if (button == QtCommon::Frontend::Yes) {
+    if (button == QMessageBox::Yes) {
         QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(filename).absolutePath()));
     }
 }
@@ -217,15 +246,14 @@ void UpdateDialog::InstallInPlace() {
     const auto install_dir = InstallDir();
     const UpdateInstaller::Lock lock{install_dir / UpdateInstaller::LockName};
     if (!lock.Held()) {
-        QtCommon::Frontend::Critical(
-            tr("Failed to install the update"),
-            tr("Another Fritchii window is already updating this folder."));
+        Notify(parentWidget(), QMessageBox::Critical, tr("Failed to install the update"),
+               tr("Another Fritchii window is already updating this folder."));
         return;
     }
     if (fs::exists(install_dir / UpdateInstaller::JournalName)) {
-        QtCommon::Frontend::Critical(tr("Failed to install the update"),
-                                     tr("An earlier update is unfinished. Start Fritchii again to "
-                                        "finish it first."));
+        Notify(parentWidget(), QMessageBox::Critical, tr("Failed to install the update"),
+               tr("An earlier update is unfinished. Start Fritchii again to "
+                  "finish it first."));
         return;
     }
 
@@ -234,7 +262,7 @@ void UpdateDialog::InstallInPlace() {
     const auto unpacked = staging / "unpacked";
     const auto fail = [&](const QString& text) {
         UpdateInstaller::CleanStaging(install_dir);
-        QtCommon::Frontend::Critical(tr("Failed to install the update"), text);
+        Notify(parentWidget(), QMessageBox::Critical, tr("Failed to install the update"), text);
     };
 
     UpdateInstaller::CleanStaging(install_dir);
@@ -278,12 +306,11 @@ void UpdateDialog::InstallInPlace() {
     case UpdateInstaller::Outcome::Done:
         LOG_INFO(Frontend, "Installed {} in {}", m_release.tag, PathText(install_dir));
         UpdateInstaller::CleanStaging(install_dir);
-        QtCommon::Frontend::Information(tr("Update Installed"),
-                                        tr("%1 is installed. Fritchii will restart now.\n\nThe "
-                                           "previous version is kept: Help > "
-                                           "Roll Back to the Previous Version brings it back.")
-                                            .arg(QString::fromStdString(m_release.title)));
-        Updater::Restart(parentWidget());
+        // Restart at once; the new version says it was installed when it is up.
+        Updater::Restart(parentWidget(),
+                         tr("%1 is installed.\n\nThe previous version is kept: Help > Roll Back "
+                            "to the Previous Version brings it back.")
+                             .arg(QString::fromStdString(m_release.title)));
         return;
     case UpdateInstaller::Outcome::Unchanged:
         LOG_ERROR(Frontend, "Could not install {}: {}", m_release.tag, ec.message());
@@ -293,13 +320,12 @@ void UpdateDialog::InstallInPlace() {
     case UpdateInstaller::Outcome::Interrupted:
         LOG_CRITICAL(Frontend, "Installing {} failed and could not be undone: {}", m_release.tag,
                      ec.message());
-        QtCommon::Frontend::Critical(
-            tr("Failed to install the update"),
-            tr("The update failed (%1) and some files could not be put back. Close Fritchii and "
-               "start it again to restore the previous version. If it does not start, download "
-               "the release again and unzip it over your Fritchii folder; your user data is not "
-               "affected.")
-                .arg(ErrorText(ec)));
+        Notify(parentWidget(), QMessageBox::Critical, tr("Failed to install the update"),
+               tr("The update failed (%1) and some files could not be put back. Close Fritchii and "
+                  "start it again to restore the previous version. If it does not start, download "
+                  "the release again and unzip it over your Fritchii folder; your user data is not "
+                  "affected.")
+                   .arg(ErrorText(ec)));
         return;
     }
 }
@@ -310,8 +336,8 @@ bool UpdateDialog::DownloadTo(const QString& filename) {
     QSaveFile file(filename);
     if (!file.open(QIODevice::Truncate | QIODevice::WriteOnly)) {
         LOG_WARNING(Frontend, "Could not open file {}", filename.toStdString());
-        QtCommon::Frontend::Critical(tr("Failed to save file"),
-                                     tr("Could not open file %1 for writing.").arg(filename));
+        Notify(parentWidget(), QMessageBox::Critical, tr("Failed to save file"),
+               tr("Could not open file %1 for writing.").arg(filename));
         return false;
     }
 
@@ -353,15 +379,15 @@ bool UpdateDialog::DownloadTo(const QString& filename) {
     u64 received = 0;
 
     // Write file in chunks.
-    auto content_receiver = [&file, &hash, &received, filename](const char* t_data,
-                                                                size_t data_length) -> bool {
+    auto content_receiver = [this, &file, &hash, &received, filename](const char* t_data,
+                                                                      size_t data_length) -> bool {
         hash.addData(QByteArrayView(t_data, static_cast<qsizetype>(data_length)));
         received += data_length;
         if (file.write(t_data, data_length) == -1) {
             LOG_WARNING(Frontend, "Could not write {} bytes to file {}", data_length,
                         filename.toStdString());
-            QtCommon::Frontend::Critical(tr("Failed to save file"),
-                                         tr("Could not write to file %1.").arg(filename));
+            Notify(parentWidget(), QMessageBox::Critical, tr("Failed to save file"),
+                   tr("Could not write to file %1.").arg(filename));
             return false;
         }
 
@@ -376,9 +402,9 @@ bool UpdateDialog::DownloadTo(const QString& filename) {
         LOG_ERROR(Frontend, "GET to {}{} failed: {}", m_asset.url, m_asset.path,
                   httplib::to_string(result.error()));
         if (result.error() != httplib::Error::Canceled) {
-            QtCommon::Frontend::Critical(tr("Failed to download file"),
-                                         tr("Could not download the update. Check your internet "
-                                            "connection and try again."));
+            Notify(parentWidget(), QMessageBox::Critical, tr("Failed to download file"),
+                   tr("Could not download the update. Check your internet "
+                      "connection and try again."));
         }
         return false;
     }
@@ -387,11 +413,10 @@ bool UpdateDialog::DownloadTo(const QString& filename) {
     if (response.status >= 400) {
         LOG_ERROR(Frontend, "GET to {}{} returned error status code: {}", m_asset.url, m_asset.path,
                   response.status);
-        QtCommon::Frontend::Critical(tr("Failed to download file"),
-                                     tr("Could not download from %1%2\nError code: %3")
-                                         .arg(QString::fromStdString(m_asset.url),
-                                              QString::fromStdString(m_asset.path),
-                                              QString::number(response.status)));
+        Notify(parentWidget(), QMessageBox::Critical, tr("Failed to download file"),
+               tr("Could not download from %1%2\nError code: %3")
+                   .arg(QString::fromStdString(m_asset.url), QString::fromStdString(m_asset.path),
+                        QString::number(response.status)));
         return false;
     }
     if (!response.has_header("content-type")) {
@@ -407,17 +432,16 @@ bool UpdateDialog::DownloadTo(const QString& filename) {
         LOG_ERROR(Frontend, "Downloaded {} does not match the published size or SHA-256",
                   m_asset.filename);
         file.cancelWriting();
-        QtCommon::Frontend::Critical(
-            tr("Download failed verification"),
-            tr("The downloaded file does not match the checksum GitHub published for it, so it "
-               "was discarded. Try again later."));
+        Notify(parentWidget(), QMessageBox::Critical, tr("Download failed verification"),
+               tr("The downloaded file does not match the checksum GitHub published for it, so it "
+                  "was discarded. Try again later."));
         return false;
     }
 
     if (!file.commit()) {
         LOG_WARNING(Frontend, "Could not commit to file {}", filename.toStdString());
-        QtCommon::Frontend::Critical(tr("Failed to save file"),
-                                     tr("Could not commit to file %1.").arg(filename));
+        Notify(parentWidget(), QMessageBox::Critical, tr("Failed to save file"),
+               tr("Could not commit to file %1.").arg(filename));
         return false;
     }
 
@@ -428,14 +452,26 @@ namespace Updater {
 
 void PrepareLaunch() {
     UpdateInstaller::WaitForReplacedProcess();
+    LaunchExe() = UpdateInstaller::RunningExePath();
+    RestartNote() = qEnvironmentVariable(RestartNoteVariable);
+    qunsetenv(RestartNoteVariable);
     LaunchEnvironment() = QProcessEnvironment::systemEnvironment();
+}
+
+std::optional<QString> TakeRestartNote() {
+    if (RestartNote().isEmpty()) {
+        return std::nullopt;
+    }
+    return std::exchange(RestartNote(), QString{});
 }
 
 bool CanInstallInPlace() {
 #if defined(_WIN32) && defined(ENABLE_UPDATE_CHECKER)
-    return UpdateChecker::RunningVersion().has_value() &&
-           QFileInfo(QCoreApplication::applicationFilePath())
-                   .fileName()
+    const auto install_dir = InstallDir();
+    const auto exe = LaunchExe();
+    return UpdateChecker::RunningVersion().has_value() && !exe.empty() &&
+           !UpdateInstaller::IsUpdaterFolder(install_dir) &&
+           QString::fromStdWString(exe.filename().wstring())
                    .compare(QString::fromWCharArray(ExeName), Qt::CaseInsensitive) == 0;
 #else
     return false;
@@ -465,16 +501,14 @@ bool FinishPendingSwap(QWidget* window) {
     case UpdateInstaller::Recovery::Undone:
         LOG_WARNING(Frontend, "Undid an interrupted update in {}", PathText(install_dir));
         UpdateInstaller::CleanStaging(install_dir);
-        QtCommon::Frontend::Information(
-            QCoreApplication::translate("Updater", "Update Undone"),
-            QCoreApplication::translate("Updater",
-                                        "An update was interrupted, so the version it was "
-                                        "replacing has been put back. Fritchii will restart now."));
-        return Restart(window);
+        return Restart(window, QCoreApplication::translate(
+                                   "Updater", "An update was interrupted, so the version it was "
+                                              "replacing has been put back."));
     case UpdateInstaller::Recovery::Failed:
         LOG_CRITICAL(Frontend, "Could not undo an interrupted update in {}: {}",
                      PathText(install_dir), ec.message());
-        QtCommon::Frontend::Critical(
+        Notify(
+            window, QMessageBox::Critical,
             QCoreApplication::translate("Updater", "Interrupted Update"),
             QCoreApplication::translate(
                 "Updater",
@@ -503,61 +537,72 @@ void RollBack(QWidget* window) {
     const auto title = QCoreApplication::translate("Updater", "Roll Back");
     const auto install_dir = InstallDir();
     if (!UpdateInstaller::IsWritable(install_dir)) {
-        QtCommon::Frontend::Critical(
-            title,
-            QCoreApplication::translate("Updater", "Fritchii can't write to its folder (%1).")
-                .arg(QDir::toNativeSeparators(QCoreApplication::applicationDirPath())));
+        Notify(window, QMessageBox::Critical, title,
+               QCoreApplication::translate("Updater", "Fritchii can't write to its folder (%1).")
+                   .arg(QDir::toNativeSeparators(QString::fromStdWString(InstallDir().wstring()))));
         return;
     }
-    const auto answer = QtCommon::Frontend::Question(
-        title,
-        QCoreApplication::translate("Updater",
-                                    "Go back to %1? Fritchii will restart. Your settings, saves "
-                                    "and keys are not changed, and you can switch back to this "
-                                    "version the same way.")
-            .arg(FritchiiName(*version)),
-        QtCommon::Frontend::Yes | QtCommon::Frontend::No);
-    if (answer != QtCommon::Frontend::Yes) {
+    const auto answer =
+        Notify(window, QMessageBox::Question, title,
+               QCoreApplication::translate(
+                   "Updater", "Go back to %1? Fritchii will restart. Your settings, saves "
+                              "and keys are not changed, and you can switch back to this "
+                              "version the same way.")
+                   .arg(FritchiiName(*version)),
+               QMessageBox::Yes | QMessageBox::No);
+    if (answer != QMessageBox::Yes) {
         return;
     }
 
     const UpdateInstaller::Lock lock{install_dir / UpdateInstaller::LockName};
     if (!lock.Held()) {
-        QtCommon::Frontend::Critical(
-            title, QCoreApplication::translate("Updater", "Another Fritchii window is already "
-                                                          "updating this folder."));
+        Notify(window, QMessageBox::Critical, title,
+               QCoreApplication::translate("Updater", "Another Fritchii window is already "
+                                                      "updating this folder."));
         return;
     }
     std::error_code ec;
     switch (UpdateInstaller::RollBack(install_dir, RunningVersionText(), ExeName, ec)) {
     case UpdateInstaller::Outcome::Done:
-        LOG_INFO(Frontend, "Rolled back to {} in {}", version->toStdString(), PathText(install_dir));
+        LOG_INFO(Frontend, "Rolled back to {} in {}", version->toStdString(),
+                 PathText(install_dir));
         UpdateInstaller::CleanStaging(install_dir);
-        Restart(window);
+        Restart(window, QCoreApplication::translate("Updater", "%1 is back. Help > Roll Back to "
+                                                               "the Previous Version switches to "
+                                                               "the newer version again.")
+                            .arg(FritchiiName(*version)));
         return;
     case UpdateInstaller::Outcome::Unchanged:
         LOG_ERROR(Frontend, "Could not roll back: {}", ec.message());
         UpdateInstaller::CleanStaging(install_dir);
-        QtCommon::Frontend::Critical(
-            title, QCoreApplication::translate(
-                       "Updater", "Could not roll back (%1). Fritchii was not changed.")
-                       .arg(ErrorText(ec)));
+        Notify(window, QMessageBox::Critical, title,
+               QCoreApplication::translate("Updater",
+                                           "Could not roll back (%1). Fritchii was not changed.")
+                   .arg(ErrorText(ec)));
         return;
     case UpdateInstaller::Outcome::Interrupted:
         LOG_CRITICAL(Frontend, "Rolling back failed and could not be undone: {}", ec.message());
-        QtCommon::Frontend::Critical(
-            title,
-            QCoreApplication::translate(
-                "Updater", "Rolling back failed (%1) and some files could not be put "
-                           "back. Close Fritchii and start it again to restore this version.")
-                .arg(ErrorText(ec)));
+        Notify(window, QMessageBox::Critical, title,
+               QCoreApplication::translate(
+                   "Updater", "Rolling back failed (%1) and some files could not be put "
+                              "back. Close Fritchii and start it again to restore this version.")
+                   .arg(ErrorText(ec)));
         return;
     }
 }
 
-bool Restart(QWidget* window) {
-    const auto program =
-        QDir(QCoreApplication::applicationDirPath()).filePath(QString::fromWCharArray(ExeName));
+bool Restart(QWidget* window, const QString& note) {
+    // The install folder from startup: Qt's applicationDirPath() now names update-old.
+    const auto exe = InstallDir() / ExeName;
+    const auto program = QString::fromStdWString(exe.wstring());
+    std::error_code ec;
+    if (UpdateInstaller::IsUpdaterFolder(exe.parent_path()) || !fs::is_regular_file(exe, ec)) {
+        LOG_CRITICAL(Frontend, "Not restarting {}: it is not the installed version", PathText(exe));
+        Notify(window, QMessageBox::Critical,
+               QCoreApplication::translate("Updater", "Failed to restart"),
+               QCoreApplication::translate("Updater", "Please start Fritchii again yourself."));
+        return false;
+    }
     std::vector<std::string> arguments;
     for (const auto& argument : QCoreApplication::arguments().mid(1)) {
         arguments.push_back(argument.toStdString());
@@ -573,6 +618,9 @@ bool Restart(QWidget* window) {
                                                      : LaunchEnvironment();
     environment.insert(QString::fromLatin1(UpdateInstaller::RestartWaitVariable),
                        QString::number(QCoreApplication::applicationPid()));
+    if (!note.isEmpty()) {
+        environment.insert(QString::fromLatin1(RestartNoteVariable), note);
+    }
     QProcess process;
     process.setProgram(program);
     process.setArguments(kept);
@@ -580,11 +628,14 @@ bool Restart(QWidget* window) {
     process.setWorkingDirectory(QDir::currentPath());
     if (!process.startDetached()) {
         LOG_ERROR(Frontend, "Could not start {}", program.toStdString());
-        QtCommon::Frontend::Critical(
-            QCoreApplication::translate("Updater", "Failed to restart"),
-            QCoreApplication::translate("Updater", "Please start Fritchii again yourself."));
+        Notify(window, QMessageBox::Critical,
+               QCoreApplication::translate("Updater", "Failed to restart"),
+               QCoreApplication::translate("Updater", "Please start Fritchii again yourself."));
         return false;
     }
+    LOG_INFO(Frontend, "Restarting {}", PathText(exe));
+    // The log is written in blocks, and the new process only starts once this one has exited.
+    Common::Log::Stop();
     if (window) {
         QMetaObject::invokeMethod(window, &QWidget::close, Qt::QueuedConnection);
     }

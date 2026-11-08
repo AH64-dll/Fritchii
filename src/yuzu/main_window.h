@@ -509,13 +509,17 @@ private:
 
 #ifdef ENABLE_UPDATE_CHECKER
     void StartUpdateCheck(bool manual);
+    void OfferPendingUpdate();
     void ShowUpdate(const UpdateChecker::CheckResult& result);
+    void ShowRestartNote();
 
     QFuture<UpdateChecker::CheckResult> update_future;
     QFutureWatcher<UpdateChecker::CheckResult> update_watcher;
     bool update_check_manual = false;
-    // An update found while a game runs, offered once it stops.
+    // An update waiting for the game to stop or for other dialogs to close.
     std::optional<UpdateChecker::CheckResult> pending_update;
+    // What the process this one replaced reported, such as "Fritchii v5 is installed".
+    QString restart_note;
 #endif
 
     MultiplayerState* multiplayer_state = nullptr;

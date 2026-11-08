@@ -96,6 +96,13 @@ Recovery Recover(const std::filesystem::path& install_dir, std::error_code& ec);
 // Remove StagingName, unless a swap still needs it.
 void CleanStaging(const std::filesystem::path& install_dir);
 
+// The path of the running exe. Windows reports the new path once the exe is renamed into
+// OldName, so callers read it at startup, before any swap.
+std::filesystem::path RunningExePath();
+
+// Whether `install_dir` lies in one of the updater's own folders, which are never installed into.
+bool IsUpdaterFolder(const std::filesystem::path& install_dir);
+
 // Set for a restarted process to the id of the process it replaces.
 inline constexpr char RestartWaitVariable[] = "LICHII_UPDATE_WAIT_PID";
 

@@ -47,15 +47,15 @@ private:
 // In-place installs of the Fritchii Windows package (see frontend_common/update_installer.h).
 namespace Updater {
 
-// Call first in main(): waits for the process this one replaces and keeps the environment that
-// a restart passes on.
+// Call first in main(): waits for the process this one replaces, and keeps the exe path and the
+// environment that a restart uses.
 void PrepareLaunch();
 
 // Whether this build can replace its own files: a Fritchii build on Windows run as lichii.exe.
 bool CanInstallInPlace();
 
 // At startup: finish or undo a swap that was interrupted, and remove the staging folder. Returns
-// true when Lichii restarted to run the restored files.
+// true when Fritchii restarted to run the restored files.
 bool FinishPendingSwap(QWidget* window);
 
 // The version a rollback would restore ("" when unknown), or nullopt when there is none.
@@ -63,7 +63,11 @@ std::optional<QString> RollbackVersion();
 
 void RollBack(QWidget* window);
 
-// Start lichii.exe again, with the current arguments minus any game, and close `window`.
-bool Restart(QWidget* window);
+// Start lichii.exe in the install folder again, with the current arguments minus any game, and
+// close `window`. The new process shows `note` once it is up.
+bool Restart(QWidget* window, const QString& note = {});
+
+// The note the process this one replaced left for it, once.
+std::optional<QString> TakeRestartNote();
 
 } // namespace Updater

@@ -217,6 +217,18 @@ TEST_CASE("User data and the updater's own files are protected", "[updater]") {
     }
 }
 
+TEST_CASE("Restarts never target the updater's own folders", "[updater]") {
+    CHECK(UpdateInstaller::IsUpdaterFolder(fs::path{"C:/Games/Fritchii/update-old"}));
+    CHECK(UpdateInstaller::IsUpdaterFolder(fs::path{"C:/Games/Fritchii/Update-Old"}));
+    CHECK(UpdateInstaller::IsUpdaterFolder(
+        fs::path{"C:/Games/Fritchii/update-staging/unpacked/Fritchii-v5"}));
+    CHECK_FALSE(UpdateInstaller::IsUpdaterFolder(fs::path{"C:/Games/Fritchii"}));
+    CHECK_FALSE(UpdateInstaller::IsUpdaterFolder(fs::path{"C:/Games/update-older"}));
+#if defined(_WIN32) || defined(__linux__)
+    CHECK_FALSE(UpdateInstaller::RunningExePath().empty());
+#endif
+}
+
 TEST_CASE("The package root is the zip's top folder or the unpacked folder", "[updater]") {
     TempDir dir;
     Write(dir.path / "one" / "Fritchii-v5" / "lichii.exe", "v5");
