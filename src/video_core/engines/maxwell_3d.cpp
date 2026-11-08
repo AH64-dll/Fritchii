@@ -79,7 +79,10 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     perf_verify = VideoCommon::Nx2Perf::Verify();
 }
 
-Maxwell3D::~Maxwell3D() = default;
+Maxwell3D::~Maxwell3D() {
+    // Its held-back draw batch (EXP22, FrontFlushPending) goes with it.
+    VideoCommon::GpuSplit::Get().DropPendingFlush(this);
+}
 
 void Maxwell3D::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
     rasterizer = rasterizer_;
@@ -1082,6 +1085,27 @@ struct Maxwell3D::FrontState {
     /// EDEN_NX2_EXP2, read in Front(): same-value index_buffer.first writes are not sent.
     int same_experiment{};
     int early_same{}; ///< EXP14, read once per front call like same_experiment
+    /// EDEN_NX2_EXP22 (zortos293/Lichii#641's front state, draw batches and same-value draw
+    /// registers), read once per front call like early_same.
+    int exp22{};
+    /// StateDelta blocks would skip the back's write history and first-write trace
+    /// (EDEN_NX2_3D_HISTORY, EDEN_NX2_3D_METHODS): off with them.
+    bool delta_allowed{};
+    /// EXP22 bit 2: the last complete instance-loop group (draw.begin Subsequent and the loop
+    /// writes after it) held back, how many times in a row it came, and the next group while it
+    /// is captured. Held only until the next ring entry, publish or drain (FrontFlushPending).
+    struct BatchWrite {
+        u32 method;
+        u32 argument;
+        bool is_last;
+        bool from_macro;
+    };
+    static constexpr u32 MaxBatchWrites = 8;
+    std::array<BatchWrite, MaxBatchWrites> batch{};
+    u32 batch_size{};
+    u32 batch_repeats{};
+    std::array<BatchWrite, MaxBatchWrites> capture{};
+    u32 capture_size{};
     /// An inline or small index draw (which binds an index buffer not taken from the registers)
     /// was sent since the last index_buffer.count write. Starts set: nothing is known.
     bool other_index_draw{true};
@@ -1223,6 +1247,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         std::memcpy(front->shadow.data(), shadow_state.reg_array.data(), sizeof(front->shadow));
         front->control = shadow_state.shadow_ram_control;
         front->skip_same = SkipSameValueWrites() && FrontSkipSame();
+        front->delta_allowed = !record_write_history && !g_trace_first_method_writes;
         front->executing_macro = executing_macro;
         front->parameters = std::move(macro_params);
         macro_params.clear();
@@ -1231,6 +1256,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
     }
     front->same_experiment = VideoCore::Nx2Debug::Experiment(2);
     front->early_same = VideoCore::Nx2Debug::Experiment(14);
+    front->exp22 = VideoCore::Nx2Debug::Experiment(22);
     return *front;
 }
 
@@ -1328,6 +1354,24 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     if (Profile::Enabled()) [[unlikely]] {
         Profile::Add(Profile::Counter::MethodWrites, 1);
     }
+    // EXP22 bit 1 (zortos293/Lichii#641 EDEN_NX2_FRONT_STATE): a macro's write to a state
+    // register that writes no memory, which the rest of this function would only compare, store
+    // and send as a Direct MacroWrite, goes in the open StateDelta block instead.
+    if ((fs.exp22 & 1) != 0 && from_macro && !execution_mask[method] &&
+        !memory_write_mask[method] && fs.delta_allowed && fs.same_experiment == 0 &&
+        !VideoCommon::GpuSplit::MacroSink()) {
+        if (fs.regs[method] == value && shadow_kept && fs.skip_same) {
+            if (Profile::Enabled()) [[unlikely]] {
+                Profile::Add(Profile::Counter::SameValueWrites, 1);
+            }
+            return;
+        }
+        fs.regs[method] = value;
+        split.DeltaWrite(this, method, argument,
+                         fs.draw_pending ? VideoCommon::GpuSplit::Effect::Gpu
+                                         : VideoCommon::GpuSplit::Effect::None);
+        return;
+    }
     if (method == MAXWELL3D_REG_INDEX(shadow_ram_control) && FrontVerifyEnabled()) [[unlikely]] {
         fs.control_writes[fs.control_count++ % fs.control_writes.size()] = {
             argument, static_cast<u32>(fs.control), from_macro ? 2U : 1U};
@@ -1343,14 +1387,17 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         }
         return;
     }
-    if (fs.same_experiment != 0) [[unlikely]] {
-        if (execution_mask[method] && FrontSkipsIndexFirst(fs, method, value, shadow_kept)) {
-            if (Profile::Enabled()) [[unlikely]] {
-                Profile::Add(Profile::Counter::SameValueWrites, 1);
-            }
-            FrontReportSameWrites(fs);
-            return;
+    // EXP2, and EXP22 bit 4 (#641 EDEN_NX2_SKIP_SAME_DRAWREG: its same-value vertex_buffer
+    // first and count are the loop writes skipped above).
+    if ((fs.same_experiment != 0 || (fs.exp22 & 4) != 0) && execution_mask[method] &&
+        FrontSkipsIndexFirst(fs, method, value, shadow_kept)) {
+        if (Profile::Enabled()) [[unlikely]] {
+            Profile::Add(Profile::Counter::SameValueWrites, 1);
         }
+        if (fs.same_experiment != 0) [[unlikely]] {
+            FrontReportSameWrites(fs);
+        }
+        return;
     }
     // What a constant buffer upload word or a report writes, for the front's macro memory reads.
     const auto [write_begin, write_end] = FrontWriteRange(fs, method, 1);
@@ -1416,6 +1463,11 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     if (fs.same_experiment != 0) [[unlikely]] {
         ++fs.exp_sent;
         FrontReportSameWrites(fs);
+    }
+    // EXP22 bit 2: instance loop methods, which nothing after the send below concerns.
+    if ((fs.exp22 & 2) != 0 && execution_mask[method] &&
+        FrontBatchWrite(split, fs, method, argument, value, is_last_call, from_macro)) {
+        return;
     }
     if (from_macro && (execution_mask[method] || !VideoCommon::GpuSplit::MacroSink())) {
         split.MacroWrite(this, method, argument, effect);
@@ -2389,6 +2441,334 @@ void Maxwell3D::FinishFrontMacro(Core::System& system) {
     // What ProcessMacro and CallMacroMethod do around the macro.
     ConsumeSink(system);
     draw_manager.DrawDeferred(*this);
+}
+
+namespace {
+
+// EXP22 bit 2: the instance loop writes that may follow a draw.begin (Subsequent) in a draw
+// batch. Written again with the same values they store what the registers hold and raise dirty
+// flags that are raised (no deferred draw goes before an instance loop method), set draw_indexed
+// again (index_buffer.count) or draw nothing (draw.end in DrawMode::Instance).
+bool IsBatchMiddle(u32 method) {
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(vertex_buffer.first):
+    case MAXWELL3D_REG_INDEX(vertex_buffer.count):
+    case MAXWELL3D_REG_INDEX(index_buffer.first):
+    case MAXWELL3D_REG_INDEX(index_buffer.count):
+    case MAXWELL3D_REG_INDEX(draw.end):
+        return true;
+    default:
+        return false;
+    }
+}
+
+// A held instance loop write (EXP22), sent as the entry it would have been. Draw manager
+// methods: FrontMethodEffect's Gpu.
+template <typename Write>
+void SendHeldWrite(VideoCommon::GpuSplit& split, EngineInterface* engine, const Write& write) {
+    constexpr auto effect = VideoCommon::GpuSplit::Effect::Gpu;
+    if (write.from_macro) {
+        split.MacroWrite(engine, write.method, write.argument, effect);
+    } else {
+        split.Method(engine, write.method, write.argument, write.is_last, nullptr, effect);
+    }
+}
+
+// ApplyFrontDelta past a deferred draw, with the same-value skip and a shadow RAM that tracks
+// (Track) or passes through: each write's register and its two dirty flags, raised together at
+// the end (nothing reads them in between), as ProcessDirtyRegisters raises them one by one.
+template <bool Track>
+void ApplyDeltaWrites(Maxwell3D& maxwell3d, const u64* writes, u32 count) {
+    static_assert(std::tuple_size<Maxwell3D::DirtyState::Tables>::value == 2);
+    const auto& table0 = maxwell3d.dirty.tables[0];
+    const auto& table1 = maxwell3d.dirty.tables[1];
+    u32* const reg_array = maxwell3d.regs.reg_array.data();
+    u32* const shadow_array = maxwell3d.shadow_state.reg_array.data();
+    Maxwell3D::DirtyState::Flags raised;
+    for (u32 i = 0; i < count; ++i) {
+        const u32 method = static_cast<u32>(writes[i]) & 0xffff;
+        const u32 value = static_cast<u32>(writes[i] >> 32);
+        if constexpr (Track) {
+            shadow_array[method] = value;
+        }
+        if (reg_array[method] == value) {
+            continue;
+        }
+        reg_array[method] = value;
+        raised[table0[method]] = true;
+        raised[table1[method]] = true;
+    }
+    maxwell3d.dirty.flags |= raised;
+}
+
+// EXP22 bit 8 (back thread): every 65536th check, how many were made and how many differed.
+struct Exp22Checks {
+    u64 deltas;
+    u64 delta_differences;
+    u64 batches;
+    u64 batch_differences;
+};
+Exp22Checks g_exp22_checks{};
+
+void ReportExp22Checks() {
+    const Exp22Checks& c = g_exp22_checks;
+    if (((c.deltas + c.batches) & 0xffff) == 1) {
+        LOG_INFO(HW_GPU,
+                 "EXP22 check: {} state deltas checked, {} differed; {} draw batches checked, "
+                 "{} differed",
+                 c.deltas, c.delta_differences, c.batches, c.batch_differences);
+    }
+}
+
+} // Anonymous namespace
+
+void Maxwell3D::ApplyFrontDelta(Core::System& system, const u64* writes, u32 count) {
+    // The Direct MacroWrite entries the block stands for, each as CallMethod applies a state
+    // register write: the sink first, then the shadow RAM, the same-value skip and
+    // ProcessDirtyRegisters. The shadow RAM mode can't change within a block (its register is
+    // executable, and any other entry ends the block).
+    ConsumeSink(system);
+    if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::MethodWrites, count);
+    }
+    const auto control = shadow_state.shadow_ram_control;
+    const bool track = control == Regs::ShadowRamControl::Track ||
+                       control == Regs::ShadowRamControl::TrackWithFilter;
+    const bool fast = SkipSameValueWrites() &&
+                      (track || control == Regs::ShadowRamControl::Passthrough);
+    // One by one while a deferred instanced draw waits (the first changed write issues it), and
+    // with a replaying shadow RAM or without the same-value skip.
+    u32 i = 0;
+    for (; i < count && (!fast || draw_manager.HasDeferredDraw()); ++i) {
+        const u32 method = static_cast<u32>(writes[i]) & 0xffff;
+        const u32 value = ProcessShadowRam(method, static_cast<u32>(writes[i] >> 32));
+        if (!SkipSameValueWrites() || regs.reg_array[method] != value) {
+            ProcessDirtyRegisters(method, value);
+        }
+    }
+    if (i == count) {
+        return;
+    }
+    if ((VideoCore::Nx2Debug::Experiment(22) & 8) != 0) [[unlikely]] {
+        CheckFrontDelta(writes + i, count - i);
+    } else if (track) {
+        ApplyDeltaWrites<true>(*this, writes + i, count - i);
+    } else {
+        ApplyDeltaWrites<false>(*this, writes + i, count - i);
+    }
+}
+
+void Maxwell3D::CheckFrontDelta(const u64* writes, u32 count) {
+    // ApplyDeltaWrites, undone, then the single writes as CallMethodFast applies them (no
+    // deferred draw waits here); the two results must match, and the second one stays.
+    struct Saved {
+        u32 reg;
+        u32 shadow;
+        u32 fast_reg;
+        u32 fast_shadow;
+    };
+    thread_local std::vector<Saved> saved;
+    saved.resize(count);
+    const auto method_of = [writes](u32 k) { return static_cast<u32>(writes[k]) & 0xffff; };
+    for (u32 k = 0; k < count; ++k) {
+        saved[k].reg = regs.reg_array[method_of(k)];
+        saved[k].shadow = shadow_state.reg_array[method_of(k)];
+    }
+    const DirtyState::Flags flags = dirty.flags;
+    const auto control = shadow_state.shadow_ram_control;
+    if (control == Regs::ShadowRamControl::Track ||
+        control == Regs::ShadowRamControl::TrackWithFilter) {
+        ApplyDeltaWrites<true>(*this, writes, count);
+    } else {
+        ApplyDeltaWrites<false>(*this, writes, count);
+    }
+    const DirtyState::Flags fast_flags = dirty.flags;
+    for (u32 k = 0; k < count; ++k) {
+        saved[k].fast_reg = regs.reg_array[method_of(k)];
+        saved[k].fast_shadow = shadow_state.reg_array[method_of(k)];
+    }
+    // Newest first: a register written twice gets its value from before the block back.
+    for (u32 k = count; k-- > 0;) {
+        regs.reg_array[method_of(k)] = saved[k].reg;
+        shadow_state.reg_array[method_of(k)] = saved[k].shadow;
+    }
+    dirty.flags = flags;
+    for (u32 k = 0; k < count; ++k) {
+        const u32 value = ProcessShadowRam(method_of(k), static_cast<u32>(writes[k] >> 32));
+        if (!SkipSameValueWrites() || regs.reg_array[method_of(k)] != value) {
+            ProcessDirtyRegisters(method_of(k), value);
+        }
+    }
+    u32 first = count;
+    for (u32 k = 0; k < count && first == count; ++k) {
+        if (regs.reg_array[method_of(k)] != saved[k].fast_reg ||
+            shadow_state.reg_array[method_of(k)] != saved[k].fast_shadow) {
+            first = k;
+        }
+    }
+    const bool differs = first != count || fast_flags != dirty.flags;
+    ++g_exp22_checks.deltas;
+    if (differs && g_exp22_checks.delta_differences++ < 32) {
+        LOG_ERROR(HW_GPU,
+                  "EXP22 check: state delta of {} writes differs: register {:#x}, dirty flags {}",
+                  count, first != count ? method_of(first) : 0U,
+                  fast_flags != dirty.flags ? "differ" : "match");
+    }
+    ReportExp22Checks();
+}
+
+void Maxwell3D::RunDrawBatch(Core::System& system, const u64* writes, u32 count, u32 repeats) {
+    // The first group as its single entries ran: the sink, then CallMethod (is_last_call only
+    // matters to inline data).
+    const auto run_group = [&] {
+        for (u32 i = 0; i < count; ++i) {
+            ConsumeSink(system);
+            CallMethod(system, static_cast<u32>(writes[i]) & 0xffff,
+                       static_cast<u32>(writes[i] >> 32), true);
+        }
+    };
+    run_group();
+    if (repeats <= 1) {
+        return;
+    }
+    auto& state = draw_manager.draw_state;
+    if ((VideoCore::Nx2Debug::Experiment(22) & 8) == 0) [[likely]] {
+        // The repeats write what the registers and shadow RAM hold, raise flags that are raised,
+        // set draw_indexed again and draw nothing (IsBatchMiddle): each counts an instance in
+        // its draw.begin (DrawManager::DrawBegin, Subsequent).
+        state.instance_count += repeats - 1;
+        return;
+    }
+    // EXP22 bit 8: the repeats as their single entries, against that.
+    constexpr u32 MaxWrites = FrontState::MaxBatchWrites;
+    const u32 checked = (std::min)(count, MaxWrites);
+    const u32 expected = state.instance_count + (repeats - 1);
+    const DirtyState::Flags flags = dirty.flags;
+    const auto mode = state.draw_mode;
+    const bool indexed = state.draw_indexed;
+    const auto topology = state.topology;
+    std::array<u32, MaxWrites> group_regs{};
+    std::array<u32, MaxWrites> group_shadow{};
+    for (u32 i = 0; i < checked; ++i) {
+        const u32 method = static_cast<u32>(writes[i]) & 0xffff;
+        group_regs[i] = regs.reg_array[method];
+        group_shadow[i] = shadow_state.reg_array[method];
+    }
+    for (u32 repeat = 1; repeat < repeats; ++repeat) {
+        run_group();
+    }
+    bool differs = state.instance_count != expected || dirty.flags != flags ||
+                   state.draw_mode != mode || state.draw_indexed != indexed ||
+                   state.topology != topology;
+    for (u32 i = 0; i < checked; ++i) {
+        const u32 method = static_cast<u32>(writes[i]) & 0xffff;
+        differs |= regs.reg_array[method] != group_regs[i] ||
+                   shadow_state.reg_array[method] != group_shadow[i];
+    }
+    ++g_exp22_checks.batches;
+    if (differs && g_exp22_checks.batch_differences++ < 32) {
+        LOG_ERROR(HW_GPU,
+                  "EXP22 check: draw batch of {} writes x {} differs: {} instances, expected {}",
+                  count, repeats, state.instance_count, expected);
+    }
+    ReportExp22Checks();
+}
+
+bool Maxwell3D::FrontBatchWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                                u32 argument, u32 value, bool is_last_call, bool from_macro) {
+    const FrontState::BatchWrite write{method, argument, is_last_call, from_macro};
+    if (method == MAXWELL3D_REG_INDEX(draw.begin)) {
+        // Not with a replaying shadow RAM: the back's instance id is then the argument's.
+        constexpr u32 subsequent = static_cast<u32>(Regs::Draw::InstanceId::Subsequent);
+        if (fs.control == Regs::ShadowRamControl::Replay || ((value >> 26) & 3) != subsequent) {
+            return false;
+        }
+        if (fs.capture_size != 0) {
+            FrontEndCapture(split, fs);
+        }
+        split.SetPendingFlush(&FrontFlushPending, this);
+        fs.capture[0] = write;
+        fs.capture_size = 1;
+        return true;
+    }
+    if (fs.capture_size == 0 || fs.capture_size == FrontState::MaxBatchWrites ||
+        !IsBatchMiddle(method)) {
+        // Sent as before, after what is held (GpuSplit::SelectEngine sends that first).
+        return false;
+    }
+    fs.capture[fs.capture_size++] = write;
+    return true;
+}
+
+bool Maxwell3D::FrontCaptureRepeats(const FrontState& fs) {
+    if (fs.batch_size != fs.capture_size) {
+        return false;
+    }
+    for (u32 i = 0; i < fs.capture_size; ++i) {
+        if (fs.batch[i].method != fs.capture[i].method ||
+            fs.batch[i].argument != fs.capture[i].argument) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void Maxwell3D::FrontEndCapture(VideoCommon::GpuSplit& split, FrontState& fs) {
+    // The captured writes are one more of the held batch, or the next batch to hold.
+    if (FrontCaptureRepeats(fs)) {
+        ++fs.batch_repeats;
+        fs.capture_size = 0;
+        return;
+    }
+    split.DropPendingFlush(this); // The held batch goes now, by itself
+    FrontEmitBatch(split, fs);
+    fs.batch = fs.capture;
+    fs.batch_size = fs.capture_size;
+    fs.batch_repeats = 1;
+    fs.capture_size = 0;
+    split.SetPendingFlush(&FrontFlushPending, this);
+}
+
+void Maxwell3D::FrontEmitBatch(VideoCommon::GpuSplit& split, FrontState& fs) {
+    const u32 size = fs.batch_size;
+    const u32 repeats = fs.batch_repeats;
+    fs.batch_size = 0;
+    fs.batch_repeats = 0;
+    if (size == 0) {
+        return;
+    }
+    if (repeats > 1) {
+        std::array<u64, FrontState::MaxBatchWrites> words;
+        for (u32 i = 0; i < size; ++i) {
+            words[i] = u64{fs.batch[i].method} | (u64{fs.batch[i].argument} << 32);
+        }
+        split.DrawBatch(this, words.data(), size, repeats, VideoCommon::GpuSplit::Effect::Gpu);
+        return;
+    }
+    for (u32 i = 0; i < size; ++i) {
+        SendHeldWrite(split, this, fs.batch[i]);
+    }
+}
+
+void Maxwell3D::FrontEmitCapture(VideoCommon::GpuSplit& split, FrontState& fs) {
+    const u32 size = fs.capture_size;
+    fs.capture_size = 0;
+    for (u32 i = 0; i < size; ++i) {
+        SendHeldWrite(split, this, fs.capture[i]);
+    }
+}
+
+void Maxwell3D::FrontFlushPending(void* maxwell3d) {
+    // GpuSplit cleared the hook before the call: what is sent here does not come back to it.
+    auto* const self = static_cast<Maxwell3D*>(maxwell3d);
+    FrontState& fs = *self->front;
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (fs.capture_size != 0 && FrontCaptureRepeats(fs)) {
+        ++fs.batch_repeats;
+        fs.capture_size = 0;
+    }
+    self->FrontEmitBatch(split, fs);
+    self->FrontEmitCapture(split, fs);
 }
 
 } // namespace Tegra::Engines

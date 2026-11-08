@@ -3207,6 +3207,13 @@ public:
     void CallConstBufferWords(Core::System& system, const u32* methods, const u32* arguments,
                               u32 count);
 
+    /// GpuSplit's back (Kind::StateDelta, EXP22 bit 1): `count` macro state register writes
+    /// (method | argument << 32), each as CallMethod would apply it.
+    void ApplyFrontDelta(Core::System& system, const u64* writes, u32 count);
+    /// GpuSplit's back (Kind::DrawBatch, EXP22 bit 2): an instance-loop group's `count` writes,
+    /// then `repeats - 1` more identical groups, which only count an instance each.
+    void RunDrawBatch(Core::System& system, const u64* writes, u32 count, u32 repeats);
+
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
     /// registers and sends the register writes to the back thread.
@@ -3423,6 +3430,17 @@ private:
                            GPUVAddr source, u32 ram, u32 words);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
+    // EXP22 bit 2: instance-loop groups held back and sent as DrawBatch entries.
+    bool FrontBatchWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                         u32 argument, u32 value, bool is_last_call, bool from_macro);
+    static bool FrontCaptureRepeats(const FrontState& state);
+    void FrontEndCapture(VideoCommon::GpuSplit& split, FrontState& state);
+    void FrontEmitBatch(VideoCommon::GpuSplit& split, FrontState& state);
+    void FrontEmitCapture(VideoCommon::GpuSplit& split, FrontState& state);
+    /// GpuSplit::PendingFlush: sends what FrontBatchWrite holds.
+    static void FrontFlushPending(void* maxwell3d);
+    /// EXP22 bit 8: the fast StateDelta loop against the single writes (the latter are kept).
+    void CheckFrontDelta(const u64* writes, u32 count);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
     // EDEN_NX2_SKIP_SAME and EDEN_NX2_PERF_VERIFY, read in the constructor (after the switch

@@ -181,6 +181,10 @@ void GpuSplit::Stop() {
     front_engine = nullptr;
     pairs_header = nullptr;
     pairs_count = 0;
+    delta_header = nullptr;
+    delta_count = 0;
+    pending_flush = nullptr;
+    pending_flush_argument = nullptr;
     back_engine = nullptr;
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
@@ -223,8 +227,10 @@ void GpuSplit::WaitForSpace(size_t words) {
 }
 
 void GpuSplit::Publish() {
-    // The back may read what is published: the open Pairs block is final from here on.
+    RunPendingFlush();
+    // The back may read what is published: the open blocks are final from here on.
     pairs_header = nullptr;
+    delta_header = nullptr;
     if (published_local == write_position) {
         return;
     }
@@ -235,7 +241,7 @@ void GpuSplit::Publish() {
         wake.fetch_add(1, std::memory_order_seq_cst);
         wake.notify_one();
     }
-    if ((macro_sink || compute_sink || ring_pairs) && (++publishes & 1023) == 0) [[unlikely]] {
+    if ((++publishes & 1023) == 0) [[unlikely]] {
         ReportBatched();
     }
 }
@@ -254,17 +260,24 @@ void GpuSplit::ReportBatched() {
     const auto rate = [&](Batched counter) {
         return static_cast<double>(batched[static_cast<size_t>(counter)]) / elapsed.count();
     };
-    LOG_INFO(HW_GPU,
-             "GPU split batched writes per second: split_batch.macro_sunk {:.0f}, "
-             "split_batch.compute_sunk {:.0f}, split_batch.compute_same {:.0f}, "
-             "split_batch.pairs {:.0f} in split_batch.pair_blocks {:.0f}",
-             rate(Batched::MacroSunk), rate(Batched::ComputeSunk), rate(Batched::ComputeSame),
-             rate(Batched::Pairs), rate(Batched::PairBlocks));
+    if (std::ranges::any_of(batched, [](u64 count) { return count != 0; })) {
+        LOG_INFO(HW_GPU,
+                 "GPU split batched writes per second: split_batch.macro_sunk {:.0f}, "
+                 "split_batch.compute_sunk {:.0f}, split_batch.compute_same {:.0f}, "
+                 "split_batch.pairs {:.0f} in split_batch.pair_blocks {:.0f}, "
+                 "split_batch.delta {:.0f} in split_batch.delta_blocks {:.0f}, "
+                 "split_batch.draw_batches {:.0f} for split_batch.draw_repeats {:.0f} more groups",
+                 rate(Batched::MacroSunk), rate(Batched::ComputeSunk), rate(Batched::ComputeSame),
+                 rate(Batched::Pairs), rate(Batched::PairBlocks), rate(Batched::DeltaWrites),
+                 rate(Batched::DeltaBlocks), rate(Batched::DrawBatches),
+                 rate(Batched::DrawRepeats));
+    }
     batched.fill(0);
     batched_since = now;
 }
 
 void GpuSplit::Drain(DrainSite site) {
+    RunPendingFlush(); // Everything sent so far includes the held-back work
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position) {
         return;
@@ -982,6 +995,22 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         engine->ConsumeSink(*system);
         engine->ApplyPairs(*system, entry + 1, count);
+        return 1 + size_t{count};
+    }
+    case Kind::StateDelta: {
+        // EXP22: only Maxwell3D sends StateDelta and DrawBatch entries (Maxwell3D::FrontWrite).
+        const u32 count = static_cast<u32>(head >> 32);
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        static_cast<Tegra::Engines::Maxwell3D*>(back_engine)
+            ->ApplyFrontDelta(*system, entry + 1, count);
+        return 1 + size_t{count};
+    }
+    case Kind::DrawBatch: {
+        const u32 count = static_cast<u32>((head >> 8) & 0xff);
+        const u32 repeats = static_cast<u32>(head >> 32);
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        static_cast<Tegra::Engines::Maxwell3D*>(back_engine)
+            ->RunDrawBatch(*system, entry + 1, count, repeats);
         return 1 + size_t{count};
     }
     }

@@ -121,6 +121,10 @@ public:
         ComputeSame, ///< Compute state writes dropped: the register held the value
         Pairs,       ///< Writes sent as pairs (any engine, any source)
         PairBlocks,  ///< Pairs blocks opened
+        DeltaWrites, ///< EXP22: 3D macro state writes sent in StateDelta blocks
+        DeltaBlocks, ///< EXP22: StateDelta blocks opened
+        DrawBatches, ///< EXP22: DrawBatch entries sent
+        DrawRepeats, ///< EXP22: instance-loop groups they stand for past their first
         Count,
     };
     void CountBatched(Batched counter, u64 amount = 1) {
@@ -254,6 +258,74 @@ public:
         CountBatched(Batched::Pairs);
         CountBatched(Batched::PairBlocks);
         Commit(2, Effect::None);
+    }
+
+    // EDEN_NX2_EXP22, from zortos293/Lichii#641 (EDEN_NX2_FRONT_STATE, EDEN_NX2_DRAW_BATCH).
+    /// Bit 1: a 3D macro's state register write (not executable, writes no memory), which would
+    /// go as a Direct MacroWrite, appended to the open StateDelta block instead. The back applies
+    /// the block in one loop, write by write as CallMethod would (Maxwell3D::ApplyFrontDelta).
+    /// Open as a Pairs block is, and with each write's own effect noted at its position.
+    void DeltaWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
+                    Effect effect) {
+        SelectEngine(engine);
+        const u64 word = u64{method & 0xffff} | (u64{argument} << 32);
+        const size_t index = write_position & RingMask;
+        if (delta_header != nullptr && index != 0 && delta_count < MaxPairs &&
+            write_position + 1 - consumed_cache <= RingWords) [[likely]] {
+            ring[index] = word;
+            ++delta_count;
+            *delta_header = static_cast<u64>(Kind::StateDelta) | (u64{delta_count} << 32);
+            CountBatched(Batched::DeltaWrites);
+            Commit(1, effect);
+            return;
+        }
+        u64* const entry = Reserve(2);
+        entry[0] = static_cast<u64>(Kind::StateDelta) | (u64{1} << 32);
+        entry[1] = word;
+        delta_header = entry;
+        delta_count = 1;
+        CountBatched(Batched::DeltaWrites);
+        CountBatched(Batched::DeltaBlocks);
+        Commit(2, effect);
+    }
+    /// Bit 2: `count` (method | argument << 32) writes of an instance-loop group (draw.begin
+    /// Subsequent and the instance loop stores after it), run once, then `repeats - 1` more
+    /// identical groups counted as instances (Maxwell3D::RunDrawBatch).
+    void DrawBatch(Tegra::Engines::EngineInterface* engine, const u64* writes, u32 count,
+                   u32 repeats, Effect effect) {
+        SelectEngine(engine);
+        u64* const entry = Reserve(1 + size_t{count});
+        entry[0] = static_cast<u64>(Kind::DrawBatch) | (u64{count & 0xff} << 8) |
+                   (u64{repeats} << 32);
+        std::memcpy(entry + 1, writes, size_t{count} * sizeof(u64));
+        CountBatched(Batched::DrawBatches);
+        CountBatched(Batched::DrawRepeats, repeats - 1);
+        Commit(1 + size_t{count}, effect);
+    }
+    /// Work the front holds back (EXP22's draw batches): `hook(argument)` sends it before any
+    /// other entry is reserved, before an engine is selected, before a publish and before a
+    /// drain, so it keeps its place in the method order. Another holder's work is sent first.
+    using PendingFlush = void (*)(void*);
+    void SetPendingFlush(PendingFlush hook, void* argument) {
+        if (pending_flush != hook || pending_flush_argument != argument) {
+            RunPendingFlush();
+            pending_flush = hook;
+            pending_flush_argument = argument;
+        }
+    }
+    void RunPendingFlush() {
+        if (pending_flush != nullptr) [[unlikely]] {
+            const PendingFlush hook = pending_flush;
+            pending_flush = nullptr;
+            hook(pending_flush_argument);
+        }
+    }
+    /// `argument` sends its held work itself, or goes away: forget its hook.
+    void DropPendingFlush(void* argument) {
+        if (pending_flush_argument == argument) {
+            pending_flush = nullptr;
+            pending_flush_argument = nullptr;
+        }
     }
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
@@ -686,6 +758,8 @@ private:
         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
         Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
         Pairs,  ///< Bits 32-63 count; then one word per write: bits 0-15 method, 32-63 value
+        StateDelta, ///< As Pairs, Maxwell3D macro writes (DeltaWrite)
+        DrawBatch,  ///< Bits 8-15 count, 32-63 repeats; then count words (method | arg << 32)
     };
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
@@ -713,7 +787,10 @@ private:
 
     /// Room for an entry of `words` at the write position (never across the ring's end).
     u64* Reserve(size_t words) {
-        pairs_header = nullptr; // What follows ends the open Pairs block
+        RunPendingFlush(); // Held-back work goes before any other entry
+        // What follows ends the open Pairs or StateDelta block.
+        pairs_header = nullptr;
+        delta_header = nullptr;
         const size_t index = write_position & RingMask;
         if (index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
             [[likely]] {
@@ -731,6 +808,8 @@ private:
     }
     void WaitForSpace(size_t words);
     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
+        // Before the engine is compared: the held-back work selects its own.
+        RunPendingFlush();
         if (engine != front_engine) [[unlikely]] {
             SwitchEngine(engine);
         }
@@ -862,6 +941,12 @@ private:
     /// The open Pairs block's head (PairWrite), and its count.
     u64* pairs_header{};
     u32 pairs_count{};
+    /// The open StateDelta block's head (DeltaWrite), and its count.
+    u64* delta_header{};
+    u32 delta_count{};
+    /// Held-back front work (SetPendingFlush).
+    PendingFlush pending_flush{};
+    void* pending_flush_argument{};
     std::array<u64, static_cast<size_t>(Batched::Count)> batched{};
     std::chrono::steady_clock::time_point batched_since{};
     u32 publishes{};
