@@ -193,6 +193,16 @@ inline std::atomic<int> g_idle_pause{-1};
 /// (OpenGL keeps its FlushRegion). 0 = the operation wait as before. Off by default, not measured
 /// yet: compare the back's "query DMA wait" profile zone (ms and waits per second) and the white
 /// flash watch.
+/// EXP31 (render target memo, RT_FAST from zortos293/Lichii#717; TextureCache::
+/// UpdateRenderTargets), bits: 1 = a draw whose render targets are clean (no Dirty::RenderTargets)
+/// skips preparing them again while the same views were prepared for a draw in the same frame,
+/// no image was marked modified, created, deleted, rescaled or CPU written since (modification
+/// tick and bindings_epoch unchanged), and every target image is GPU-modified with no CPU
+/// modification, alias or sparse state, 2 = with 1: such draws run the loop anyway and check it
+/// changed nothing but the targets' own modification ticks (flags, bindings_epoch; logs "RT_FAST
+/// (EXP31) mismatch" and drops the memo on a difference). Logs skips, verified and mismatches
+/// every 600 frames while on. Off by default; measure the back's "render targets" zone (3 = verify
+/// first, then 1).
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 

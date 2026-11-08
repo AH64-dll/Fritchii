@@ -644,6 +644,15 @@ void TextureCache<P>::TickFrame() {
 
     runtime.TickFrame();
     ++frame_tick;
+    // Prepared render targets skip the LRU touch of their images: keep them to one frame.
+    ++bindings_epoch;
+    if (VideoCore::Nx2Debug::Experiment(31) != 0 && frame_tick % 600 == 0) {
+        LOG_INFO(HW_GPU,
+                 "RT_FAST (EXP31) last 600 frames: {} of {} clean render target updates skipped; "
+                 "verified {}, mismatches {}",
+                 rt_fast_skips, rt_fast_clean_paths, rt_fast_verified, rt_fast_mismatches);
+        rt_fast_skips = rt_fast_clean_paths = rt_fast_verified = rt_fast_mismatches = 0;
+    }
 
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
         for (auto& buffer : async_buffers_death_ring) {
@@ -847,6 +856,7 @@ void TextureCache<P>::SynchronizeDescriptors(bool compute) {
             bindings_changed = true;
         if (bindings_changed) {
             ++texture_bindings_serial;
+            ++bindings_epoch;
         }
     } else {
         const bool linked_tsc = maxwell3d->regs.sampler_binding == Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding;
@@ -859,6 +869,7 @@ void TextureCache<P>::SynchronizeDescriptors(bool compute) {
             bindings_changed = true;
         if (bindings_changed) {
             ++texture_bindings_serial;
+            ++bindings_epoch;
         }
     }
 }
@@ -971,14 +982,42 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     clearing_render_targets = is_clear;
     auto& flags = maxwell3d->dirty.flags;
     if (!flags[Dirty::RenderTargets]) {
+        // EDEN_NX2_EXP31 (RT_FAST, zortos293/Lichii#717): bit 1 = skip the loop below while it
+        // would change nothing, bit 2 = run it anyway and check that it changed nothing.
+        const int rt_fast = VideoCore::Nx2Debug::Experiment(31);
+        bool verify = false;
+        if (rt_fast != 0 && !is_clear) {
+            ++rt_fast_clean_paths;
+            if ((rt_fast & 1) != 0 && RenderTargetsStillPrepared()) {
+                if ((rt_fast & 2) == 0) {
+                    ++rt_fast_skips;
+                    return;
+                }
+                verify = true;
+            }
+        }
+        if (verify) {
+            if (!VerifyRenderTargetsPrepared()) {
+                rt_prepared.valid = false;
+                return;
+            }
+            NoteRenderTargetsPrepared();
+            return;
+        }
         for (size_t index = 0; index < NUM_RT; ++index) {
             ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
             PrepareImageView(color_buffer_id, true, is_clear && IsFullClear(color_buffer_id));
         }
         const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
         PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
+        if (is_clear) {
+            rt_prepared.valid = false;
+        } else if ((rt_fast & 1) != 0) {
+            NoteRenderTargetsPrepared();
+        }
         return;
     }
+    rt_prepared.valid = false;
 
     const VideoCommon::RenderTargets previous_render_targets = render_targets;
     const bool rescaled = RescaleRenderTargets();
@@ -1031,6 +1070,108 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     }
 
     flags[Dirty::DepthBiasGlobal] = true;
+}
+
+template <class P>
+bool TextureCache<P>::RenderTargetsStillPrepared() const {
+    const auto& prepared = rt_prepared;
+    if (!prepared.valid || prepared.serial != render_targets_serial ||
+        prepared.modification_tick != modification_tick || prepared.frame_tick != frame_tick ||
+        prepared.bindings_epoch != bindings_epoch) {
+        return false;
+    }
+    for (size_t index = 0; index <= NUM_RT; ++index) {
+        const ImageViewId id =
+            index < NUM_RT ? render_targets.color_buffer_ids[index] : render_targets.depth_buffer_id;
+        if (id != prepared.views[index]) {
+            return false;
+        }
+        if (!id) {
+            continue;
+        }
+        const ImageViewBase& image_view = slot_image_views[id];
+        if (image_view.IsBuffer()) {
+            continue;
+        }
+        // What PrepareImage(is_modification, !invalidate) would act on.
+        const ImageBase& image = slot_images[image_view.image_id];
+        if (False(image.flags & ImageFlagBits::GpuModified) ||
+            True(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::SparseTiles |
+                                ImageFlagBits::SparseLayers | ImageFlagBits::UnwrittenSparse)) ||
+            !image.aliased_images.empty()) {
+            return false;
+        }
+    }
+    // MarkModification would give them the newest ticks again, in the same order: they have them,
+    // nothing was marked since. LRU touches within a frame are no-ops.
+    return true;
+}
+
+template <class P>
+void TextureCache<P>::NoteRenderTargetsPrepared() {
+    auto& prepared = rt_prepared;
+    prepared.valid = true;
+    prepared.serial = render_targets_serial;
+    prepared.modification_tick = modification_tick;
+    prepared.frame_tick = frame_tick;
+    prepared.bindings_epoch = bindings_epoch;
+    for (size_t index = 0; index < NUM_RT; ++index) {
+        prepared.views[index] = render_targets.color_buffer_ids[index];
+    }
+    prepared.views[NUM_RT] = render_targets.depth_buffer_id;
+}
+
+template <class P>
+bool TextureCache<P>::VerifyRenderTargetsPrepared() {
+    // The images the clean path prepares, with their flags before it runs.
+    std::array<ImageId, NUM_RT + 1> images{};
+    std::array<ImageFlagBits, NUM_RT + 1> flags_before{};
+    u64 marked = 0;
+    for (size_t index = 0; index <= NUM_RT; ++index) {
+        const ImageViewId id =
+            index < NUM_RT ? render_targets.color_buffer_ids[index] : render_targets.depth_buffer_id;
+        if (!id || slot_image_views[id].IsBuffer()) {
+            continue;
+        }
+        images[index] = slot_image_views[id].image_id;
+        flags_before[index] = slot_images[images[index]].flags;
+        ++marked;
+    }
+    const u64 tick_before = modification_tick;
+    const u64 epoch_before = bindings_epoch;
+    for (size_t index = 0; index < NUM_RT; ++index) {
+        PrepareImageView(render_targets.color_buffer_ids[index], true, false);
+    }
+    PrepareImageView(render_targets.depth_buffer_id, true, false);
+    ++rt_fast_verified;
+    // Skipping it would have left the ticks alone: MarkModification once per target is all it
+    // may have done.
+    bool same = modification_tick - tick_before == marked && bindings_epoch == epoch_before;
+    size_t first_difference = NUM_RT + 1;
+    for (size_t index = 0; index <= NUM_RT && same; ++index) {
+        if (images[index] && slot_images[images[index]].flags != flags_before[index]) {
+            same = false;
+            first_difference = index;
+        }
+    }
+    if (!same) {
+        ++rt_fast_mismatches;
+        static u32 logged = 0;
+        if (logged < 32) {
+            ++logged;
+            const ImageId image =
+                first_difference <= NUM_RT ? images[first_difference] : ImageId{};
+            LOG_WARNING(HW_GPU,
+                        "RT_FAST (EXP31) mismatch: the clean path changed what the skip assumed: "
+                        "modification tick +{} for {} targets, epoch {} -> {}, target {} flags "
+                        "{:#x} -> {:#x}",
+                        modification_tick - tick_before, marked, epoch_before, bindings_epoch,
+                        first_difference,
+                        image ? static_cast<u32>(flags_before[first_difference]) : 0U,
+                        image ? static_cast<u32>(slot_images[image].flags) : 0U);
+        }
+    }
+    return same;
 }
 
 template <class P>
@@ -1113,6 +1254,7 @@ template <class P>
 void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
     ClearStale(cpu_addr, size);
     ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
+        ++bindings_epoch;
         if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
             // Written at last: a backed image replaces it where it is used next.
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
@@ -1256,6 +1398,7 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
                             [&](ImageId id, Image&) { deleted_images.push_back(id); });
     for (const ImageId id : deleted_images) {
         Image& image = slot_images[id];
+        ++bindings_epoch;
         if (False(image.flags & ImageFlagBits::CpuModified)) {
             image.flags |= ImageFlagBits::CpuModified;
             if (True(image.flags & ImageFlagBits::Tracked)) {
@@ -2377,6 +2520,7 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     }
     const TICEntry config = TextureViewHeader(raw_config, native);
     const ImageInfo info(config);
+    ++bindings_epoch;
     if (info.type == ImageType::Buffer) {
         const ImageViewInfo view_info(config, 0);
         return slot_image_views.insert(runtime, info, view_info, config.Address());
@@ -2486,6 +2630,7 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
 
 template <class P>
 void TextureCache<P>::InvalidateScale(Image& image) {
+    ++bindings_epoch;
     if (image.scale_tick <= frame_tick) {
         image.scale_tick = frame_tick + 1;
     }
@@ -2933,6 +3078,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     }
     Image& new_image = slot_images[new_image_id];
+    ++bindings_epoch;
 
     new_image.allocation_tick = frame_tick;
     {
@@ -3656,6 +3802,7 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
     }
     const ImageViewId image_view_id = slot_image_views.insert(runtime, info, image_id, image, slot_images);
     image.InsertView(info, image_view_id);
+    ++bindings_epoch;
     return image_view_id;
 }
 
@@ -3831,6 +3978,7 @@ template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
+    ++bindings_epoch;
     MarkStale(image);
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left
@@ -3944,6 +4092,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
 
 template <class P>
 void TextureCache<P>::RemoveImageViewReferences(std::span<const ImageViewId> removed_views) {
+    ++bindings_epoch;
     for (const ImageViewId removed : removed_views) {
         const auto refs = image_view_descriptors.find(removed);
         if (refs == image_view_descriptors.end()) {
@@ -4091,6 +4240,7 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
                         image.gpu_addr);
             Tegra::Nx2SparseMarkWritten(image.gpu_addr, image.guest_size_bytes);
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
+            ++bindings_epoch;
         }
         MarkModification(image);
     }

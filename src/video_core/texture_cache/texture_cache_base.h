@@ -537,8 +537,35 @@ private:
     Tegra::MaxwellDeviceMemoryManager& device_memory;
     std::deque<TextureCacheGPUMap> gpu_page_table_storage;
 
+    /// EDEN_NX2_EXP31 (RT_FAST, zortos293/Lichii#717): whether UpdateRenderTargets' clean path
+    /// would change nothing: the same targets were prepared for a draw, no image was modified,
+    /// created or deleted since, in the same frame, and none needs an upload, alias sync or
+    /// sparse backing.
+    [[nodiscard]] bool RenderTargetsStillPrepared() const;
+    void NoteRenderTargetsPrepared();
+    /// EXP31 bit 2: the clean path ran although RenderTargetsStillPrepared; checks it changed
+    /// nothing but the targets' own modification ticks. False (and logs) on a difference.
+    bool VerifyRenderTargetsPrepared();
+
     RenderTargets render_targets;
     u64 render_targets_serial = 0;
+    struct RenderTargetsPrepared {
+        bool valid = false;
+        u64 serial = 0;
+        u64 modification_tick = 0;
+        u64 frame_tick = 0;
+        u64 bindings_epoch = 0;
+        std::array<ImageViewId, NUM_RT + 1> views{};
+    } rt_prepared;
+    /// EXP31 counts since the last report (TickFrame, every 600 frames while it is on).
+    u64 rt_fast_skips = 0;
+    u64 rt_fast_clean_paths = 0;
+    u64 rt_fast_verified = 0;
+    u64 rt_fast_mismatches = 0;
+    /// Changes whenever a prepared render target could need preparing again: images or views
+    /// created, deleted, rescaled or CPU modified, descriptor pools moved, and every frame
+    /// (zortos293/Lichii#717's bindings_epoch).
+    u64 bindings_epoch = 1;
     u32 rt_active_mask = 0;
     std::array<ImageId, 8> rt_image_id{};
     ImageId rt_depth_image_id{};
