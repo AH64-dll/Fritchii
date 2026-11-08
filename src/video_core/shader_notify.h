@@ -59,6 +59,38 @@ public:
     }
     [[nodiscard]] bool WarmMayBuild() const noexcept;
 
+    /// Precompiled pipelines (EDEN_NX2_PRECOMPILE, progress kind 3). A preparation counts as a
+    /// warm-up while it runs. Prepare Shaders Now asks for another one with RequestPrecompile,
+    /// which counts it at once so the menu sees work left; the preparation thread takes the
+    /// request and ends it with PrecompileEnded.
+    void SetPrecompileAvailable(bool available) noexcept {
+        int expected = available ? PrecompileAbsent : PrecompileIdle;
+        precompile_state.compare_exchange_strong(expected,
+                                                 available ? PrecompileIdle : PrecompileAbsent);
+    }
+    /// The preparation thread starts a run (on its own or for a request).
+    void PrecompileStarted() noexcept {
+        if (precompile_state.exchange(PrecompileRunning) != PrecompileAsked) {
+            BeginWarm();
+        }
+    }
+    void PrecompileEnded() noexcept {
+        precompile_state.store(PrecompileIdle);
+        EndWarm();
+    }
+    /// False when this title has no precompiled pipelines to prepare.
+    bool RequestPrecompile() noexcept {
+        int expected = PrecompileIdle;
+        if (precompile_state.compare_exchange_strong(expected, PrecompileAsked)) {
+            BeginWarm();
+            return true;
+        }
+        return expected == PrecompileRunning || expected == PrecompileAsked;
+    }
+    [[nodiscard]] bool PrecompileRequested() const noexcept {
+        return precompile_state.load() == PrecompileAsked;
+    }
+
     void MarkShaderComplete() noexcept {
         ++num_complete;
     }
@@ -76,6 +108,11 @@ private:
     std::atomic<int> warm_running{};
     std::atomic<bool> emulation_paused{};
     std::atomic<bool> warm_requested{};
+    static constexpr int PrecompileAbsent = 0;  ///< nothing to prepare for this title
+    static constexpr int PrecompileIdle = 1;    ///< prepared, or waiting for its turn
+    static constexpr int PrecompileRunning = 2; ///< a preparation runs (counted in warm_running)
+    static constexpr int PrecompileAsked = 3;   ///< requested (counted in warm_running)
+    std::atomic<int> precompile_state{PrecompileAbsent};
     int report_base{};
 
     bool completed{};

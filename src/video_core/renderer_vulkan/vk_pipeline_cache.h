@@ -348,6 +348,45 @@ private:
     /// Waits until the warm-up may build (ShaderNotify::WarmMayBuild). False when it is to stop.
     bool WaitForWarmTurn(std::stop_token stop);
 
+    /// EDEN_NX2_PRECOMPILE (zortos293/Lichii#895): finds or assembles the title's precompiled
+    /// file (VideoCommon::Nx2Precompile) and prepares it on precompile_thread, at idle priority
+    /// while the game runs. Prepare Shaders Now (ShaderNotify::RequestPrecompile) prepares it
+    /// again. Started at the end of LoadDiskResources.
+    void StartPrecompiled(u64 title_id, const std::filesystem::path& base_dir);
+    std::jthread precompile_thread;
+
+    /// Builds and drops every pipeline of the game's precompiled file (written offline by
+    /// tools/nx2-precompile, or assembled from a recipe), so the driver's own cache holds them
+    /// before they are first drawn. Draws never use these pipelines: they build their own from
+    /// the guest's shaders and find the driver's compiled code. Runs once per precompiled file,
+    /// driver and emulator build (or again when `force`). Fritchii runs it on precompile_thread,
+    /// so `callback` (the loading screen in #895) is empty and progress goes to ShaderNotify.
+    void PreparePrecompiled(const std::filesystem::path& base_dir, std::stop_token stop_loading,
+                            const VideoCore::DiskResourceLoadCallback& callback,
+                            const std::filesystem::path& file = {}, bool force = false);
+
+    /// Native pipelines: the key without state that cannot change the pipeline (see
+    /// FixedPipelineState::CanonicalizeNative). From #895, not called yet (see
+    /// port_895_report.md: draws and the disk cache loader would have to key canonically).
+    void CanonicalizeNativeKey(GraphicsPipelineCacheKey& key,
+                               std::span<const Shader::Environment* const> envs) const noexcept;
+
+    /// Native vertex programs found to load attributes their header does not list: their keys
+    /// keep every attribute type (#895).
+    bool IsUnmaskedVertexProgram(u64 hash) const {
+        if (!any_unmasked_vertex_program.load(std::memory_order_acquire)) {
+            return false;
+        }
+        std::scoped_lock lock{unmasked_mutex};
+        return unmasked_vertex_programs.contains(hash);
+    }
+    mutable std::mutex unmasked_mutex;
+    std::unordered_set<u64> unmasked_vertex_programs;
+    std::atomic<bool> any_unmasked_vertex_program{};
+    /// disk_pipelines as boot left it: the preparation skips those keys (read off the GPU
+    /// thread, which keeps adding to disk_pipelines).
+    std::shared_ptr<const std::unordered_set<u64>> precompile_disk_keys;
+
     /// The pipeline cache warm-up builds go through: none by default, so the tens of thousands
     /// of warm-up programs stay in the driver's disk cache and out of vulkan_pipelines.bin (which
     /// is loaded into memory at every boot). EDEN_NX2_WARM_APP_CACHE=1 uses ours.
