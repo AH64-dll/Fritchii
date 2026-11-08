@@ -176,6 +176,10 @@ std::optional<FritchiiVersion> ParseBuildVersion(std::string_view build_version)
 }
 
 std::optional<FritchiiVersion> RunningVersion() {
+    // Fritchii builds carry the name apart from the version ("Fritchii" + "v4").
+    if (std::string_view{Common::g_build_name} == "Fritchii") {
+        return ParseBuildVersion(fmt::format("Fritchii {}", Common::g_build_version));
+    }
     return ParseBuildVersion(Common::g_build_version);
 }
 
