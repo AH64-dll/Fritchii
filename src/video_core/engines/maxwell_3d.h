@@ -3298,6 +3298,11 @@ private:
 
     void ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call);
 
+    /// CallMethod after the profile: CallMethodFast, or CallMethodSlow where it can't.
+    void DispatchMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call);
+    /// CallMethod with EDEN_NX2_GPU_PROFILE: DispatchMethod, counted and timed.
+    void ProfiledCallMethod(Core::System& system, u32 method, u32 method_argument,
+                            bool is_last_call);
     /// CallMethod with every check, for the cases and tools CallMethodFast leaves out.
     void CallMethodSlow(Core::System& system, u32 method, u32 method_argument, bool is_last_call);
     void CallMethodFast(u32 method, u32 method_argument, bool is_last_call);

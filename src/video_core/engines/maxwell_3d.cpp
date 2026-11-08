@@ -74,8 +74,9 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     for (size_t i = MacroRegistersStart; i < memory_write_mask.size(); ++i) {
         memory_write_mask[i] = true;
     }
+    // Profiled runs take the same path: CallMethod counts and times its calls itself.
     fast_maxwell3d = VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::Method) && !record_write_history &&
-                     !g_trace_first_method_writes && !VideoCommon::Nx2Profile::Enabled();
+                     !g_trace_first_method_writes;
     const char* skip_same = std::getenv("EDEN_NX2_SKIP_SAME");
     skip_same_value_writes = skip_same == nullptr || skip_same[0] != '0';
     perf_verify = VideoCommon::Nx2Perf::Verify();
@@ -517,6 +518,14 @@ void Maxwell3D::TraceFirstMethodWrite(u32 method, u32 argument) {
 }
 
 void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
+    if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
+        return ProfiledCallMethod(system, method, method_argument, is_last_call);
+    }
+    DispatchMethod(system, method, method_argument, is_last_call);
+}
+
+void Maxwell3D::DispatchMethod(Core::System& system, u32 method, u32 method_argument,
+                               bool is_last_call) {
     if (!fast_maxwell3d || executing_macro != 0 || method >= MacroRegistersStart ||
         method == MAXWELL3D_REG_INDEX(shadow_ram_control)) {
         return CallMethodSlow(system, method, method_argument, is_last_call);
@@ -525,6 +534,20 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
         return VerifyCallMethod(system, method, method_argument, is_last_call);
     }
     CallMethodFast(method, method_argument, is_last_call);
+}
+
+// EDEN_NX2_GPU_PROFILE: the path unprofiled runs take, counted. GpuSplit's back calls the 3D engine
+// outside every zone (fast_maxwell3d), millions of times a second: a sample of those calls is
+// timed (SampledScope). Called inside another zone (a back macro, a run of words, the unsplit GPU
+// thread's method zone), the call is that zone's time, as before.
+void Maxwell3D::ProfiledCallMethod(Core::System& system, u32 method, u32 method_argument,
+                                   bool is_last_call) {
+    const VideoCommon::Nx2Profile::SampledScope scope{VideoCommon::Nx2Profile::Zone::Method};
+    if (method < MacroRegistersStart) {
+        VideoCommon::Nx2Profile::CountRegisterWrite(method,
+                                                    regs.reg_array[method] == method_argument);
+    }
+    DispatchMethod(system, method, method_argument, is_last_call);
 }
 
 namespace {
@@ -669,8 +692,15 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
         }
         return;
     }
+    // Counted and timed as CallMethod counts and times each word (EDEN_NX2_GPU_PROFILE).
+    const VideoCommon::Nx2Profile::SampledScope scope{VideoCommon::Nx2Profile::Zone::Method, count};
+    const bool profile = VideoCommon::Nx2Profile::Enabled();
     // As CallMethodFast for each word: the first may issue a deferred draw, before any upload.
     for (u32 i = 0; i < count; ++i) {
+        if (profile) [[unlikely]] {
+            VideoCommon::Nx2Profile::CountRegisterWrite(methods[i],
+                                                        regs.reg_array[methods[i]] == arguments[i]);
+        }
         ProcessDirtyRegisters(methods[i], ProcessShadowRam(methods[i], arguments[i]));
     }
     memory_manager.WriteWordsCached(address + offset, values.data(), count);
@@ -699,14 +729,7 @@ void Maxwell3D::CallMethodSlow(Core::System& system, u32 method, u32 method_argu
     }
 
     ASSERT(method < Regs::NUM_REGS && "Invalid Maxwell3D register, increase the size of the Regs structure");
-    if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
-        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::MethodWrites, 1);
-        const bool same = regs.reg_array[method] == method_argument;
-        if (same) {
-            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::SameValueWrites, 1);
-        }
-        VideoCommon::Nx2Profile::CountMethod(method, same);
-    }
+    // The profile's write counters: ProfiledCallMethod, for this path and CallMethodFast.
     if (method == MAXWELL3D_REG_INDEX(shadow_ram_control) && front_macros) [[unlikely]] {
         back_control_writes[back_control_count++ % back_control_writes.size()] = {
             method_argument, static_cast<u32>(shadow_state.shadow_ram_control), is_last_call ? 1U : 0U};

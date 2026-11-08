@@ -146,6 +146,10 @@ struct ThreadData {
     u64 window_start{};
     u64 window_start_ticks{};
     std::optional<u64> cpu_start_ns;
+    u32 depth{};          ///< Zones open (Scope, timed SampledScope)
+    u32 samples_left{1};  ///< SampledScope: entries until the next timed one
+    u32 sample_weight{1}; ///< SampledScope: the entries the next timed one stands for
+    u32 sample_seed{0x2545F491};
 };
 
 inline thread_local ThreadData t_data;
@@ -188,8 +192,10 @@ public:
         if (!enabled) {
             return;
         }
-        parent_child_ns = t_data.child_ns;
-        t_data.child_ns = 0;
+        auto& data = t_data;
+        ++data.depth;
+        parent_child_ns = data.child_ns;
+        data.child_ns = 0;
         start = Ticks();
     }
 
@@ -207,6 +213,7 @@ public:
         data.exclusive_ns[index] += elapsed - data.child_ns;
         ++data.count[index];
         data.child_ns = parent_child_ns + elapsed;
+        --data.depth;
     }
 
     Scope(const Scope&) = delete;
@@ -219,6 +226,90 @@ private:
     u64 start{};
     u64 parent_child_ns{};
     u64 timeline_start{};
+};
+
+/// The ticks two time stamp reads in a row take: what a timed entry measures on top of its own
+/// time (the least of a few tries).
+inline u64 TimingOverheadTicks() {
+    static const u64 overhead = [] {
+        u64 least = ~u64{0};
+        for (int i = 0; i < 64; ++i) {
+            const u64 first = Ticks();
+            const u64 second = Ticks();
+            least = (std::min)(least, second - first);
+        }
+        return least;
+    }();
+    return overhead;
+}
+
+/// A zone entered millions of times a second, such as the split's back's 3D register writes
+/// (Maxwell3D::CallMethod): timing every entry took two time stamp reads each, which cost more
+/// than most entries and slowed the very runs it measured. Entered outside every other zone, one
+/// entry in about SampleEvery is timed and stands for the entries since the last timed one; all
+/// are counted. Entered inside another zone it does nothing: the entry is that zone's time.
+/// Not recorded on the Nx2Timeline (a span per sampled method would say nothing there).
+class SampledScope {
+public:
+    static constexpr u32 SampleEvery = 32;
+    /// About 25 us at 4 GHz (time stamp ticks): far longer than these entries take.
+    static constexpr u64 LongTicks = 100'000;
+
+    /// `entries`: what this entry counts as (a run of constant buffer words counts each word).
+    explicit SampledScope(Zone zone, u32 entries = 1) {
+        if (!Enabled()) [[likely]] {
+            return;
+        }
+        auto& data = t_data;
+        if (data.depth != 0) {
+            return;
+        }
+        index = static_cast<size_t>(zone);
+        data.count[index] += entries;
+        if (--data.samples_left != 0) {
+            return;
+        }
+        weight = data.sample_weight;
+        // The next interval: 1 to 2 * SampleEvery - 1 entries, so that no fixed period lines up
+        // with a repeating pattern of entries (xorshift32).
+        u32 seed = data.sample_seed;
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        data.sample_seed = seed;
+        data.sample_weight = 1 + seed % (2 * SampleEvery - 1);
+        data.samples_left = data.sample_weight;
+        ++data.depth;
+        parent_child_ns = data.child_ns;
+        data.child_ns = 0;
+        start = Ticks();
+    }
+
+    ~SampledScope() {
+        if (weight == 0) {
+            return;
+        }
+        const u64 elapsed = Ticks() - start;
+        auto& data = t_data;
+        // Less the reads' own cost, which the untimed entries did not pay.
+        const u64 overhead = TimingOverheadTicks();
+        const u64 own = elapsed - data.child_ns;
+        const u64 measured = own > overhead ? own - overhead : 0;
+        // An entry this long was most likely interrupted or preempted: it counts once, not for
+        // the untimed entries too.
+        data.exclusive_ns[index] += measured > LongTicks ? measured : measured * weight;
+        data.child_ns = parent_child_ns + elapsed;
+        --data.depth;
+    }
+
+    SampledScope(const SampledScope&) = delete;
+    SampledScope& operator=(const SampledScope&) = delete;
+
+private:
+    size_t index{};
+    u64 weight{}; ///< 0: not timed
+    u64 start{};
+    u64 parent_child_ns{};
 };
 
 /// Amounts counted on the GPU thread, logged per second with the zones.
@@ -271,6 +362,18 @@ inline void CountMethod(u32 method, bool same) {
         ++t_method_count[method];
         t_method_same[method] += same ? 1 : 0;
     }
+}
+
+/// A 3D register write (Maxwell3D::CallMethod below the macro range), `same` if the register
+/// held the value already: the write counters and the per-method counts.
+inline void CountRegisterWrite(u32 method, bool same) {
+    if (!Enabled()) {
+        return;
+    }
+    auto& counters = t_data.counters;
+    ++counters[static_cast<size_t>(Counter::MethodWrites)];
+    counters[static_cast<size_t>(Counter::SameValueWrites)] += same ? 1 : 0;
+    CountMethod(method, same);
 }
 
 inline void CountDmaRead(u32 macro) {
@@ -489,7 +592,10 @@ inline void Report(const char* thread_name = "GPU thread") {
     t_method_count = {};
     t_method_same = {};
     t_dma_reads = {};
+    // The zones open around this call (Report runs inside the split's back loop) stay open.
+    const u32 depth = data.depth;
     data = {};
+    data.depth = depth;
     data.window_start = now;
     data.window_start_ticks = now_ticks;
     data.cpu_start_ns = cpu_now;
