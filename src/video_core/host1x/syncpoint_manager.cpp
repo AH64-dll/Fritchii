@@ -65,6 +65,9 @@ void SyncpointManager::IncrementGuest(u32 syncpoint_id) {
     }
     Increment(syncpoints_guest[syncpoint_id], wait_guest_cv, guest_action_storage[syncpoint_id],
               "syncpoint: guest increment", syncpoint_id);
+    if (const auto hook = guest_increment_hook.load(std::memory_order_acquire)) {
+        hook(guest_increment_context.load(std::memory_order_relaxed));
+    }
 }
 
 void SyncpointManager::IncrementHost(u32 syncpoint_id) {

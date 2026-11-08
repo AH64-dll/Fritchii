@@ -31,6 +31,7 @@ the trace's otherData (qpc_start, qpc_frequency); see merge_etw (not done).
 """
 
 import argparse
+import os
 import bisect
 import collections
 import json
@@ -830,6 +831,12 @@ def analyse(trace, walker, top=10):
     lo, hi = percentile(durations, 0.4), percentile(durations, 0.6)
     bands = {"median band": [f for f in frames if lo <= f["frame_ms"] <= hi],
              "p90 band": [f for f in frames if f["frame_ms"] >= p90_ms]}
+    # CP_WINDOWS="8.5-9.4,11.5-12.9" (seconds from the capture start): the second band is the
+    # frames starting inside those windows instead of the p90 band (e.g. the frames of a dip).
+    if os.environ.get("CP_WINDOWS"):
+        spans = [tuple(float(x) for x in w.split("-")) for w in os.environ["CP_WINDOWS"].split(",")]
+        bands["p90 band"] = [f for f in frames
+                             if any(a <= f["start_us"] / 1e6 <= b for a, b in spans)]
     median_frame = min(frames, key=lambda f: abs(f["frame_ms"] - median_ms))
 
     def mean_by(band, key):
