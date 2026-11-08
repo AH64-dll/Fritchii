@@ -542,6 +542,15 @@ Image::MemoryBlock Image::GetMemoryBlock() const noexcept {
             info.allocationInfo.size};
 }
 
+bool Image::IsDeviceLocal() const noexcept {
+    if (allocation == nullptr) {
+        return false;
+    }
+    VkMemoryPropertyFlags flags{};
+    vmaGetAllocationMemoryProperties(allocator, allocation, &flags);
+    return (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+}
+
 void Buffer::Flush() const {
     if (!is_coherent) {
         vmaFlushAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);

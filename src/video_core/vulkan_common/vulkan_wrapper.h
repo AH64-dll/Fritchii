@@ -750,6 +750,9 @@ public:
     };
     [[nodiscard]] MemoryBlock GetMemoryBlock() const noexcept;
 
+    /// True when the image's memory is device local (not placed in host memory over budget).
+    [[nodiscard]] bool IsDeviceLocal() const noexcept;
+
 private:
     void Release() const noexcept;
 

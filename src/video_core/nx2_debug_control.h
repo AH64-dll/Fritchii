@@ -286,6 +286,32 @@ inline std::atomic<int> g_idle_pause{-1};
 /// entries inside a method's data (the parameters GPU work writes) still wait. Against the
 /// built-in skip-everything this only adds waits. Entries that didn't wait for every writer are
 /// checked on the back ("EDEN_NX2_LIST_WAIT_SKIP: command list at ... was GPU-written": stays 0).
+/// EXP42 (live; VkImage pool, fable_answer_12 2B; vk_texture_cache.cpp): 1 = a deleted
+/// single-level, single-layer render target's VkImage (and its rescaled copy), once the GPU is done
+/// with it, is kept with its memory for the next image made with the same create info and view
+/// formats, instead of vkDestroyImage + vkCreateImage. Only device-local, non-dedicated images of
+/// 256 KiB or more; the pool holds at most 512 MiB, 180 frames each, and empties when the switch
+/// goes off or an image does not fit in device memory. A taken image starts uninitialized
+/// (UNDEFINED layout, contents discarded) as a new one does. Its bytes are left out of the
+/// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
+/// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 0 (default)
+/// = off.
+/// EXP43 (live; render target relocation, fable_answer_12 2A; TextureCache::JoinImages): a render
+/// target a clear overwrites whole, with no copies, aliases or remapped images among its overlaps
+/// and exactly one predecessor among its bad overlaps (an image of the same single-level,
+/// single-layer 2D shape it drifted off by less than its size, not written in this frame: Ocarina
+/// of Time's bump-allocated per-frame targets while an NPC moves), takes that image's place;
+/// bad overlaps of other shapes stay as for a new image. 2 = relocate: the image moves to the new
+/// address (stale at the old one, untracked, unregistered, its overlap links dropped, registered
+/// again; its VkImage, memory, views and framebuffers stay). 3 = as 2, and with several
+/// predecessors the most recently modified one moves (lets a chain made before the switch went
+/// on stop growing and age out). 1 = retire early: the predecessor is deleted at once and a new
+/// image made, as with 0. 0 (default) = off: candidates are only counted. Never for a shape
+/// whose GPU-written contents were sampled or rendered to without a clear in a later frame, or
+/// read by the CPU (sticky per shape for the session: "Render target relocation guard (EXP43)"),
+/// nor for rescaled, sparse, converted or CPU-read images, ones with a download queued, bound as
+/// another target of the clear or in another channel. Logs each shape's first candidate and
+/// relocation and "Render target relocation (EXP43=n) last 600 frames".
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 
