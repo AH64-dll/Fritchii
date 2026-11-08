@@ -1170,8 +1170,12 @@ bool Device::GetSuitability(bool requires_swapchain) {
     FOR_EACH_VK_FEATURE_EXT(FEATURE_EXTENSION);
     FOR_EACH_VK_EXTENSION(EXTENSION);
 
-    // EDEN_NX2_GPL=1: graphics pipelines linked from per-stage libraries (vk_pipeline_library).
+    // Shader libraries setting or EDEN_NX2_GPL=1: graphics pipelines linked from per-stage
+    // libraries (vk_pipeline_library).
     graphics_pipeline_library_requested = [] {
+        if (Settings::values.use_graphics_pipeline_library.GetValue()) {
+            return true;
+        }
         const char* value = std::getenv("EDEN_NX2_GPL");
         return value && *value && *value != '0';
     }();
