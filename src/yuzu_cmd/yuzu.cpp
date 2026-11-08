@@ -523,9 +523,37 @@ static bool BuildWarm(Core::System& system, int argc, char** argv) {
     };
     const auto result = ShaderWarm::BuildWarmFilesWith(
         system, Common::FS::ToU8String(argv[2]), title_id, options, on_progress, {});
+    // The error can hold a Windows path: escape it so the summary stays valid JSON.
+    std::string error;
+    for (const char c : result.error) {
+        switch (c) {
+        case '"':
+            error += "\\\"";
+            break;
+        case '\\':
+            error += "\\\\";
+            break;
+        case '\n':
+            error += "\\n";
+            break;
+        case '\r':
+            error += "\\r";
+            break;
+        case '\t':
+            error += "\\t";
+            break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+                error += fmt::format("\\u{:04x}", static_cast<unsigned>(c));
+            } else {
+                error += c;
+            }
+            break;
+        }
+    }
     fmt::print("{{\"ok\": {}, \"error\": \"{}\", \"compute\": {}, \"vertex\": {}, "
                "\"fragment\": {}, \"skipped\": {}, \"seconds\": {:.1f}}}\n",
-               result.ok, result.error, result.compute_programs, result.vertex_programs,
+               result.ok, error, result.compute_programs, result.vertex_programs,
                result.fragment_programs, result.skipped,
                std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
     std::fflush(stdout);

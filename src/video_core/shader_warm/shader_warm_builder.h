@@ -31,9 +31,10 @@ std::filesystem::path GraphicsWarmPath(u64 title_id);
 /// cache version; a matching marker skips that warm-up at boot.
 std::filesystem::path WarmMarkerPath(const std::filesystem::path& warm_file);
 
-/// Removes the title's warm files and their markers (rebuild or delete from the UI). Returns
-/// false when a file exists but cannot be removed.
-bool DeleteWarmFiles(u64 title_id);
+/// Removes the title's warm files, their markers and leftover temporary files (rebuild or delete
+/// from the UI). Returns false when a file exists but cannot be removed, with the reason in
+/// `error` when given.
+bool DeleteWarmFiles(u64 title_id, std::string* error = nullptr);
 
 struct Progress {
     std::string stage;   ///< "Reading game files", "Extracting shaders", "Converting", "Writing"

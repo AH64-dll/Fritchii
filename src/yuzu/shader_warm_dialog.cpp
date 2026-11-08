@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <memory>
 #include <system_error>
 #include <utility>
@@ -31,17 +32,7 @@ bool ShaderWarmFilesExist(u64 title_id) {
 }
 
 bool DeleteShaderWarmFiles(u64 title_id, std::string& error) {
-    bool ok = true;
-    for (const auto& path :
-         {ShaderWarm::ComputeWarmPath(title_id), ShaderWarm::GraphicsWarmPath(title_id)}) {
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-        if (ec) {
-            ok = false;
-            error = ec.message();
-        }
-    }
-    return ok;
+    return ShaderWarm::DeleteWarmFiles(title_id, &error);
 }
 
 namespace {
@@ -140,8 +131,18 @@ void ShaderWarmDialog::Start() {
                  total = static_cast<qulonglong>(p.total)] { OnProgress(stage, done, total); },
                 Qt::QueuedConnection);
         };
-        auto result = std::make_shared<ShaderWarm::Result>(
-            ShaderWarm::BuildWarmFiles(system, game_path, title_id, on_progress, stop));
+        // An exception must not leave the thread (std::terminate would close the emulator):
+        // report it as a failed build instead.
+        auto result = std::make_shared<ShaderWarm::Result>();
+        try {
+            *result = ShaderWarm::BuildWarmFiles(system, game_path, title_id, on_progress, stop);
+        } catch (const std::exception& e) {
+            result->ok = false;
+            result->error = e.what();
+        } catch (...) {
+            result->ok = false;
+            result->error = "unknown error";
+        }
         const bool stopped = stop.stop_requested();
         QMetaObject::invokeMethod(
             this, [this, result, stopped] { OnFinished(*result, stopped); },

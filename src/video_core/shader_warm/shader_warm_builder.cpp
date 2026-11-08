@@ -311,7 +311,7 @@ fs::path WarmMarkerPath(const fs::path& warm_file) {
     return marker;
 }
 
-bool DeleteWarmFiles(u64 title_id) {
+bool DeleteWarmFiles(u64 title_id, std::string* error) {
     bool ok = true;
     for (const auto& warm : {ComputeWarmPath(title_id), GraphicsWarmPath(title_id)}) {
         fs::path tmp = warm;
@@ -319,7 +319,12 @@ bool DeleteWarmFiles(u64 title_id) {
         for (const auto& path : {warm, WarmMarkerPath(warm), tmp}) {
             std::error_code ec;
             fs::remove(path, ec);
-            ok = ok && !ec;
+            if (ec) {
+                ok = false;
+                if (error != nullptr) {
+                    *error = ec.message();
+                }
+            }
         }
     }
     return ok;

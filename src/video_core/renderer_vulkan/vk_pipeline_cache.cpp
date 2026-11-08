@@ -1692,13 +1692,15 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
 namespace {
 /// The warm-up file: the environment variable when set, else the title's file when it exists.
-std::string WarmFile(const char* variable, const std::filesystem::path& title_file) {
+/// The warm file to load: the environment override (native narrow encoding, as the environment
+/// gives it) or the title's own file, empty when neither exists.
+std::filesystem::path WarmFile(const char* variable, const std::filesystem::path& title_file) {
     if (const char* const path = std::getenv(variable); path != nullptr && *path != '\0') {
-        return path;
+        return std::filesystem::path{path};
     }
     std::error_code ec;
     if (std::filesystem::exists(title_file, ec)) {
-        return Common::FS::PathToUTF8String(title_file);
+        return title_file;
     }
     return {};
 }
@@ -1796,13 +1798,13 @@ void PipelineCache::StartComputeWarm(u64 title_id) {
     if (!compute_warm_threads.empty()) {
         return;
     }
-    const std::string file_path = WarmFile("EDEN_NX2_COMPUTE_WARM",
-                                           VideoCommon::ShaderWarm::ComputeWarmPath(title_id));
-    if (file_path.empty()) {
+    const std::filesystem::path warm_file =
+        WarmFile("EDEN_NX2_COMPUTE_WARM", VideoCommon::ShaderWarm::ComputeWarmPath(title_id));
+    if (warm_file.empty()) {
         return;
     }
+    const std::string file_path = Common::FS::PathToUTF8String(warm_file); // for the log
     const char* const path = file_path.c_str();
-    const std::filesystem::path warm_file = Common::FS::ToU8String(file_path);
     const std::filesystem::path title_file = VideoCommon::ShaderWarm::ComputeWarmPath(title_id);
     if (WarmAlreadyDone(warm_file, title_file, device)) {
         LOG_INFO(Render_Vulkan, "Nx2Perf compute_warm: already done for this file and driver");
@@ -1817,7 +1819,7 @@ void PipelineCache::StartComputeWarm(u64 title_id) {
     };
     auto entries = std::make_shared<std::vector<Entry>>();
     try {
-        std::ifstream file(std::filesystem::path{path}, std::ios::binary | std::ios::ate);
+        std::ifstream file(warm_file, std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
             LOG_WARNING(Render_Vulkan, "Nx2Perf compute_warm: cannot open {}", path);
             return;
@@ -1939,13 +1941,13 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
     if (!graphics_warm_threads.empty() || !device.IsExtGraphicsPipelineLibrarySupported()) {
         return;
     }
-    const std::string file_path = WarmFile("EDEN_NX2_GRAPHICS_WARM",
-                                           VideoCommon::ShaderWarm::GraphicsWarmPath(title_id));
-    if (file_path.empty()) {
+    const std::filesystem::path warm_file =
+        WarmFile("EDEN_NX2_GRAPHICS_WARM", VideoCommon::ShaderWarm::GraphicsWarmPath(title_id));
+    if (warm_file.empty()) {
         return;
     }
+    const std::string file_path = Common::FS::PathToUTF8String(warm_file); // for the log
     const char* const path = file_path.c_str();
-    const std::filesystem::path warm_file = Common::FS::ToU8String(file_path);
     const std::filesystem::path title_file = VideoCommon::ShaderWarm::GraphicsWarmPath(title_id);
     if (WarmAlreadyDone(warm_file, title_file, device)) {
         LOG_INFO(Render_Vulkan, "Nx2Perf graphics_warm: already done for this file and driver");
@@ -1967,7 +1969,7 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
     };
     auto reader = std::make_shared<Reader>();
     try {
-        reader->file.open(std::filesystem::path{path}, std::ios::binary | std::ios::ate);
+        reader->file.open(warm_file, std::ios::binary | std::ios::ate);
         if (!reader->file.is_open()) {
             LOG_WARNING(Render_Vulkan, "Nx2Perf graphics_warm: cannot open {}", path);
             return;
