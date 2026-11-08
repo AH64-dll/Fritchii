@@ -1566,9 +1566,9 @@ bool Feed(const AcquireCheck& check, bool resume) {
                                ? compare == Compare::Gequal && check.value <= newest.payload
                                : Meets(compare, check.value, newest.payload);
         if (!earlier_monotonic && (queued || pending) && meets) {
-            const auto writers = GpuSplit::Get().QueuedGuestWriters(
-                check.done, check.address, check.device, sizeof(u32));
-            if ((std::max)(writers.noted, writers.unbounded) <= newest.position) {
+            // Write stamps: no write the front noted since the release may have reached it.
+            if (GpuSplit::Get().WriteStamp(check.device, sizeof(u32), check.address) <=
+                newest.position) {
                 if (!FeedSource(newest.source)) {
                     ++state.not_fed_source[static_cast<size_t>(newest.source)];
                     return false;
