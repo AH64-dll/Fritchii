@@ -1124,6 +1124,12 @@ PipelineCache::~PipelineCache() {
                                      CACHE_VERSION);
     }
     Common::NoteShutdownProgress();
+    if (background_taken != 0 || !background_ready.empty()) {
+        // Prebuilt pipelines a draw never took cost driver memory and build time for nothing.
+        LOG_INFO(Render_Vulkan,
+                 "Background pipelines this session: {} taken by draws, {} never used",
+                 background_taken, background_ready.size());
+    }
     DestroyPipelinesWithProgress(background_ready);
     DestroyPipelinesWithProgress(graphics_cache);
     DestroyPipelinesWithProgress(evicted_pipelines);
@@ -1954,6 +1960,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         const u64 hash = deferred.first.Hash();
         return rekeyed_pipelines.contains(hash) && !native_pipelines.contains(hash);
     });
+    if (background_count == 0 && !deferred_graphics.empty()) {
+        LOG_INFO(Render_Vulkan,
+                 "No background pipeline builds: {} cached graphics pipelines are built when first "
+                 "needed",
+                 deferred_graphics.size());
+    }
     if (background_count != 0 && !stop_loading.stop_requested()) {
         const size_t threads = BackgroundPipelineThreads();
         LOG_INFO(Render_Vulkan,
