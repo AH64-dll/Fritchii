@@ -796,6 +796,10 @@ public:
     void SetWriteStampTag(u64 tag) {
         write_stamp_tag = tag;
     }
+    /// A tag no other write has (inline uploads of any engine).
+    [[nodiscard]] u64 NewWriteStampTag() {
+        return ++write_stamp_tags;
+    }
     [[nodiscard]] u64 WriteStamp(u64 device, u64 size, GPUVAddr address, u64 skip_tag = 0) const;
     /// For a semaphore acquire of `device`: the payload a release still queued for the back writes
     /// there, if nothing sent after it may write the word. The back runs the acquire's channel
@@ -1021,6 +1025,7 @@ private:
     std::unique_ptr<StampSlot[]> page_stamps;
     bool write_stamps{};
     u64 write_stamp_tag{};
+    u64 write_stamp_tags{};
     u64 write_stamp_floor{};
     u64 unknown_write_position{};
     void StampWrite(u64 begin, u64 end, bool gpu_address);

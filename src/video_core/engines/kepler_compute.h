@@ -47,6 +47,13 @@ class RasterizerInterface;
 
 namespace Tegra::Engines {
 
+/// EXP13=2-4: bytes another engine's front knows (a 3D inline upload) land at GPU [address,
+/// address + size) of `memory` when the back runs the work that ends at ring `position`, written
+/// with write-stamp tag `tag`: the QMD copy's inline QMD overlays and upload shadow blocks that
+/// still hold those bytes take them, as compute inline uploads patch them.
+void Nx2PatchQmdCopy(VideoCommon::GpuSplit& split, const MemoryManager& memory, GPUVAddr address,
+                     const u8* data, u64 size, u64 position, u64 tag);
+
 /// Draws left to trace after an upscale fallback (debug aid).
 extern std::atomic<u32> g_nx2_trace_draws_after_upscale;
 
