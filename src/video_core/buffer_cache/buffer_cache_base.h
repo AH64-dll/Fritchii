@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "common/container/unordered_map.h"
+#include <boost/unordered/unordered_node_map.hpp>
 #include <boost/container/static_vector.hpp>
 #include <boost/container/small_vector.hpp>
 
@@ -499,7 +500,10 @@ public:
         u64 changed_frame = ~u64{0};
         bool recheck = false;
     };
-    std::unordered_map<DAddr, NativeBankPage> native_indirect_page_snapshots;
+    /// Node map: NoteNativeBankPageChanged keeps pointers to earlier pages' words until the bind's
+    /// uploads are flushed, so entries must not move (std::unordered_map's lookups were ~2% of the
+    /// split's back at Castle Town, 600k a second).
+    boost::unordered_node_map<DAddr, NativeBankPage> native_indirect_page_snapshots;
     /// Counts graphics draws (UpdateGraphicsBuffers) for EDEN_NX2_EXP4 & 2.
     u64 native_bank_draw = 0;
     /// EDEN_NX2_EXP4 != 0: bank check cost, logged every 5 s.
