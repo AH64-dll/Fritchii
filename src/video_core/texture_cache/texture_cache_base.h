@@ -671,6 +671,22 @@ private:
     u64 tombstone_overlap_reads{}; ///< New images read over one, not at its address
     u32 tombstone_hits_logged{};
 
+    /// Cold sweep (EDEN_NX2_TC_COLD_FRAMES=K, 0 = off; fable_answer_16 3.2): a relocation-shaped
+    /// image with BadOverlap (a member of a drifted chain) untouched for K host frames, with no
+    /// download queued and not bound, is deleted in TickFrame (at most 16 a frame), so its
+    /// VkImage goes to the EXP42 pool instead of waiting for the collector, which only starts
+    /// near the device budget. Never a GPU-written image that may be read again: one that was
+    /// itself read in a later frame or by the CPU, or of a shape guarded as read by the CPU, and
+    /// unless EDEN_NX2_TC_COLD_GUARDED=1 of a shape guarded as sampled or rendered to without a
+    /// clear in a later frame. JoinImages puts the chain members it sees on the watch list.
+    void WatchColdImage(ImageId image_id);
+    void SweepColdImages();
+    std::vector<std::pair<ImageId, u64>> cold_watch; ///< Image, frame_tick it was put on
+    ::Common::unordered_set<ImageId> cold_watch_set;
+    u64 cold_deleted{};       ///< Since the last report
+    u64 cold_kept_guarded{};  ///< Dropped from the watch: GPU-written and guarded
+    u64 cold_kept_read{};     ///< Dropped from the watch: GPU-written and read later or by the CPU
+
     [[nodiscard]] static bool RelocationShaped(const ImageInfo& info) noexcept {
         return info.type == ImageType::e2D && info.resources.levels == 1 &&
                info.resources.layers == 1 && info.num_samples == 1;

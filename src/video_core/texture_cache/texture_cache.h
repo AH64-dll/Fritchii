@@ -638,6 +638,7 @@ void TextureCache<P>::TickFrame() {
         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
         images_created = images_deleted = 0;
     }
+    SweepColdImages();
     // An image that could not be made at all: the driver is out of memory whatever the counts
     // say, so collect as at the critical threshold.
     bool out_of_memory = false;
@@ -711,6 +712,139 @@ void TextureCache<P>::TickFrame() {
             runtime.FreeDeferredStagingBuffer(buffer);
         }
         async_buffers_death_ring.clear();
+    }
+}
+
+/// EDEN_NX2_TC_COLD_FRAMES (the cold sweep's K, 0 = off).
+inline u64 TcColdFrames() {
+    static const u64 frames = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_COLD_FRAMES");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+    }();
+    return frames;
+}
+
+template <class P>
+void TextureCache<P>::WatchColdImage(ImageId image_id) {
+    if (TcColdFrames() == 0 || !RelocationShaped(slot_images[image_id].info)) {
+        return;
+    }
+    if (cold_watch_set.insert(image_id).second) {
+        cold_watch.emplace_back(image_id, frame_tick);
+    }
+}
+
+template <class P>
+void TextureCache<P>::SweepColdImages() {
+    const u64 cold_frames = TcColdFrames();
+    if (cold_frames == 0) {
+        return;
+    }
+    static const bool sweep_guarded = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_COLD_GUARDED");
+        return value != nullptr && value[0] == '1';
+    }();
+    constexpr u32 MaxPerFrame = 16;
+    constexpr u64 MaxWatchFrames = 600; // then a watched image that never got BadOverlap leaves
+    constexpr ImageFlagBits excluded =
+        ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+        ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked | ImageFlagBits::Converted |
+        ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding | ImageFlagBits::Remapped |
+        ImageFlagBits::CostlyLoad;
+    const auto queued = [](ImageId image_id, const auto& downloads) {
+        return std::ranges::any_of(downloads, [image_id](const auto& download) {
+            return download.is_swizzle && download.object_id == image_id;
+        });
+    };
+    const auto bound = [this](const ImageBase& image) {
+        return std::ranges::any_of(image.image_view_ids, [this](ImageViewId view) {
+            return render_targets.depth_buffer_id == view ||
+                   std::ranges::find(render_targets.color_buffer_ids, view) !=
+                       render_targets.color_buffer_ids.end();
+        });
+    };
+    u32 deleted = 0;
+    size_t index = 0;
+    while (index < cold_watch.size()) {
+        const ImageId image_id = cold_watch[index].first;
+        const u64 watched_at = cold_watch[index].second;
+        const auto drop = [&] {
+            cold_watch_set.erase(image_id);
+            cold_watch[index] = cold_watch.back();
+            cold_watch.pop_back();
+        };
+        if (!slot_images.contains(image_id)) {
+            drop();
+            continue;
+        }
+        Image& image = slot_images[image_id];
+        if (!RelocationShaped(image.info) || False(image.flags & ImageFlagBits::Registered) ||
+            True(image.flags & excluded)) {
+            drop();
+            continue;
+        }
+        if (False(image.flags & ImageFlagBits::BadOverlap)) {
+            // The newest image of a chain has one overlap; the next drift makes it bad.
+            if (frame_tick - watched_at > MaxWatchFrames) {
+                drop();
+            } else {
+                ++index;
+            }
+            continue;
+        }
+        // Touched (prepared, bound, sampled) in the last K host frames.
+        if (frame_tick - lru_cache.Tick(image.lru_index) < cold_frames) {
+            ++index;
+            continue;
+        }
+        if (True(image.flags & ImageFlagBits::GpuModified)) {
+            // Its contents exist only on the GPU and the collector would not download them
+            // either (BadOverlap): only where nothing says they may be read again.
+            if (image.relocation_guard_noted != 0 || image.info.forced_flushed ||
+                image.info.dma_downloaded) {
+                ++cold_kept_read;
+                drop();
+                continue;
+            }
+            const auto shape = relocation_shapes.find(RelocationShapeKey(image.info));
+            const u8 guard = shape != relocation_shapes.end() ? shape->second.guard : 0;
+            if ((guard & GuardCpuRead) != 0 ||
+                (!sweep_guarded && (guard & (GuardSampled | GuardLoaded)) != 0)) {
+                ++cold_kept_guarded;
+                drop();
+                continue;
+            }
+        }
+        if (queued(image_id, uncommitted_downloads) ||
+            std::ranges::any_of(committed_downloads,
+                                [&](const auto& downloads) { return queued(image_id, downloads); }) ||
+            bound(image)) {
+            ++index;
+            continue;
+        }
+        if (deleted >= MaxPerFrame) {
+            break;
+        }
+        // As the collector deletes an image it does not download.
+        MarkStale(image); // before UntrackImage (see MarkStale)
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        UnregisterImage(image_id);
+        DeleteImage(image_id);
+        ++deleted;
+        drop();
+    }
+    cold_deleted += deleted;
+    if (frame_tick % 600 == 0) {
+        LOG_INFO(HW_GPU,
+                 "Cold sweep (EDEN_NX2_TC_COLD_FRAMES={}{}) last 600 frames: {} chain images "
+                 "deleted, {} kept as GPU-written and guarded, {} kept as read later; {} watched; "
+                 "{} images, device memory {} MiB (expected {} MiB)",
+                 cold_frames, sweep_guarded ? ", guarded too" : "", cold_deleted,
+                 cold_kept_guarded, cold_kept_read, cold_watch.size(), slot_images.size(),
+                 total_used_memory >> 20, expected_memory >> 20);
+        cold_deleted = cold_kept_guarded = cold_kept_read = 0;
     }
 }
 
@@ -3475,7 +3609,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                             moved.overlapping_images.size() > 1) {
                             moved.flags |= ImageFlagBits::BadOverlap;
                         }
+                        WatchColdImage(other_id);
                     }
+                    WatchColdImage(old_id);
                     return old_id;
                 }
                 if (mode == 1) {
@@ -3716,6 +3852,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             new_image.overlapping_images.size() > 1) {
             new_image.flags |= ImageFlagBits::BadOverlap;
         }
+        WatchColdImage(aliased_id);
+    }
+    if (!join_bad_overlap_ids.empty()) {
+        WatchColdImage(new_image_id);
     }
 
     const auto joined_delete_start = std::chrono::steady_clock::now();
