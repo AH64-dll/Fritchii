@@ -12,6 +12,7 @@
 #include "ui_main.h"
 #include "yuzu/fritchii/fritchii_ui.h"
 #include "yuzu/fritchii/home.h"
+#include "yuzu/fritchii/precompile_gate.h"
 #include "yuzu/fritchii/whats_new.h"
 #include "yuzu/game/game_list.h"
 #include "yuzu/main_window.h"
@@ -102,4 +103,21 @@ void MainWindow::SetUpFritchiiUi() {
                                          game_list_placeholder, std::move(home));
     connect(this, &MainWindow::EmulationStarting, fritchii_home,
             &FritchiiUi::Home::OnEmulationStarting);
+
+    // "Preparing shaders" before the game starts when its precompiled pipelines need preparing.
+    auto* gate = new FritchiiUi::PrecompileGate(
+        this, statusBar(),
+        {.pause = [this] { OnPauseGame(); },
+         .resume = [this] { OnStartGame(); },
+         .game_name = [] {
+             constexpr u64 OcarinaOfTime = 0x0400486024DEC000ULL;
+             return QtCommon::system &&
+                            QtCommon::system->GetApplicationProcessProgramID() == OcarinaOfTime
+                        ? QStringLiteral("OoT")
+                        : tr("the game");
+         }});
+    connect(this, &MainWindow::EmulationStarting, gate,
+            &FritchiiUi::PrecompileGate::OnEmulationStarting);
+    connect(this, &MainWindow::EmulationStopping, gate,
+            &FritchiiUi::PrecompileGate::OnEmulationStopping);
 }

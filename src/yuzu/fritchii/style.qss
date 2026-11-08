@@ -167,6 +167,13 @@ QListWidget#selectorList::item:selected { background: #2b2640; color: #ececf1; }
 QLabel#FritchiiDialogTitle { font-size: 24px; font-weight: 500; color: #ececf1; }
 QTextBrowser#FritchiiNotes { background: transparent; border: none; font-size: 15px; }
 
+/* Preparing shaders (fritchii/precompile_gate.cpp) */
+QDialog#FritchiiPrepare { background: #111113; }
+QLabel#FritchiiLead { font-size: 16px; color: #c9c9d3; }
+QProgressBar#FritchiiPrepareBar { background: #1f1f24; border: none; border-radius: 6px; }
+QProgressBar#FritchiiPrepareBar::chunk { background: #a78bfa; border-radius: 6px; }
+QLabel#FritchiiStatusNote { color: #a78bfa; padding: 0 10px; }
+
 /* Home and rail (fritchii/home.cpp) */
 QWidget#FritchiiRail { background: #0c0c0e; }
 QToolButton#FritchiiRailButton {
