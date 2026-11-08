@@ -24,8 +24,8 @@ inline constexpr u32 OpenGLPipelineCacheVersion = 48;
 /// #408), which is all their version 55 changes. So shared caches and #895 recipes of 54 are taken as
 /// they are, and moving to 55 later is this number plus VulkanOwnPreviousVersions.
 inline constexpr u32 VulkanPipelineCacheVersion = 54;
-/// This fork's earlier versions of the same record format, newest first: their files are adopted
-/// once into the current version (renamed, the cache header's version rewritten; records unchanged).
+/// This fork's earlier versions of the same record format, newest first: their files are copied
+/// once to the current version's names (header version rewritten; records unchanged).
 inline constexpr std::array<u32, 1> VulkanOwnPreviousVersions{52};
 
 // Official Eglantine (cache version 18 at c0cb3325) and this fork (a different version) both
@@ -70,42 +70,13 @@ inline bool AdoptLegacyPipelineCache(const std::filesystem::path& legacy,
     return !error;
 }
 
-/// Adopts this fork's own cache file of an earlier version with the same record format: renames
-/// `old_cache` to `new_cache` and rewrites the version in its header (no copy, so a 1+ GB cache
-/// moves instantly). Does nothing when `new_cache` exists or the header doesn't say `old_version`.
-/// Undoes the rename if the header can't be rewritten.
-inline bool AdoptOwnPipelineCache(const std::filesystem::path& old_cache,
-                                  const std::filesystem::path& new_cache,
-                                  const std::array<char, 8>& magic, u32 old_version,
-                                  u32 new_version) {
-    std::error_code error;
-    if (std::filesystem::exists(new_cache, error) || error ||
-        !PipelineCacheHeaderMatches(old_cache, magic, old_version)) {
-        return false;
-    }
-    std::filesystem::rename(old_cache, new_cache, error);
-    if (error) {
-        return false;
-    }
-    {
-        std::fstream stream(new_cache, std::ios::binary | std::ios::in | std::ios::out);
-        stream.seekp(static_cast<std::streamoff>(magic.size()));
-        stream.write(reinterpret_cast<const char*>(&new_version), sizeof(new_version));
-        if (stream.good()) {
-            return true;
-        }
-    }
-    std::filesystem::rename(new_cache, old_cache, error);
-    return false;
-}
-
-/// Renames a file of this fork's earlier version that has no version in it (the used-pipelines
-/// list, the merge log) when the current one doesn't exist yet.
-inline void AdoptOwnUnversionedFile(const std::filesystem::path& old_file,
-                                    const std::filesystem::path& new_file) {
+/// Copies a file of this fork's earlier version that has no version in it (the used-pipelines
+/// list, the merge log) when the current one doesn't exist yet; the old file stays for older builds.
+inline void CopyOwnUnversionedFile(const std::filesystem::path& old_file,
+                                   const std::filesystem::path& new_file) {
     std::error_code error;
     if (!std::filesystem::exists(new_file, error) && std::filesystem::exists(old_file, error)) {
-        std::filesystem::rename(old_file, new_file, error);
+        std::filesystem::copy_file(old_file, new_file, error);
     }
 }
 

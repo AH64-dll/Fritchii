@@ -2295,24 +2295,25 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan-frizti", CACHE_VERSION);
     used_pipelines_filename =
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used-frizti", CACHE_VERSION);
-    // This fork's files of an earlier version with the same records (52 before 2026-11-08) become
-    // the current version's: renamed, header rewritten, used list and merge log moved with them.
+    // This fork's files of an earlier version with the same records (52 before 2026-11-08) are
+    // copied to the current version's names, header rewritten, used list and merge log with them.
+    // Copied, not renamed: older builds (a rollback to the previous release) keep their cache.
     for (const u32 previous : VideoCommon::VulkanOwnPreviousVersions) {
         const auto old_cache =
             VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan-frizti", previous);
         // The shader cache's records file magic (the driver blob file uses VULKAN_CACHE_MAGIC_NUMBER).
         constexpr std::array<char, 8> RecordsMagic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
-        if (VideoCommon::AdoptOwnPipelineCache(old_cache, pipeline_cache_filename, RecordsMagic,
-                                               previous, CACHE_VERSION)) {
-            VideoCommon::AdoptOwnUnversionedFile(
+        if (VideoCommon::CopyCompatiblePipelineCache(old_cache, pipeline_cache_filename,
+                                                     RecordsMagic, previous, CACHE_VERSION)) {
+            VideoCommon::CopyOwnUnversionedFile(
                 VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used-frizti", previous),
                 used_pipelines_filename);
             auto old_log = old_cache;
             old_log += ".merged";
             auto new_log = pipeline_cache_filename;
             new_log += ".merged";
-            VideoCommon::AdoptOwnUnversionedFile(old_log, new_log);
-            LOG_INFO(Render_Vulkan, "Pipeline cache of version {} adopted as version {}: {}",
+            VideoCommon::CopyOwnUnversionedFile(old_log, new_log);
+            LOG_INFO(Render_Vulkan, "Pipeline cache of version {} copied as version {}: {}",
                      previous, CACHE_VERSION, Common::FS::PathToUTF8String(pipeline_cache_filename));
             break;
         }
