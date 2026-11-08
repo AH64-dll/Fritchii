@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <utility>
 
 #include "common/common_types.h"
 #include "shader_recompiler/shader_info.h"
@@ -46,5 +47,27 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Memory& gpu_mem
                })
         .value_or(0U);
 }
+
+/// Whether texture descriptor `desc`'s handle word (element `index`) is where a storage buffer of
+/// the same program keeps its address. The translation falls back to such a word when the shader
+/// loads the handle per invocation, which no draw-time evaluation can give (a light's texture
+/// read in a clustered light loop, Ocarina of Time's waterfall). Its low bits then name an
+/// unrelated texture, a different one whenever the game moves the buffer: every frame for a
+/// double-buffered one, so the surface flickers. Bind no texture for it instead.
+template <typename Descriptor>
+[[nodiscard]] bool HandleIsStoragePointer(const Shader::Info& info, const Descriptor& desc,
+                                          u32 index) {
+    if (desc.handle_program != ~0U || desc.has_secondary) {
+        return false;
+    }
+    const u32 offset = desc.cbuf_offset + (index << desc.size_shift);
+    return std::ranges::any_of(info.storage_buffers_descriptors, [&](const auto& storage) {
+        return storage.cbuf_index == desc.cbuf_index && offset >= storage.cbuf_offset &&
+               offset - storage.cbuf_offset < sizeof(u64);
+    });
+}
+
+/// A texture handle no table holds: the texture cache binds its null view and sampler.
+inline constexpr std::pair<u32, u32> NULL_TEXTURE_HANDLE{~0U, ~0U};
 
 } // namespace VideoCommon

@@ -356,3 +356,27 @@ TEST_CASE("Storage handle words are read from the host-aligned buffer base",
         CHECK(VideoCommon::EvaluateTextureHandle(info, 0, memory, cbuf_address, 4) == 0x22U);
     }
 }
+
+TEST_CASE("A texture handle word that holds a storage buffer address is not a handle",
+          "[video_core][texture_handles]") {
+    Shader::Info info;
+    info.storage_buffers_descriptors.push_back({.cbuf_index = 0, .cbuf_offset = 0x520, .count = 1, .is_written = false});
+    Shader::TextureDescriptor desc{};
+    desc.cbuf_index = 0;
+    desc.cbuf_offset = 0x520;
+    desc.count = 1;
+    desc.size_shift = 3;
+    CHECK(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    desc.cbuf_offset = 0x524; // the address's upper word
+    CHECK(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    desc.cbuf_offset = 0x528;
+    CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    desc.cbuf_offset = 0x518;
+    CHECK(VideoCommon::HandleIsStoragePointer(info, desc, 1)); // the second element
+    desc.cbuf_offset = 0x520;
+    desc.cbuf_index = 2;
+    CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    desc.cbuf_index = 0;
+    desc.handle_program = 0; // computed for each draw: a real handle
+    CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+}

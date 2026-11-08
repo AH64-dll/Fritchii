@@ -609,9 +609,14 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 add_image(desc, false);
             }
         }
+        // EDEN_NX2_EXP21 (default 1; 0 = off): no texture for a handle that is a buffer address.
+        const bool null_pointer_handles{VideoCore::Nx2Debug::Experiment(21) != 0};
         for (const auto& desc : info.texture_descriptors) {
             for (u32 index = 0; index < desc.count; ++index) {
-                const auto handle{read_handle(desc, index)};
+                const auto handle{null_pointer_handles &&
+                                          VideoCommon::HandleIsStoragePointer(info, desc, index)
+                                      ? VideoCommon::NULL_TEXTURE_HANDLE
+                                      : read_handle(desc, index)};
                 // EDEN_NX2_HANDLE_TRACE=<shader hash>: each new handle of that shader's textures.
                 static const u64 trace_hash{[] {
                     const char* const value{std::getenv("EDEN_NX2_HANDLE_TRACE")};
