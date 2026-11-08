@@ -625,6 +625,38 @@ public:
         }
         return remembered == pending_writes.size();
     }
+    /// The newest NoteMemoryWrite / NoteMemoryWriteData sent after `since` over the u32 at
+    /// `device` (what OverlayQueuedWrites(since) applies last to it), whether or not the back ran
+    /// it since. `position` 0: none (or more were noted since than are remembered); `words` 0:
+    /// its words are unknown, else `value` is the word it writes at `device`.
+    struct NotedWord {
+        u64 position;
+        const char* what;
+        u32 words;
+        u32 value;
+    };
+    [[nodiscard]] NotedWord NewestNotedWriteTo(u64 since, u64 device) const {
+        const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+        for (u64 scanned = 0; scanned < remembered; ++scanned) {
+            const PendingWrite& write =
+                pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
+            if (write.position <= since) {
+                break;
+            }
+            if (write.begin < device + sizeof(u32) && device < write.end) {
+                NotedWord found{write.position, write.what, write.words, 0};
+                if (const u64 offset = device - write.begin;
+                    write.words != 0 && device >= write.begin && offset % sizeof(u32) == 0 &&
+                    offset / sizeof(u32) < write.words) {
+                    found.value = write.data[offset / sizeof(u32)];
+                } else {
+                    found.words = 0;
+                }
+                return found;
+            }
+        }
+        return {};
+    }
     /// Work that writes the device range [begin, begin + size) was just sent (an inline upload, a
     /// report, a semaphore release). size ~0 means an unknown range.
     void NoteMemoryWrite(u64 begin, u64 size, const char* what = "unknown") {

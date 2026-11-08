@@ -145,15 +145,37 @@ const char* NotedWriterName(const VideoCommon::GpuSplit::GuestWriters& writers) 
 //   with EXP13 on, a release the QMD prediction recorded for it (QMD completion releases; with
 //   EXP13=0 the front can't tell which word a queued QMD releases). The lower ones are among
 //   them;
-// - readable below: SemaphoreReadableNow read the word current (queued known writes overlaid)
-//   and below the value, yet guest memory meets it (a compute release landing in between can do
-//   that too, so this one is a hint).
-// The first 8 of the first two are logged, and one line every 5 s (HW_GPU, Info). Front thread
-// only, as the GpuSplit tables it reads.
+// - readable below: SemaphoreReadableNow read the word current (guest memory with the queued
+//   writes the front knows the words of overlaid, GpuSplit::OverlayQueuedWrites, or after
+//   waiting for the noted ones, WaitForWritesTo) and below the value, yet guest memory meets it
+//   now. Both lookups above ask what is queued NOW, from the same tables the readable read used
+//   (pending_writes, queued_releases), so a write the overlay applied that is still queued shows
+//   up there too. What they can't see: the readable read came earlier (at back position
+//   ReadableRead::done), and work sent before the acquire may have run in between. The writes
+//   SemaphoreReadableNow neither waits for nor overlays are the ones not in pending_writes:
+//   compute 0x6c3 releases and reductions and copy semaphores (writer_ranges), and QMD
+//   completion releases (dispatches, no per-word note with EXP13=0). One of those landing
+//   between the two reads raises the word, and has run, so it is queued no more. Or the back
+//   ran a known write and then one of those between the overlay's position load and its guest
+//   memory read: the overlay then puts the known (older, lower) word back over the newer one.
+//   Either way the write the overlay applied ran before level 2 looked. The first 8 log
+//   the overlay's newest write since the read (kind, ring, value) and the writers sent after
+//   the read, to tell such a raise from a reset.
+// The first 8 of each are logged, and one line every 5 s (HW_GPU, Info). Front thread only, as
+// the GpuSplit tables it reads.
 // EDEN_NX2_EXP34 (live, default 1, nx2_debug_control.h): 1 = an acquire over a queued writer
-// (lower releases included) takes the normal path instead (the drain or the readable fence
-// release, as when guest memory is below the value), 2 = only one over a queued lower release
-// does, 0 = count only. It only turns met answers into the normal path, never the other way.
+// (lower releases included) or readable below the value takes the normal path instead (the
+// drain or the readable fence release, as when guest memory is below the value), 2 = only one
+// over a queued lower release does, 0 = count only. It only turns met answers into the normal
+// path, never the other way.
+
+// What SemaphoreReadableNow read for an acquire: the word, and the back's position loaded before
+// guest memory was read for it.
+struct ReadableRead {
+    u32 word;
+    u64 done;
+};
+
 class PrecheckAudit {
 public:
     static PrecheckAudit& Get() {
@@ -162,10 +184,10 @@ public:
     }
 
     /// Level 2 would answer met: guest memory holds `word` (>= `value`) at GPU `address`
-    /// (device `device`); `readable_word`: what SemaphoreReadableNow read, when it read the word
+    /// (device `device`); `readable`: what SemaphoreReadableNow read, when it read the word
     /// current. Returns whether the answer stands (EXP34).
     bool Allow(GPUVAddr address, u64 device, u32 word, u32 value,
-               std::optional<u32> readable_word) {
+               std::optional<ReadableRead> readable) {
         auto& split = VideoCommon::GpuSplit::Get();
         const u64 done = split.ConsumedNow();
         u64 release_position = 0;
@@ -207,13 +229,19 @@ public:
                          split.SentPosition());
             }
         }
-        if (readable_word && *readable_word < value) {
+        const bool below = readable && readable->word < value;
+        if (below) {
             ++readable_below;
+            if (logged_below < 8) {
+                ++logged_below;
+                LogReadableBelow(split, address, device, word, value, *readable, done);
+            }
         }
-        // EXP34: 1 = over a queued writer (the lower releases among them) the normal path
-        // answers, 2 = only over a queued lower release; anything else counts only.
+        // EXP34: 1 = over a queued writer (the lower releases among them) or readable below the
+        // value the normal path answers, 2 = only over a queued lower release; anything else
+        // counts only.
         const int guard = VideoCore::Nx2Debug::Experiment(34);
-        const bool refuse = (guard == 1 && writer) || (guard == 2 && lower);
+        const bool refuse = (guard == 1 && (writer || below)) || (guard == 2 && lower);
         refused += refuse ? 1 : 0;
         const auto now = std::chrono::steady_clock::now();
         if (now - last_report >= std::chrono::seconds{5}) {
@@ -230,6 +258,40 @@ public:
     }
 
 private:
+    // A readable-below case: what was written to the word, or sent that may write it, between
+    // the readable read (back at `read.done`) and now (back at `done`).
+    static void LogReadableBelow(VideoCommon::GpuSplit& split, GPUVAddr address, u64 device,
+                                 u32 word, u32 value, const ReadableRead& read, u64 done) {
+        // The overlay's source: the newest noted write over the word sent after the read.
+        const auto overlay = split.NewestNotedWriteTo(read.done, device);
+        // Releases and noted writers sent after the read, run since or still queued.
+        u64 release_position = 0;
+        const std::optional<u32> release =
+            split.QueuedReleaseTo(device, read.done, release_position);
+        const auto writers = split.QueuedGuestWriters(read.done, address, device, sizeof(u32));
+        const bool noted = writers.noted > read.done;
+        // Compute and copies (their 0x6c3, copy and QMD completion releases), unranged writers
+        // and queued functions: what the readable read can't account for.
+        const u64 untracked = split.UntrackedWriterPosition(device);
+        LOG_INFO(HW_GPU,
+                 "Acquire precheck (level 2) readable below the value: {:#x} (device {:#x}) "
+                 "readable {:#x} < {:#x} <= word {:#x}; read at back {}, back now {}, sent {}; "
+                 "overlay write {} at ring {} ({}, {} known words, writes {:#x}); release since "
+                 "the read {} "
+                 "(payload {:#x}, ring {}); noted since the read {} (ring {}); untracked writer "
+                 "at ring {} ({})",
+                 address, device, read.word, value, word, read.done, done, split.SentPosition(),
+                 overlay.position != 0 ? (overlay.position > done ? "queued" : "ran")
+                                       : "none",
+                 overlay.position, overlay.what != nullptr ? overlay.what : "-", overlay.words,
+                 overlay.words != 0 ? overlay.value : 0, release ? "sent" : "none",
+                 release.value_or(0), release_position,
+                 noted ? NotedWriterName(writers) : "none", noted ? writers.noted : 0, untracked,
+                 untracked > done        ? "queued"
+                 : untracked > read.done ? "ran since the read"
+                                         : "before the read");
+    }
+
     u64 met{};
     u64 over_lower{};
     u64 over_writer{};
@@ -237,6 +299,7 @@ private:
     u64 refused{};
     u32 logged_lower{};
     u32 logged_writer{};
+    u32 logged_below{};
     std::chrono::steady_clock::time_point last_report = std::chrono::steady_clock::now();
 };
 
@@ -245,9 +308,9 @@ private:
 // holds a lower value: one that meets the acquire already, meets it then too. Only a write that
 // lowers the word (a reset) could make this wrong (PrecheckAudit counts the met answers given over
 // a queued write the front knows of). Ocarina drained ~2,200 acquires a second that were met at
-// once. `readable_word`: what SemaphoreReadableNow read, when it read the word current.
+// once. `readable`: what SemaphoreReadableNow read, when it read the word current.
 bool GequalMetWithoutDrain(DmaPusher& dma_pusher, GPUVAddr address, u32 value,
-                           std::optional<u32> readable_word = std::nullopt) {
+                           std::optional<ReadableRead> readable = std::nullopt) {
     static const int level = [] {
         const char* setting = std::getenv("EDEN_NX2_ACQUIRE_PRECHECK");
         return setting == nullptr ? 0 : setting[0] == '2' ? 2 : setting[0] != '0' ? 1 : 0;
@@ -269,7 +332,7 @@ bool GequalMetWithoutDrain(DmaPusher& dma_pusher, GPUVAddr address, u32 value,
     if (word < value) {
         return false;
     }
-    if (level == 2 && !PrecheckAudit::Get().Allow(address, *device, word, value, readable_word)) {
+    if (level == 2 && !PrecheckAudit::Get().Allow(address, *device, word, value, readable)) {
         return false;
     }
     split.NoteSync();
@@ -721,7 +784,9 @@ bool MetByQmdPrediction(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
 
 } // Anonymous namespace
 
-static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& word);
+// `read_done` (optional): the back's position loaded before guest memory was read for `word`.
+static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& word,
+                                 u64* read_done = nullptr);
 
 // The fence release of an acquire whose word SemaphoreReadableNow read current but unmet: the
 // drain only matters for writes that read can't account for. Returns whether the acquire is met.
@@ -818,13 +883,14 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     }
     // EXP13=3: asked once per poll, before the unmet-poll throttle most polls end at.
     bool predicted = false;
-    std::optional<u32> readable_word;
-    if (u32 word{}; SemaphoreReadableNow(dma_pusher, pending_acquire->address, word)) {
+    std::optional<ReadableRead> readable;
+    u64 read_done = 0;
+    if (u32 word{}; SemaphoreReadableNow(dma_pusher, pending_acquire->address, word, &read_done)) {
         if (pending_acquire->Matches(word)) {
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquirePollsFast, 1);
             return true;
         }
-        readable_word = word;
+        readable = ReadableRead{.word = word, .done = read_done};
         // An unmet word is answered without a drain for at most 16 polls or 1 ms since the back
         // was last drained for this acquire. A release the back holds as deferred work lands only
         // when the back runs, so a channel polled without ever draining again waited forever
@@ -849,7 +915,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (static_cast<GpuSemaphoreOperation>(pending_acquire->operation) ==
             GpuSemaphoreOperation::AcquireGequal &&
         GequalMetWithoutDrain(dma_pusher, pending_acquire->address, pending_acquire->value,
-                              readable_word)) {
+                              readable)) {
         return true;
     }
     // EDEN_NX2_ACQUIRE_LEARN: resume when a release met the waiter (GPU releases notify
@@ -1009,7 +1075,8 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
     }
 }
 
-static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& word);
+static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& word,
+                                 u64* read_done);
 
 void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     const auto semaphoreOperationMask = 0xF;
@@ -1063,7 +1130,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
         u32 word{};
-        const bool readable = SemaphoreReadableNow(dma_pusher, acquire.address, word);
+        u64 read_done = 0;
+        const bool readable = SemaphoreReadableNow(dma_pusher, acquire.address, word, &read_done);
         if (readable && acquire.Matches(word)) {
             return;
         }
@@ -1076,7 +1144,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }
         if (op == GpuSemaphoreOperation::AcquireGequal &&
             GequalMetWithoutDrain(dma_pusher, acquire.address, acquire.value,
-                                  readable ? std::optional<u32>{word} : std::nullopt)) {
+                                  readable ? std::optional<ReadableRead>{ReadableRead{
+                                                 .word = word, .done = read_done}}
+                                           : std::nullopt)) {
             return;
         }
         if (op == GpuSemaphoreOperation::AcquireEqual &&
@@ -1318,7 +1388,8 @@ static void NoteSemaphoreWrite(DmaPusher& dma_pusher, GPUVAddr address,
 // EDEN_NX2_SEM_FAST: whether the word at `address` can be read without draining the back: not
 // GPU-written, after waiting only for the queued writes noted to it.
 // =2 also overlays the queued fence releases the front knows, instead of waiting for them.
-static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& word) {
+static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& word,
+                                 u64* read_done) {
     auto& split = VideoCommon::GpuSplit::Get();
     const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_sem_fast, "EDEN_NX2_SEM_FAST");
     using VideoCommon::Nx2Profile::Counter;
@@ -1341,12 +1412,18 @@ static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& w
         const u64 since = split.ConsumedNow();
         word = dma_pusher.memory_manager.Read<u32>(address);
         if (split.OverlayQueuedWrites(since, *device, &word, 1)) {
+            if (read_done) {
+                *read_done = since;
+            }
             return true;
         }
     }
     if (!split.WaitForWritesTo(*device, 16)) {
         VideoCommon::Nx2Profile::Add(Counter::SemWritersWait, 1);
         return false;
+    }
+    if (read_done) {
+        *read_done = split.ConsumedNow();
     }
     word = dma_pusher.memory_manager.Read<u32>(address);
     return true;

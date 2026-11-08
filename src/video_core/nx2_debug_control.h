@@ -233,7 +233,10 @@ inline std::atomic<int> g_idle_pause{-1};
 /// 1 = it takes the normal path instead when the front knows a write to the word is still queued
 /// for the back: a plain release (puller, SEM_EXECUTE, 3D or compute 0x6c3) with any payload, a
 /// noted write over the word (puller semaphores, 3D reports, compute 0x6c3 releases and
-/// reductions, copies, uploads) or, with EXP13 on, a QMD prediction record; 2 = only when that
+/// reductions, copies, uploads) or, with EXP13 on, a QMD prediction record, and when
+/// SemaphoreReadableNow read the word current but below the value (the Castle Town route's only
+/// cases, 5-13 per 5 s; most likely work it doesn't track ran between that read and level 2's,
+/// the log's first 8 say); 2 = only when that
 /// queued plain release writes less than the word read (a reset); 0 = count only. The counts
 /// are logged either way ("Acquire precheck (level 2)", every 5 s). Default 1: it only turns met
 /// answers into the path level 2 takes for a word below the value, never the other way, so it is
