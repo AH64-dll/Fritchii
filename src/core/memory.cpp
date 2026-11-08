@@ -39,6 +39,8 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/rasterizer_download_area.h"
 
 namespace Core::Memory {
@@ -1001,9 +1003,21 @@ struct Memory::Impl {
             // It is often the case the games like to access wildly different addresses. Hence why I propose
             // we should let the compiler just do it's thing...
             if (current_area.last_address != subaddress) {
+                // EDEN_NX2_EXP35: a page no GPU write ever marked (bits that never clear) is
+                // collected like a GPU-modified one instead of asking OnCPUWrite under both
+                // caches' mutexes, which the split's back holds through each draw (4% of the
+                // guest cores' busy time at Castle Town). The back applies collected writes to
+                // both caches at its next FlushCaching, before each draw, dispatch and clear.
+                const bool collect_unasked =
+                    address != 0 && size != 0 && VideoCore::Nx2Debug::Experiment(35) != 0 &&
+                    Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+                    !Tegra::Nx2MayBeGpuWritten(address, size);
+                if (collect_unasked) {
+                    Tegra::g_nx2_guest_writes_collected.fetch_add(1, std::memory_order_relaxed);
+                }
                 // Short circuit the need to check for address/size
-                auto const do_collection = (address != 0 && size != 0)
-                    && system.GPU().OnCPUWrite(address, size);
+                auto const do_collection = collect_unasked || ((address != 0 && size != 0)
+                    && system.GPU().OnCPUWrite(address, size));
                 if (do_collection) {
                     current_area.last_address = subaddress;
                 } else {
