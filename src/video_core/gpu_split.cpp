@@ -266,11 +266,12 @@ void GpuSplit::ReportBatched() {
                  "split_batch.compute_sunk {:.0f}, split_batch.compute_same {:.0f}, "
                  "split_batch.pairs {:.0f} in split_batch.pair_blocks {:.0f}, "
                  "split_batch.delta {:.0f} in split_batch.delta_blocks {:.0f}, "
-                 "split_batch.draw_batches {:.0f} for split_batch.draw_repeats {:.0f} more groups",
+                 "split_batch.draw_batches {:.0f} for split_batch.draw_repeats {:.0f} more groups, "
+                 "split_batch.same_index_first {:.0f}",
                  rate(Batched::MacroSunk), rate(Batched::ComputeSunk), rate(Batched::ComputeSame),
                  rate(Batched::Pairs), rate(Batched::PairBlocks), rate(Batched::DeltaWrites),
                  rate(Batched::DeltaBlocks), rate(Batched::DrawBatches),
-                 rate(Batched::DrawRepeats));
+                 rate(Batched::DrawRepeats), rate(Batched::SameIndexFirst));
     }
     batched.fill(0);
     batched_since = now;

@@ -1354,23 +1354,31 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     if (Profile::Enabled()) [[unlikely]] {
         Profile::Add(Profile::Counter::MethodWrites, 1);
     }
-    // EXP22 bit 1 (zortos293/Lichii#641 EDEN_NX2_FRONT_STATE): a macro's write to a state
-    // register that writes no memory, which the rest of this function would only compare, store
-    // and send as a Direct MacroWrite, goes in the open StateDelta block instead.
-    if ((fs.exp22 & 1) != 0 && from_macro && !execution_mask[method] &&
-        !memory_write_mask[method] && fs.delta_allowed && fs.same_experiment == 0 &&
-        !VideoCommon::GpuSplit::MacroSink()) {
-        if (fs.regs[method] == value && shadow_kept && fs.skip_same) {
-            if (Profile::Enabled()) [[unlikely]] {
-                Profile::Add(Profile::Counter::SameValueWrites, 1);
+    // EXP22 bit 1 (zortos293/Lichii#641 EDEN_NX2_FRONT_STATE): a write to a state register that
+    // writes no memory, which the rest of this function would only compare, store and send as a
+    // Direct MacroWrite (a macro's, EDEN_NX2_MACRO_SINK off) or a PairWrite (EDEN_NX2_RING_PAIRS:
+    // the command list's, and the macros' with MACRO_SINK), goes in the open StateDelta block at
+    // that same place, with the effect that path notes. Sunk Method entries (MACRO_SINK without
+    // RING_PAIRS) apply later than a block would and stay as they are.
+    if ((fs.exp22 & 1) != 0 && !execution_mask[method] && !memory_write_mask[method] &&
+        fs.delta_allowed && fs.same_experiment == 0) {
+        const bool direct = from_macro && !VideoCommon::GpuSplit::MacroSink();
+        if (direct || VideoCommon::GpuSplit::RingPairs()) {
+            if (fs.regs[method] == value && shadow_kept && fs.skip_same) {
+                if (Profile::Enabled()) [[unlikely]] {
+                    Profile::Add(Profile::Counter::SameValueWrites, 1);
+                }
+                return;
+            }
+            fs.regs[method] = value;
+            using Effect = VideoCommon::GpuSplit::Effect;
+            split.DeltaWrite(this, method, argument,
+                             direct && fs.draw_pending ? Effect::Gpu : Effect::None);
+            if (from_macro && !direct) {
+                split.CountBatched(VideoCommon::GpuSplit::Batched::MacroSunk);
             }
             return;
         }
-        fs.regs[method] = value;
-        split.DeltaWrite(this, method, argument,
-                         fs.draw_pending ? VideoCommon::GpuSplit::Effect::Gpu
-                                         : VideoCommon::GpuSplit::Effect::None);
-        return;
     }
     if (method == MAXWELL3D_REG_INDEX(shadow_ram_control) && FrontVerifyEnabled()) [[unlikely]] {
         fs.control_writes[fs.control_count++ % fs.control_writes.size()] = {
@@ -1397,6 +1405,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         if (fs.same_experiment != 0) [[unlikely]] {
             FrontReportSameWrites(fs);
         }
+        split.CountBatched(VideoCommon::GpuSplit::Batched::SameIndexFirst);
         return;
     }
     // What a constant buffer upload word or a report writes, for the front's macro memory reads.
@@ -2523,10 +2532,10 @@ void ReportExp22Checks() {
 } // Anonymous namespace
 
 void Maxwell3D::ApplyFrontDelta(Core::System& system, const u64* writes, u32 count) {
-    // The Direct MacroWrite entries the block stands for, each as CallMethod applies a state
-    // register write: the sink first, then the shadow RAM, the same-value skip and
-    // ProcessDirtyRegisters. The shadow RAM mode can't change within a block (its register is
-    // executable, and any other entry ends the block).
+    // The Direct MacroWrite entries or the Pairs block the block stands for, each write as
+    // CallMethod and ApplyPairs apply a state register write: the sink first, then the shadow
+    // RAM, the same-value skip and ProcessDirtyRegisters. The shadow RAM mode can't change within
+    // a block (its register is executable, and any other entry ends the block).
     ConsumeSink(system);
     if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::MethodWrites, count);

@@ -125,6 +125,7 @@ public:
         DeltaBlocks, ///< EXP22: StateDelta blocks opened
         DrawBatches, ///< EXP22: DrawBatch entries sent
         DrawRepeats, ///< EXP22: instance-loop groups they stand for past their first
+        SameIndexFirst, ///< EXP2 or EXP22 bit 4: same-value index_buffer.first writes not sent
         Count,
     };
     void CountBatched(Batched counter, u64 amount = 1) {
@@ -261,10 +262,11 @@ public:
     }
 
     // EDEN_NX2_EXP22, from zortos293/Lichii#641 (EDEN_NX2_FRONT_STATE, EDEN_NX2_DRAW_BATCH).
-    /// Bit 1: a 3D macro's state register write (not executable, writes no memory), which would
-    /// go as a Direct MacroWrite, appended to the open StateDelta block instead. The back applies
-    /// the block in one loop, write by write as CallMethod would (Maxwell3D::ApplyFrontDelta).
-    /// Open as a Pairs block is, and with each write's own effect noted at its position.
+    /// Bit 1: a 3D state register write (not executable, writes no memory), which would go as a
+    /// Direct MacroWrite or a PairWrite, appended to the open StateDelta block instead. The back
+    /// applies the block in one loop, write by write as CallMethod and ApplyPairs would
+    /// (Maxwell3D::ApplyFrontDelta). Open as a Pairs block is, and each write notes the effect
+    /// its old path noted at its position.
     void DeltaWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
                     Effect effect) {
         SelectEngine(engine);
