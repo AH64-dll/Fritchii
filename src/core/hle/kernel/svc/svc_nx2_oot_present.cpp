@@ -70,9 +70,16 @@ constexpr bool IsBlr(u32 word) {
 }
 
 struct PresentPollState {
+    // The process the site was checked in (process ids restart every session, so the pointer
+    // too), and what was found: main base + SleepReturn (0 when the site did not verify) and the
+    // two call words, read again on each use in case main moved.
     std::mutex site_mutex;
-    u64 checked_process_id = ~u64{}; // the process the site was checked in
-    u64 site_return = 0;             // main base + SleepReturn; 0 when the site did not verify
+    const KProcess* checked_process{};
+    u64 checked_process_id = ~u64{};
+    u64 site_return = 0;
+    u32 sleep_call_word = 0;
+    u32 get_value_call_word = 0;
+    bool build_id_logged = false;
 
     std::atomic<KernelCore*> kernel{};
     KThread* waiter{}; // the thread in the wait; guarded by the scheduler lock
@@ -145,23 +152,34 @@ void OnGpuWrite(u64 device_address, u32 value) {
 }
 
 /// main base + SleepReturn when this process runs the verified Ocarina of Time build, else 0.
-/// Checked once per process.
+/// The module is searched once per process; later calls only read the two call words again.
 u64 SiteReturnAddress(Core::System& system, KProcess& process) {
     PresentPollState& state = PollState();
     std::scoped_lock lk{state.site_mutex};
-    if (state.checked_process_id == process.GetProcessId()) {
-        return state.site_return;
+    const auto& build_id = system.GetApplicationProcessBuildID();
+    if (!std::equal(OotMainBuildId.begin(), OotMainBuildId.end(), build_id.begin())) {
+        if (!state.build_id_logged) {
+            state.build_id_logged = true;
+            LOG_INFO(Kernel_SVC, "OoT present poll (EXP24): main is not build E0F3CCFA..., off");
+        }
+        return 0;
     }
+    auto& memory = process.GetMemory();
+    if (state.checked_process == std::addressof(process) &&
+        state.checked_process_id == process.GetProcessId()) {
+        if (state.site_return == 0 ||
+            (memory.Read32(state.site_return - (SleepReturn - SleepCall)) ==
+                 state.sleep_call_word &&
+             memory.Read32(state.site_return + (GetValueCall - SleepReturn)) ==
+                 state.get_value_call_word)) {
+            return state.site_return;
+        }
+    }
+    state.checked_process = std::addressof(process);
     state.checked_process_id = process.GetProcessId();
     state.site_return = 0;
 
-    const auto& build_id = system.GetApplicationProcessBuildID();
-    if (!std::equal(OotMainBuildId.begin(), OotMainBuildId.end(), build_id.begin())) {
-        LOG_INFO(Kernel_SVC, "OoT present poll (EXP24): main is not build E0F3CCFA..., off");
-        return 0;
-    }
     const u64 main_base = GetInteger(Core::FindMainModuleEntrypoint(std::addressof(process)));
-    auto& memory = process.GetMemory();
     if (!memory.IsValidVirtualAddressRange(main_base + DumpFirst, DumpWords * sizeof(u32))) {
         LOG_WARNING(Kernel_SVC, "OoT present poll (EXP24): main+{:#x} is not mapped (main {:#x}), off",
                     DumpFirst, main_base);
@@ -190,6 +208,8 @@ u64 SiteReturnAddress(Core::System& system, KProcess& process) {
              "OoT present poll (EXP24): site verified (bl {:#010x}, blr {:#010x}, then {:#010x}{})",
              sleep_call, get_value_call, compare, compare == CmpW0One ? " = cmp w0, #1" : "");
     state.site_return = main_base + SleepReturn;
+    state.sleep_call_word = sleep_call;
+    state.get_value_call_word = get_value_call;
     state.kernel.store(std::addressof(system.Kernel()), std::memory_order_release);
     Common::Nx2GpuWrite::SetListener(&OnGpuWrite);
     return state.site_return;
