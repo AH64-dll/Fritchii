@@ -19,6 +19,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include "common/container/unordered_map.h"
 #include <vector>
@@ -236,6 +237,13 @@ private:
                                               u32 expected_cache_version);
 
     void QueueVulkanPipelineCacheFlush();
+    /// Writes the driver pipeline cache on the serialization thread, unless a write is queued
+    /// already (`again_if_busy`: then one more follows it, for a save that must hold the latest
+    /// builds). Callable from any thread.
+    void QueueVulkanPipelineCacheSave(bool again_if_busy);
+    /// True (and `last` set to now) when a write of the driver cache is due since `last`.
+    [[nodiscard]] bool VulkanPipelineCacheSaveDue(
+        std::chrono::steady_clock::time_point& last) const;
 
     /// The title's warm-compute.bin (ShaderWarm::ComputeWarmPath, EDEN_NX2_COMPUTE_WARM=<file>
     /// overrides): compute programs prepared from the game files are converted (missing reads
@@ -323,6 +331,11 @@ private:
     /// GPU thread builds them.
     std::unordered_set<u64> failed_disk_pipelines;
     std::mutex failed_disk_pipelines_mutex;
+    /// Disk cache records the translation rejected since the last report: the first few are
+    /// logged, the rest counted (ReportDiskRecordFailures, after the boot and background builds).
+    std::atomic<size_t> disk_record_failures{};
+    void NoteDiskRecordFailure(std::string_view kind, u64 hash, const char* reason);
+    void ReportDiskRecordFailures();
     std::unordered_map<u64, u8> used_pipelines; ///< Key hash -> sessions since it was last used
     std::unordered_set<const GraphicsPipeline*> used_this_session;
     std::filesystem::path used_pipelines_filename;
@@ -335,6 +348,7 @@ private:
     std::chrono::steady_clock::time_point last_flush{};
     std::atomic<size_t> last_cache_size{};
     std::atomic_bool flush_in_flight{};
+    std::atomic_bool save_again{};
 
     Common::ThreadWorker workers;
     Common::ThreadWorker serialization_thread;
@@ -357,6 +371,7 @@ private:
     std::atomic<size_t> background_slots{};
     size_t background_taken{}; ///< Under background_mutex
     std::chrono::steady_clock::time_point background_start{};
+    std::chrono::steady_clock::time_point background_last_save{}; ///< Under background_mutex
     /// Last: destroyed (its threads joined) before the state above.
     std::unique_ptr<Common::ThreadWorker> background_workers;
 };
