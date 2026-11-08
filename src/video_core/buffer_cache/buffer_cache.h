@@ -20,6 +20,7 @@
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
+#include "video_core/buffer_cache/nx2_bytes_equal.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/gpu_split.h"
@@ -1557,13 +1558,24 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     // the memory tracker, leaving stale host contents, so check such a bank on every bind: games
     // rewrite per-draw data between draws, and checking once per frame left it stale for a frame
     // now and then (white flashes in Ocarina of Time, Eglantine 031e07436c).
-    const bool native_bank = has_host_buffer &&
-                             (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
-                             size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
-                             !memory_tracker.IsRegionGpuModified(device_addr, size);
+    // Decided before the bank check, which changes nothing it reads (marking pages CPU-modified
+    // leaves their GPU bits alone).
+    const bool use_fast_buffer = needs_alignment_stream
+        || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
+            && !memory_tracker.IsRegionGpuModified(device_addr, size));
+    const bool native_bank_bind = has_host_buffer &&
+                                  (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
+                                  size != 0 && gpu_memory != nullptr &&
+                                  gpu_memory->UsesNativeTiling() &&
+                                  !memory_tracker.IsRegionGpuModified(device_addr, size);
+    // EDEN_NX2_EXP26 & 1 (zortos293/Lichii#717 EDEN_NX2_BUFCACHE_BANK): a bind that streams the
+    // buffer skips the check. The stream copies guest memory itself; the write flags the check
+    // would take stay set for the next bind that reads the host buffer.
+    const int bank_trims = native_bank_bind ? VideoCore::Nx2Debug::Experiment(26) : 0;
+    const bool native_bank = native_bank_bind && !(use_fast_buffer && (bank_trims & 1) != 0);
     if (const int tracked_mode = native_bank ? VideoCore::Nx2Debug::Experiment(9) : 0;
         tracked_mode != 0) {
-        CheckNativeBankPagesTracked(device_addr, size, tracked_mode);
+        CheckNativeBankPagesTracked(device_addr, size, tracked_mode, bank_trims, buffer);
     } else if (native_bank) {
         // The bank size is only an upper limit: stop at the end of the mapped memory.
         u64 mapped_size = 0;
@@ -1591,6 +1603,8 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         if (cost_mode != 0) {
             ++cost.binds;
         }
+        Buffer* const bank_upload_to = (bank_trims & 4) != 0 ? &buffer : nullptr;
+        NativeBankUploads bank_uploads;
         for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
             const u8* const guest = device_memory.template GetPointer<u8>(page);
             if (guest == nullptr) {
@@ -1608,8 +1622,13 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                 ++cost.pages_skipped;
                 continue;
             }
-            const bool same = !inserted && std::memcmp(snapshot.words.data() + begin,
-                                                       guest + begin, stop - begin) == 0;
+            // EDEN_NX2_EXP26 & 2: an inline SSE2 compare instead of the ucrt memcmp.
+            const bool same =
+                !inserted && ((bank_trims & 2) != 0
+                                  ? VideoCommon::Nx2BytesEqual(snapshot.words.data() + begin,
+                                                               guest + begin, stop - begin)
+                                  : std::memcmp(snapshot.words.data() + begin, guest + begin,
+                                                stop - begin) == 0);
             if (cost_mode != 0 && !inserted) {
                 ++cost.pages_compared;
                 cost.bytes_compared += stop - begin;
@@ -1657,7 +1676,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                 continue;
             }
             std::memcpy(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE);
-            memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
+            NoteNativeBankPageChanged(page, snapshot.words.data(), bank_upload_to, bank_uploads);
             if (once_per_draw) {
                 snapshot.checked_draw = native_bank_draw;
                 snapshot.checked_begin = 0;
@@ -1666,6 +1685,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             if (cost_mode != 0 && !inserted) {
                 ++cost.pages_changed;
             }
+        }
+        if (bank_uploads.count != 0) {
+            FlushNativeBankUploads(buffer, bank_uploads);
         }
         if (cost_mode != 0) {
             const auto now = std::chrono::steady_clock::now();
@@ -1681,9 +1703,6 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             }
         }
     }
-    const bool use_fast_buffer = needs_alignment_stream
-        || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
-            && !memory_tracker.IsRegionGpuModified(device_addr, size));
     if (use_fast_buffer) {
         if constexpr (IS_OPENGL) {
             if (runtime.HasFastBufferSubData()) {
@@ -1846,7 +1865,8 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
 }
 
 template <class P>
-void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, int mode) {
+void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, int mode,
+                                                 int trims, Buffer& buffer) {
     // EDEN_NX2_EXP9 (experiment, 0 = off): compare only the pages whose guest memory may have
     // changed since their last compare. 1: pages guest CPU writes were collected for (applied
     // only at the next InvalidateGPUCache, while the tracker holds the page clean), pages the
@@ -1871,6 +1891,8 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     const bool any_cpu_dirty = memory_tracker.IsRegionCpuModified(first_page, end - first_page);
     auto& stats = native_bank_tracked_stats;
     ++stats.binds;
+    Buffer* const upload_to = (trims & 4) != 0 ? &buffer : nullptr;
+    NativeBankUploads uploads;
     for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
         const u8* const guest = device_memory.template GetPointer<u8>(page);
         if (guest == nullptr) {
@@ -1886,7 +1908,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             std::memcpy(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE);
             snapshot.checked_frame = frame_tick;
             snapshot.recheck = collected || written;
-            memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
+            NoteNativeBankPageChanged(page, snapshot.words.data(), upload_to, uploads);
             continue;
         }
         // A flagged write's bytes may land after this compare: compare again at the next bind.
@@ -1916,13 +1938,19 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             continue;
         }
         ++stats.compared[reason];
-        if (std::memcmp(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE) == 0) {
+        // EDEN_NX2_EXP26 & 2: an inline SSE2 compare instead of the ucrt memcmp.
+        if ((trims & 2) != 0
+                ? VideoCommon::Nx2BytesEqual(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE)
+                : std::memcmp(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE) == 0) {
             continue;
         }
         ++stats.changed[reason];
         snapshot.changed_frame = frame_tick;
         std::memcpy(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE);
-        memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
+        NoteNativeBankPageChanged(page, snapshot.words.data(), upload_to, uploads);
+    }
+    if (uploads.count != 0) {
+        FlushNativeBankUploads(buffer, uploads);
     }
     const auto now = std::chrono::steady_clock::now();
     if (now - stats.last_log < std::chrono::seconds{5}) {
@@ -1946,6 +1974,60 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
              verify ? changed[BankNone] + changed[BankFrame] : 0);
     stats = {};
     stats.last_log = now;
+}
+
+template <class P>
+void BufferCache<P>::NoteNativeBankPageChanged(DAddr page, [[maybe_unused]] const u8* words,
+                                               [[maybe_unused]] Buffer* upload_to,
+                                               [[maybe_unused]] NativeBankUploads& uploads) {
+    if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
+        // EDEN_NX2_EXP26 & 4 (zortos293/Lichii#717 UploadNativeBank): copy the page from its
+        // snapshot now and leave its tracking alone (marking it CPU-modified costs two
+        // VirtualProtect calls). Only for a page that lies whole in the bound buffer and holds no
+        // GPU-written data, so the guest bytes are what its host copy should hold.
+        if (upload_to != nullptr && uploads.count < uploads.pages.size() &&
+            page >= upload_to->CpuAddr() &&
+            page + Core::DEVICE_PAGESIZE <= upload_to->CpuAddr() + upload_to->SizeBytes() &&
+            !memory_tracker.IsRegionGpuModified(page, Core::DEVICE_PAGESIZE) &&
+            !gpu_modified_ranges.Intersects(page, Core::DEVICE_PAGESIZE)) {
+            uploads.pages[uploads.count++] = NativeBankUpload{.page = page, .words = words};
+            return;
+        }
+    }
+    memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
+}
+
+template <class P>
+void BufferCache<P>::FlushNativeBankUploads([[maybe_unused]] Buffer& buffer,
+                                            [[maybe_unused]] const NativeBankUploads& uploads) {
+    if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
+        auto upload_staging = runtime.UploadStagingBuffer(uploads.count * Core::DEVICE_PAGESIZE);
+        std::array<BufferCopy, NativeBankUploadCapacity> copies{};
+        size_t num_copies = 0;
+        u64 staging_offset = 0;
+        for (size_t i = 0; i < uploads.count; ++i) {
+            const NativeBankUpload& upload = uploads.pages[i];
+            // From the snapshot, not guest memory again: the host buffer then holds exactly the
+            // bytes compared, and a later guest write shows at the next compare.
+            std::memcpy(upload_staging.mapped_span.data() + staging_offset, upload.words,
+                        Core::DEVICE_PAGESIZE);
+            const u64 dst_offset = buffer.Offset(upload.page);
+            if (num_copies != 0 &&
+                copies[num_copies - 1].dst_offset + copies[num_copies - 1].size == dst_offset) {
+                copies[num_copies - 1].size += Core::DEVICE_PAGESIZE;
+            } else {
+                copies[num_copies++] = BufferCopy{
+                    .src_offset = upload_staging.offset + staging_offset,
+                    .dst_offset = dst_offset,
+                    .size = Core::DEVICE_PAGESIZE,
+                };
+            }
+            staging_offset += Core::DEVICE_PAGESIZE;
+        }
+        const std::span<const BufferCopy> copy_span(copies.data(), num_copies);
+        const bool can_reorder = runtime.CanReorderUpload(buffer, copy_span);
+        runtime.CopyBuffer(buffer, upload_staging.buffer, copy_span, true, can_reorder);
+    }
 }
 
 template <class P>

@@ -144,6 +144,15 @@ inline std::atomic<int> g_idle_pause{-1};
 /// the resource request thread sleeps before rescanning requests that are not ready.
 /// 0 = no sleep (as without the patch, plus one SVC per rescan), 1 = 500 us (#641's default),
 /// above 1 = that many us, at most 16000. Off by default, not measured yet.
+/// EXP26 (native uniform bank check trims, zortos293/Lichii#717; BufferCache::
+/// BindHostGraphicsUniformBuffer and CheckNativeBankPagesTracked), bits: 1 = a bind that streams
+/// the buffer (at most 4 KiB, not GPU-modified) skips the check, the stream copies guest memory
+/// itself (BUFCACHE_BANK), 2 = pages compared with an inline SSE2 loop instead of memcmp
+/// (PAGE_CMP), 4 = changed pages copied to the host buffer from their snapshots instead of being
+/// marked CPU-modified (two VirtualProtect calls each), for pages whole in the bound buffer with
+/// no GPU-written data (UploadNativeBank's upload, without its once-a-frame bank shadows: the
+/// check stays per bind, d79572d28a). Off by default; measure 1 and 2 first, then 4. Verify
+/// with EXP9=2 ("missed" stays 0) and the flash watch.
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 

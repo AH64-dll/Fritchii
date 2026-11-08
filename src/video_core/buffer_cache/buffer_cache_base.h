@@ -528,6 +528,18 @@ public:
         std::array<u64, BankReasons> changed{};
         std::chrono::steady_clock::time_point last_log{};
     } native_bank_tracked_stats;
+    /// EDEN_NX2_EXP26 & 4: changed bank pages of one bind, copied to the host buffer from their
+    /// snapshots (FlushNativeBankUploads) instead of being marked CPU-modified. A 64 KiB bank
+    /// spans at most 17 pages.
+    struct NativeBankUpload {
+        DAddr page;
+        const u8* words;
+    };
+    static constexpr size_t NativeBankUploadCapacity = 32;
+    struct NativeBankUploads {
+        std::array<NativeBankUpload, NativeBankUploadCapacity> pages{};
+        size_t count = 0;
+    };
 
 private:
     template <typename Mask, typename Func>
@@ -575,7 +587,19 @@ private:
     void BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 binding_index, bool needs_bind);
 
     /// EDEN_NX2_EXP9: the native uniform bank check of a bind of [device_addr, device_addr + size).
-    void CheckNativeBankPagesTracked(DAddr device_addr, u32 size, int mode);
+    /// EDEN_NX2_EXP26 (bits, see Experiment in nx2_debug_control.h): `trims`; with & 4 changed
+    /// pages that lie whole in `buffer` are uploaded from their snapshots.
+    void CheckNativeBankPagesTracked(DAddr device_addr, u32 size, int mode, int trims,
+                                     Buffer& buffer);
+
+    /// A native bank page whose snapshot was just (re)taken: marked CPU-modified, or with
+    /// EXP26 & 4 (`upload_to` not null) queued in `uploads` when it lies whole in that buffer and
+    /// holds no GPU-written data.
+    void NoteNativeBankPageChanged(DAddr page, const u8* words, Buffer* upload_to,
+                                   NativeBankUploads& uploads);
+
+    /// EDEN_NX2_EXP26 & 4: copies the queued pages' snapshots into `buffer`.
+    void FlushNativeBankUploads(Buffer& buffer, const NativeBankUploads& uploads);
 
     void BindHostGraphicsStorageBuffers(size_t stage);
 
