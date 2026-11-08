@@ -120,6 +120,7 @@ struct KernelCore::Impl {
         // Derive the initial memory layout from the emulated board
         Init::InitializeSlabResourceCounts(kernel);
         DeriveInitialMemoryLayout();
+        CommitKernelMemory();
         Init::InitializeSlabHeaps(system, *memory_layout);
 
         // Initialize kernel memory and resources.
@@ -777,6 +778,25 @@ struct KernelCore::Impl {
         // Cache all linear regions in their own trees for faster access, later.
         memory_layout->InitializeLinearMemoryRegionTrees(aligned_linear_phys_start,
                                                          linear_region_start);
+    }
+
+    /// EDEN_NX2_SEC_RESERVE (Common::HostMemory::Commit): the kernel uses its own memory (slab
+    /// heaps, page table heap, pool management) without allocating it, so everything outside the
+    /// user pools is committed before the slab heaps are set up in it. Pool pages are committed
+    /// as the memory manager hands them out.
+    void CommitKernelMemory() {
+        auto& buffer = system.DeviceMemory().buffer;
+        if (!buffer.CommitsOnUse()) {
+            return;
+        }
+        std::vector<std::pair<size_t, size_t>> pools;
+        for (const auto& region : memory_layout->GetPhysicalMemoryRegionTree()) {
+            if (region.IsDerivedFrom(KMemoryRegionType_DramUserPool)) {
+                pools.emplace_back(region.GetAddress() - Core::DramMemoryMap::Base,
+                                   region.GetSize());
+            }
+        }
+        buffer.CommitAllBut(pools);
     }
 
     void InitializeMemoryLayout() {

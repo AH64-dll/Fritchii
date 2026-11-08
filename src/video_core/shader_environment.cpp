@@ -1136,7 +1136,7 @@ u32 ComputeEnvironment::ReadViewportTransformState() {
     return viewport_transform_state;
 }
 
-void FileEnvironment::Deserialize(std::ifstream& file) {
+void FileEnvironment::Deserialize(std::istream& file) {
     u64 code_size{};
     u64 num_texture_types{};
     u64 num_texture_pixel_formats{};
@@ -1216,7 +1216,7 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
     is_proprietary_driver = texture_bound == 2 || Shader::Ampere::HasNativeAddressMap(code);
 }
 
-bool FileEnvironment::RecordFits(std::ifstream& file, u64 bytes_left) {
+bool FileEnvironment::RecordFits(std::istream& file, u64 bytes_left) {
     // Code size and the five table counts, then seven u32 fields (see Deserialize).
     std::array<u64, 6> counts{};
     constexpr u64 HeaderSize = sizeof(counts) + 7 * sizeof(u32);

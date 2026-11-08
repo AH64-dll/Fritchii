@@ -145,6 +145,9 @@ void KMemoryManager::Initialize(KVirtualAddress management_region, size_t manage
 
                 // Open/reserve the ini memory.
                 manager.OpenFirst(ini_start, ini_size / PageSize);
+                // EDEN_NX2_SEC_RESERVE: in use without an allocation.
+                m_system.DeviceMemory().buffer.Commit(
+                    GetInteger(ini_start) - Core::DramMemoryMap::Base, ini_size);
                 reserved_sizes[it.GetAttributes()] += ini_size;
 
                 // Free memory after the ini to the heap.
