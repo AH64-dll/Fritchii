@@ -2792,6 +2792,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();
+    if (libraries_only) {
+        // A warm-up guess the translation rejects: no dump and no error per entry (the warm-up
+        // counts them and logs the total when it ends).
+        LOG_DEBUG(Render_Vulkan, "Warm graphics pipeline {}: {}", PipelineShaders(key),
+                  exception.what());
+        return nullptr;
+    }
     size_t env_index{0};
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
         if (key.unique_hashes[index] == 0) {
@@ -2962,7 +2969,9 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     PipelineStatistics* statistics, bool build_in_parallel, bool warm) try {
     auto hash = key.Hash();
     if (device.HasBrokenCompute()) {
-        LOG_ERROR(Render_Vulkan, "Skipping {:#016x}", hash);
+        if (!warm) {
+            LOG_ERROR(Render_Vulkan, "Skipping {:#016x}", hash);
+        }
         return {.failure = "Device reports broken compute support"};
     }
 
@@ -3033,8 +3042,15 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                 env.IsNativeProgram() ? env.MappedStoragePointerKeys() : std::vector<u64>{}};
 
 } catch (const Shader::Exception& exception) {
-    LOG_ERROR(Render_Vulkan, "Compute pipeline compilation failed shader={:#016x} pipeline={:#016x}: {}",
-              key.unique_hash, key.Hash(), exception.what());
+    if (warm) {
+        // A warm-up guess the translation rejects: counted by the warm-up, logged at its end.
+        LOG_DEBUG(Render_Vulkan, "Warm compute pipeline shader={:#016x} pipeline={:#016x}: {}",
+                  key.unique_hash, key.Hash(), exception.what());
+    } else {
+        LOG_ERROR(Render_Vulkan,
+                  "Compute pipeline compilation failed shader={:#016x} pipeline={:#016x}: {}",
+                  key.unique_hash, key.Hash(), exception.what());
+    }
     return {.failure = exception.what()};
 }
 
