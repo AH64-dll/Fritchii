@@ -691,8 +691,13 @@ public:
         last_memory_write_position = write_position;
         // Engines all of whose methods write (compute, DMA, inline-to-memory, 2D) mark method 0.
         last_memory_write_method = engine->memory_write_mask[0] ? OtherEngineWrite : method;
-        previous_method_write_position = last_method_write_position;
-        last_method_write_position = write_position;
+        // QueuedGuestWriters: per-method writers only (3D); the engines all of whose methods
+        // write note their ranges or count as unbounded or unranged writers. 3D wait_for_idle
+        // (0x44) and sync_info (0xb2) write no guest memory themselves.
+        if (!engine->memory_write_mask[0] && method != 0x44 && method != 0xb2) {
+            previous_method_write_position = last_method_write_position;
+            last_method_write_position = write_position;
+        }
     }
     /// The method just sent writes only [begin, end): a macro memory read waits for it only where
     /// they overlap. Without this call its write counts for every read. EDEN_NX2_RANGED_WAITS=0
@@ -941,7 +946,8 @@ private:
     u64 previous_memory_write_position{};
     u32 previous_memory_write_method{DeferredWrite};
     /// The 3D memory-writing methods alone (NoteMethodWrite, RangeLastWrite), without the
-    /// deferred work last_memory_write_position also counts (QueuedGuestWriters).
+    /// deferred work, the all-writing engines and the barriers last_memory_write_position also
+    /// counts (QueuedGuestWriters).
     u64 last_method_write_position{};
     u64 previous_method_write_position{};
     u64 session{};
