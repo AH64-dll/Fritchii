@@ -184,6 +184,15 @@ inline std::atomic<int> g_idle_pause{-1};
 /// Default 6: 2 and 4 are exact (2 only allows interleavings the mutex already allowed, 4 drops
 /// a list nothing in native mode reads); 1 is off, since the caches' GC then sees usage up to
 /// 50 ms old. EDEN_NX2_EXP29=0 is the behaviour before.
+/// EXP30 = 1 (zortos293/Lichii#559, no env var of its own): a macro DMA read of report memory
+/// with pending query results (#215's white flash fix, RasterizerVulkan::FlushQueryResults) waits
+/// only until the counter reports in its range are written (Tegra::Nx2WaitAsyncReportsSettled,
+/// slots from 12 bytes before the read), not for an operation queued behind every fence, which
+/// also waited for all GPU work sent after those reports (8-15% of the back while walking in
+/// Ocarina, ~11 waits/s of ~3.7 ms, and the front's FrontDmaRead drain with it). Vulkan only
+/// (OpenGL keeps its FlushRegion). 0 = the operation wait as before. Off by default, not measured
+/// yet: compare the back's "query DMA wait" profile zone (ms and waits per second) and the white
+/// flash watch.
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 

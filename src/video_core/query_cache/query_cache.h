@@ -341,16 +341,19 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     u8* pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
     bool is_synced = (Settings::IsGPUFenceBehaviorDefault() ? !VideoCore::Nx2Debug::AccuratePart(1) : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) && is_fence;
+    // Counted for Nx2AsyncReportsSettled (SEM_FAST) and FlushQueryResults' own-report wait
+    // (EXP30, zortos293/Lichii#559): completed on every way out of the operation, written or
+    // discarded, and when the operation is dropped without running.
+    auto report = std::make_shared<Tegra::Nx2AsyncReport>(cpu_addr);
     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
                                      pointer, pointer_timestamp, cpu_addr, addr,
-                                     asid = gpu_memory->GetID(), counter_type] {
+                                     asid = gpu_memory->GetID(), counter_type, report] {
         struct Settle {
-            DAddr address;
+            Tegra::Nx2AsyncReport& async_report;
             ~Settle() {
-                Tegra::g_nx2_async_reports_completed[Tegra::Nx2AsyncReportSlot(address)].fetch_add(
-                    1, std::memory_order_release);
+                async_report.Complete();
             }
-        } const settle{cpu_addr};
+        } const settle{*report};
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
                 LOG_INFO(HW_GPU,
@@ -406,8 +409,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         }
     });
     if (is_fence) {
-        Tegra::g_nx2_async_reports_issued[Tegra::Nx2AsyncReportSlot(cpu_addr)].fetch_add(
-            1, std::memory_order_release);
+        report->Issue();
         impl->rasterizer.SignalFence(std::move(operation));
     } else {
         if (!VideoCore::Nx2Debug::AccuratePart(1) && counter_type == QueryType::Payload) {
@@ -433,8 +435,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             streamer->Free(new_query_id);
             return;
         }
-        Tegra::g_nx2_async_reports_issued[Tegra::Nx2AsyncReportSlot(cpu_addr)].fetch_add(
-            1, std::memory_order_release);
+        report->Issue();
         impl->rasterizer.SyncOperation(std::move(operation));
     }
     if (is_synced) {

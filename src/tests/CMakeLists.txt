@@ -70,6 +70,7 @@ add_executable(tests
     video_core/spirv_fragment_shuffle.cpp
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
+    video_core/async_report_wait.cpp
     video_core/command_snapshot_suspensions.cpp
     video_core/pending_maps.cpp
     video_core/maxwell_fast_method.cpp
