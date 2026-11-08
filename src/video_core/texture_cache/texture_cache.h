@@ -872,12 +872,13 @@ void TextureCache<P>::SweepColdImages() {
 
 template <class P>
 void TextureCache<P>::TickRenderClock() {
-    static const bool clock_env = [] {
-        const char* value = std::getenv("EDEN_NX2_RENDER_CLOCK");
-        return value != nullptr && value[0] == '1';
-    }();
     // EXP43=4 relocates under this clock (with tombstones).
-    const bool enabled = clock_env || VideoCore::Nx2Debug::Experiment(43) == 4;
+    const bool enabled =
+        Tegra::Nx2RenderClockEnv() != 0 || VideoCore::Nx2Debug::Experiment(43) == 4;
+    if (enabled && !render_clock_enabled) {
+        Tegra::g_nx2_frame_fence.Resume(); // nothing was noted while it was off
+    }
+    render_clock_enabled = enabled;
     Tegra::g_nx2_render_clock_wanted.store(enabled, std::memory_order_relaxed);
     const u64 counter = Tegra::g_nx2_render_frame.load(std::memory_order_relaxed);
     render_clock_idle = counter != render_clock_last_counter ? 0 : render_clock_idle + 1;
@@ -899,7 +900,9 @@ void TextureCache<P>::TickRenderClock() {
                      frame_tick,
                      Tegra::Nx2RenderClockSyncpt() >= 0
                          ? fmt::format("syncpoint {}", Tegra::Nx2RenderClockSyncpt())
-                         : std::string{"the present poll's learned word"});
+                     : Tegra::Nx2RenderClockWordSource()
+                         ? std::string{"the present poll's learned word"}
+                         : std::string{"the flip's frame fence"});
         }
     }
     render_clock_live_frames += render_clock_live ? 1 : 0;
@@ -940,16 +943,37 @@ void TextureCache<P>::TickRenderClock() {
             syncpt_text += fmt::format(" {}:{:.2f}", signals[i].second, signals[i].first / 600.0);
         }
     }
+    // The flip-fence source's confirmations (video_core/nx2_frame_fence.h): equal and ahead are
+    // exact boundaries, late ones came at the flip (as frame_tick), early must stay 0.
+    std::string fence_text;
+    if (enabled && Tegra::Nx2RenderClockFlipSource()) {
+        const auto fence = Tegra::g_nx2_frame_fence.TakeWindow();
+        const auto per_frame = [](u32 count) { return count / 600.0; };
+        fence_text = fmt::format(
+            "; frame fence {} {}: {} flips ({:.2f} per host frame), {} equal, {} ahead, {} late "
+            "({} merged), {} early{}; bumps {} armed, {} flip, {} late; arms refused {} old, {} "
+            "not largest, {} reached, {} dropped, {} held, {} relearns",
+            fence.syncpoint == ~0U ? std::string{"none"}
+                                   : fmt::format("syncpoint {}", fence.syncpoint),
+            fence.slot_key == ~0ULL ? std::string{"(no slot armed it)"}
+                                    : fmt::format("(session {} slot {:#x})", fence.slot_key >> 32,
+                                                  static_cast<u32>(fence.slot_key)),
+            fence.flips, per_frame(fence.flips), fence.equal, fence.ahead, fence.late,
+            fence.merged, fence.early, fence.fault ? ", armed source off" : "",
+            fence.bumps_armed, fence.bumps_flip, fence.bumps_late, fence.refused_old,
+            fence.refused_not_largest, fence.refused_reached, fence.dropped, fence.held,
+            fence.relearns);
+    }
     const u64 counted = counter - render_clock_window_counter;
     render_clock_window_counter = counter;
     LOG_INFO(HW_GPU,
              "Render frame clock (EDEN_NX2_RENDER_CLOCK={}) last 600 frames: {} render frames "
              "({:.2f} per host frame), live {} of 600 frames, {} switches; {} relocation "
-             "candidates refused as written this frame{}{}; syncpoint signals per host frame:{}",
+             "candidates refused as written this frame{}{}; syncpoint signals per host frame:{}{}",
              enabled ? 1 : 0, counted, counted / 600.0, render_clock_live_frames,
              render_clock_switches, relocation_same_frame, top != 0 ? " (" : "",
              top != 0 ? refused_text + ")" : std::string{},
-             syncpt_text.empty() ? std::string{" none"} : syncpt_text);
+             syncpt_text.empty() ? std::string{" none"} : syncpt_text, fence_text);
     render_clock_live_frames = 0;
     render_clock_switches = 0;
     relocation_same_frame = 0;

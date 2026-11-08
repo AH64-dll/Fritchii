@@ -623,6 +623,7 @@ private:
     /// without a count; logs the rate next to the relocation line.
     void TickRenderClock();
     bool render_clock_live{};
+    bool render_clock_enabled{}; ///< Last tick: the clock wanted (Resume on the way back on)
     bool render_clock_logged{};
     u64 render_clock_base{};
     u64 render_clock_source_base{};
