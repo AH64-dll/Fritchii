@@ -32,6 +32,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "common/host_memory.h"
 #include "common/memory_detect.h"
 #include "common/shutdown_progress.h"
 #include "common/thread.h"
@@ -1134,8 +1135,28 @@ private:
     bool live{true};
 };
 
-/// One line every 10 s: this process's working set and commit, the system's commit, and what
-/// the disk cache prebuild still holds. One GetProcessMemoryInfo and one GlobalMemoryStatusEx.
+/// The guest memory section's commit (EDEN_NX2_SEC_RESERVE, Common::HostMemory::Commit).
+std::string GuestMemoryText() {
+    const auto stats = Common::HostMemory::GetCommitStats();
+    if (!stats.reserved) {
+        return "guest memory committed whole";
+    }
+    std::string text = fmt::format("guest memory {} of {} MiB committed (reserved), {} fault "
+                                   "commits",
+                                   stats.committed_bytes >> 20, stats.section_bytes >> 20,
+                                   stats.net_commits);
+    if (stats.net_commits != 0) {
+        // Each is a page some path touched before the kernel handed it out: a missed commit.
+        const bool in_virtual = (stats.first_net_offset >> 63) != 0;
+        text += fmt::format(" (first at {} offset {:#x})", in_virtual ? "virtual" : "backing",
+                            stats.first_net_offset & ~(u64{1} << 63));
+    }
+    return text;
+}
+
+/// One line every 10 s: this process's working set and commit, the system's commit, what the
+/// disk cache prebuild still holds and the guest memory's commit. One GetProcessMemoryInfo and
+/// one GlobalMemoryStatusEx.
 void LogMemoryUse() {
     constexpr double MiB = 1024.0 * 1024.0;
     constexpr double GiB = MiB * 1024.0;
@@ -1143,7 +1164,7 @@ void LogMemoryUse() {
     LOG_INFO(Render_Vulkan,
              "Memory: working set {:.0f} MiB (peak {:.0f}), private commit {:.0f} MiB (peak "
              "{:.0f}), system commit {:.1f} of {:.1f} GiB, {:.1f} GiB RAM free; prebuild {} "
-             "builds queued, {} done, {:.0f} MiB of records held",
+             "builds queued, {} done, {:.0f} MiB of records held; {}",
              static_cast<double>(usage.working_set) / MiB,
              static_cast<double>(usage.peak_working_set) / MiB,
              static_cast<double>(usage.private_bytes) / MiB,
@@ -1153,7 +1174,8 @@ void LogMemoryUse() {
              static_cast<double>(usage.available_physical) / GiB,
              g_prebuild_pending.load(std::memory_order_relaxed),
              g_prebuild_done.load(std::memory_order_relaxed),
-             static_cast<double>(g_prebuild_held_bytes.load(std::memory_order_relaxed)) / MiB);
+             static_cast<double>(g_prebuild_held_bytes.load(std::memory_order_relaxed)) / MiB,
+             GuestMemoryText());
 }
 
 double SecondsSinceDiskLoad() {
