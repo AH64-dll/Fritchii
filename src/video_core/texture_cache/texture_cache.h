@@ -11,11 +11,13 @@
 #include <chrono>
 #include <numeric>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <vector>
 #include <optional>
 #include <bit>
+#include <type_traits>
 #include "common/container/unordered_map.h"
 #include <boost/container/small_vector.hpp>
 
@@ -623,6 +625,8 @@ void TextureCache<P>::TickFrame() {
             channel_storage[c].graphics_image_table.Invalidate();
             channel_storage[c].compute_image_table.Invalidate();
         }
+        // Texture memos of their null views would skip that read (EXP32, zortos293/Lichii#717).
+        ++texture_memo_epoch;
     }
     sentenced_images.Tick();
     sentenced_image_index = (sentenced_image_index + 1) % TICKS_TO_DESTROY;
@@ -831,6 +835,120 @@ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
         return id;
     }
     return table.bound_ids[index];
+}
+
+template <class P>
+typename TextureCache<P>::TextureMemoState TextureCache<P>::GraphicsTextureMemoState()
+    const noexcept {
+    const auto& image_table = channel_state->graphics_image_table;
+    const auto& sampler_table = channel_state->graphics_sampler_table;
+    return TextureMemoState{
+        .channel = channel_state,
+        .memory = gpu_memory,
+        .tic_pool = image_table.current_gpu_addr,
+        .tsc_pool = sampler_table.current_gpu_addr,
+        .tic_limit = image_table.current_limit,
+        .tsc_limit = sampler_table.current_limit,
+        .map_serial = gpu_memory->MapSerial(),
+        .epoch = texture_memo_epoch,
+    };
+}
+
+template <class P>
+bool TextureCache<P>::TakeTextureMemoEntry(u32 tic_handle, u32 tsc_handle, ImageViewId view,
+                                           SamplerId sampler, TextureMemoEntry& entry) const {
+    // The entry must be in the table as this draw read it, and still give the resolved id
+    // (as zortos293/Lichii#717's RecordBinding checks).
+    const auto read_entry = [](const auto& table, u32 index, auto id) {
+        return !table.invalidated && index / 64 < table.read_descriptors.size() &&
+               index < table.descriptors.size() &&
+               (table.read_descriptors[index / 64] & (1ULL << (index % 64))) != 0 &&
+               table.bound_ids[index] == id;
+    };
+    const auto& image_table = channel_state->graphics_image_table;
+    const auto& sampler_table = channel_state->graphics_sampler_table;
+    const u32 header_index = Tegra::Texture::TextureHeaderIndex(
+        tic_handle, image_table.current_limit, gpu_memory->UsesNativeTiling());
+    if (header_index <= image_table.current_limit) {
+        if (!read_entry(image_table, header_index, view)) {
+            return false;
+        }
+        entry.tic_index = header_index;
+        entry.tic = image_table.descriptors[header_index];
+    } else if (view != NULL_IMAGE_VIEW_ID) {
+        return false;
+    } else {
+        entry.tic_index = ~0U;
+        entry.tic = TICEntry{};
+    }
+    if (tsc_handle <= sampler_table.current_limit) {
+        if (!read_entry(sampler_table, tsc_handle, sampler)) {
+            return false;
+        }
+        entry.tsc_index = tsc_handle;
+        entry.tsc = sampler_table.descriptors[tsc_handle];
+    } else if (sampler != NULL_SAMPLER_ID) {
+        return false;
+    } else {
+        entry.tsc_index = ~0U;
+        entry.tsc = TSCEntry{};
+    }
+    return true;
+}
+
+template <class P>
+bool TextureCache<P>::TextureMemoEntryCurrent(const TextureMemoState& state,
+                                              const TextureMemoEntry& entry) const {
+    const auto same = [this](GPUVAddr gpu_addr, const auto& expected) {
+        using T = std::remove_cvref_t<decltype(expected)>;
+        T guest{};
+        const bool one_page =
+            (gpu_addr & Core::Memory::YUZU_PAGEMASK) + sizeof(T) <= Core::Memory::YUZU_PAGESIZE;
+        if (const u8* const host = one_page ? gpu_memory->GetPointerForDescriptor(gpu_addr)
+                                            : nullptr) {
+            std::memcpy(&guest, host, sizeof(T));
+        } else {
+            gpu_memory->ReadBlockUnsafe(gpu_addr, &guest, sizeof(T));
+        }
+        return std::memcmp(&guest, &expected, sizeof(T)) == 0;
+    };
+    if (entry.tic_index != ~0U &&
+        !same(state.tic_pool + u64{entry.tic_index} * sizeof(TICEntry), entry.tic)) {
+        return false;
+    }
+    if (entry.tsc_index != ~0U &&
+        !same(state.tsc_pool + u64{entry.tsc_index} * sizeof(TSCEntry), entry.tsc)) {
+        return false;
+    }
+    return true;
+}
+
+template <class P>
+bool TextureCache<P>::TextureMemoViewClean(ImageViewId view) const noexcept {
+    if (!view || view == NULL_IMAGE_VIEW_ID) {
+        // VisitImageView prepares nothing for the null view.
+        return true;
+    }
+    const ImageViewBase& image_view = slot_image_views[view];
+    if (image_view.IsBuffer()) {
+        return true;
+    }
+    // What PrepareImage(id, false, false) acts on besides the LRU: RefreshContents and
+    // SynchronizeAliases.
+    const ImageBase& image = slot_images[image_view.image_id];
+    return False(image.flags & ImageFlagBits::CpuModified) && image.aliased_images.empty();
+}
+
+template <class P>
+void TextureCache<P>::TouchTextureMemoView(ImageViewId view) noexcept {
+    if (!view || view == NULL_IMAGE_VIEW_ID) {
+        return;
+    }
+    const ImageViewBase& image_view = slot_image_views[view];
+    if (image_view.IsBuffer()) {
+        return;
+    }
+    lru_cache.Touch(slot_images[image_view.image_id].lru_index, frame_tick);
 }
 
 template <class P>
@@ -4093,6 +4211,8 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
 template <class P>
 void TextureCache<P>::RemoveImageViewReferences(std::span<const ImageViewId> removed_views) {
     ++bindings_epoch;
+    // Their descriptors resolve to other views now: every texture memo goes (EXP32).
+    ++texture_memo_epoch;
     for (const ImageViewId removed : removed_views) {
         const auto refs = image_view_descriptors.find(removed);
         if (refs == image_view_descriptors.end()) {
@@ -4430,6 +4550,8 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
 template <class P>
 void TextureCache<P>::CreateChannel(struct Tegra::Control::ChannelState& channel) {
     VideoCommon::ChannelSetupCaches<TextureCacheChannelInfo>::CreateChannel(channel);
+    ++texture_memo_epoch;
+    ++bindings_epoch;
     const auto it = channel_map.find(channel.bind_id);
     auto* this_state = &channel_storage[it->second];
     const auto& this_as_ref = address_spaces[channel.memory_manager->GetID()];
