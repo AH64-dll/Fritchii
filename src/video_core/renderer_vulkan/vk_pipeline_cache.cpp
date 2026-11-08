@@ -793,6 +793,16 @@ void MaskKeyedAttributeTypes(GraphicsPipelineCacheKey& key, std::span<const File
         key.state.attribute_types, key.unique_hashes, attribute_masks);
 }
 
+// EDEN_NX2_REKEY_FOREIGN_PIPELINES=0: cached graphics pipelines another GPU driver (or driver
+// version) stored are skipped at boot instead of loaded under this driver (see load_graphics).
+bool RekeyForeignPipelines() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_REKEY_FOREIGN_PIPELINES");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 /// Reads one record as VideoCommon::LoadPipelines does and returns the key it is loaded under
 /// (graphics keys masked as load_graphics masks them, compared over GraphicsPipelineCacheKey::Size
 /// bytes), for merging another build's cache. Counts and sizes are checked against the bytes
@@ -837,6 +847,10 @@ std::optional<std::string> ReadPipelineRecordKey(std::ifstream& file, std::strea
     if (key.state.dynamic_vertex_input != 0) {
         MaskKeyedAttributeTypes(key, envs);
     }
+    // Loading puts every record under this driver (see load_graphics): a pipeline cached by
+    // another driver is the same pipeline.
+    key.state.driver_id = 0;
+    key.state.driver_version = 0;
     bytes.append(reinterpret_cast<const char*>(&key), (std::min)(key.Size(), sizeof(key)));
     return bytes;
 }
@@ -1687,6 +1701,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     size_t queued_graphics = 0;
     using GraphicsRecords = std::vector<std::vector<FileEnvironment>>;
     std::vector<std::pair<GraphicsPipelineCacheKey, GraphicsRecords>> deferred_graphics;
+    // Keys of graphics pipelines only another driver stored (see load_graphics).
+    std::unordered_set<u64> rekeyed_pipelines;
+    std::unordered_set<u64> native_pipelines;
+    size_t foreign_records = 0;
 
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename =
@@ -1775,6 +1793,28 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             return;
         }
 
+        // The key holds the driver that stored it, so a driver update (or a cache shared by
+        // someone on another driver) left every record a key no draw makes: built at boot or in
+        // the background all the same, never used, while the game translated each pipeline
+        // again. Nothing builds from those two fields, so the record is the same pipeline under
+        // this driver; its used-list age moves to that key.
+        const bool foreign = key.state.driver_id != dynamic_features.driver_id ||
+                             key.state.driver_version != dynamic_features.driver_version;
+        if (foreign) {
+            ++foreign_records;
+            if (!RekeyForeignPipelines()) {
+                return;
+            }
+            const u64 stored_hash = key.Hash();
+            key.state.driver_id = dynamic_features.driver_id;
+            key.state.driver_version = dynamic_features.driver_version;
+            if (const auto used = used_pipelines.find(stored_hash); used != used_pipelines.end()) {
+                const u8 age = used->second;
+                const auto [entry, inserted] = used_pipelines.try_emplace(key.Hash(), age);
+                entry->second = (std::min)(entry->second, age);
+            }
+        }
+
         // Keys stored before they kept only the attribute types the programs read (and imported
         // cache version 53 ones) are looked up masked. The pipeline is the same: a type is only
         // dropped for an attribute no program reads. Records that now share a key are tried
@@ -1800,6 +1840,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             return;
         }
 
+        (foreign ? rekeyed_pipelines : native_pipelines).insert(key.Hash());
         const auto [it, inserted] = graphics_record_index.try_emplace(key, graphics_records.size());
         if (inserted) {
             graphics_records.emplace_back(key, GraphicsRecords{});
@@ -1855,6 +1896,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     compute_envs.clear();
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+    if (foreign_records != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "{} cached graphics pipeline records were stored by another GPU driver{}",
+                 foreign_records,
+                 RekeyForeignPipelines() ? ", loaded under this one" : " and are skipped");
+    }
     if (PreloadAllPipelines() && queued_graphics > 10000) {
         LOG_WARNING(Render_Vulkan,
                     "EDEN_NX2_PRELOAD_ALL_PIPELINES: building and keeping all {} cached graphics "
@@ -1876,6 +1923,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     const size_t background_count =
         (std::min)(deferred_graphics.size(), BackgroundPipelineLimit(queued_graphics));
+    // Built newest first (from the end): this driver's own records before those only another
+    // driver stored, which a merged pack appends after them.
+    std::ranges::stable_partition(deferred_graphics, [&](const auto& deferred) {
+        const u64 hash = deferred.first.Hash();
+        return rekeyed_pipelines.contains(hash) && !native_pipelines.contains(hash);
+    });
     if (background_count != 0 && !stop_loading.stop_requested()) {
         const size_t threads = BackgroundPipelineThreads();
         LOG_INFO(Render_Vulkan,
