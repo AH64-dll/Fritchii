@@ -116,8 +116,11 @@ protected:
     const ShaderInfo* ComputeShader();
 
     /// @brief Collect the current graphics environments
-    void GetGraphicsEnvironments(GraphicsEnvironments& result,
-                                 const std::array<u64, NUM_PROGRAMS>& unique_hashes);
+    /// @param snapshot Take each environment's snapshot (GraphicsEnvironment::TakeSnapshot)
+    /// @return Bytes the snapshots copied
+    size_t GetGraphicsEnvironments(GraphicsEnvironments& result,
+                                   const std::array<u64, NUM_PROGRAMS>& unique_hashes,
+                                   bool snapshot = false);
 
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
     /// vertex_attribute_mask of shader_infos, copied so the lookup of every draw doesn't read a

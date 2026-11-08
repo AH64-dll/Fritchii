@@ -444,6 +444,7 @@ ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
 }
 
 std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
+std::atomic<std::chrono::nanoseconds::rep> hold_time_total_ns{};
 } // Anonymous namespace
 
 void NoteDrawReuseProbeFrame() {
@@ -456,6 +457,10 @@ void NoteDrawReuseProbeFrame() {
 
 std::chrono::nanoseconds GraphicsPipeline::TakeHoldTime() noexcept {
     return std::chrono::nanoseconds{hold_time_ns.exchange(0, std::memory_order::relaxed)};
+}
+
+std::chrono::nanoseconds GraphicsPipeline::HoldTimeTotal() noexcept {
+    return std::chrono::nanoseconds{hold_time_total_ns.load(std::memory_order::relaxed)};
 }
 
 // TODO(crueter): This is the worst-formatted code I have EVER seen
@@ -1438,9 +1443,10 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             const auto begin = std::chrono::steady_clock::now();
             build->Wait(!worker_only_build);
             const auto held = std::chrono::steady_clock::now() - begin;
-            hold_time_ns.fetch_add(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(held).count(),
-                std::memory_order::relaxed);
+            const auto held_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(held).count();
+            hold_time_ns.fetch_add(held_ns, std::memory_order::relaxed);
+            hold_time_total_ns.fetch_add(held_ns, std::memory_order::relaxed);
             if (library_cache) {
                 library_cache->RecordHeldDraw(held);
             }

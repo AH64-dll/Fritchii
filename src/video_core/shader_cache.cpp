@@ -364,9 +364,11 @@ void ShaderCache::RememberRejection(VAddr addr) {
                            std::memory_order_relaxed);
 }
 
-void ShaderCache::GetGraphicsEnvironments(GraphicsEnvironments& result,
-                                          const std::array<u64, NUM_PROGRAMS>& unique_hashes) {
+size_t ShaderCache::GetGraphicsEnvironments(GraphicsEnvironments& result,
+                                            const std::array<u64, NUM_PROGRAMS>& unique_hashes,
+                                            bool snapshot) {
     size_t env_index{};
+    size_t snapshot_bytes{};
     const GPUVAddr base_addr{maxwell3d->regs.program_region.Address()};
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
     for (size_t index = 0; index < NUM_PROGRAMS; ++index) {
@@ -383,8 +385,12 @@ void ShaderCache::GetGraphicsEnvironments(GraphicsEnvironments& result,
         env = GraphicsEnvironment{*maxwell3d, *gpu_memory, program, address, start_address,
                                   shader_infos[index]->lowered_native};
         env.SetCachedSize(shader_infos[index]->size_bytes);
+        if (snapshot) {
+            snapshot_bytes += env.TakeSnapshot();
+        }
         result.env_ptrs[env_index++] = &env;
     }
+    return snapshot_bytes;
 }
 
 ShaderInfo* ShaderCache::TryGet(VAddr addr) const {

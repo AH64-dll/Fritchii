@@ -95,6 +95,9 @@ class Device;
 class PipelineStatistics;
 class RenderPassCache;
 class Scheduler;
+class TranslateQueue;
+struct TranslationJob;
+struct TranslationRecord;
 
 using VideoCommon::ShaderInfo;
 
@@ -200,14 +203,41 @@ private:
 
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
 
+    /// Whether the current draw may be skipped while its pipeline is not ready (native draws
+    /// unless EDEN_NX2_ASYNC_DISCARD=0, and the legacy heuristic; full-screen passes never).
+    [[nodiscard]] bool DrawMayBeSkipped() const;
+
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
+
+    /// Stores a graphics pipeline built at run time in the disk cache (unless it is there and
+    /// loads), with the environments it was translated from. GPU thread.
+    void StoreRuntimeGraphicsPipeline(
+        const GraphicsPipelineCacheKey& key,
+        const std::array<VideoCommon::GraphicsEnvironment, Maxwell::MaxShaderProgram>& envs);
+
+    /// EDEN_NX2_ASYNC_TRANSLATE=1/2 (translate_queue set). Queues the current key's translation
+    /// from snapshot environments when the draw may be skipped; false when it is to be built on
+    /// the GPU thread instead.
+    bool EnqueueTranslation();
+    /// A later lookup of a key whose entry is empty: its translated pipeline when ready; `pending`
+    /// when the draw is to be skipped meanwhile. Waits (capped) or builds here for a draw that
+    /// must not be skipped.
+    std::unique_ptr<GraphicsPipeline> AdoptTranslation(bool& pending);
+    /// What a finished job gives: its pipeline once its texture reads check out on the GPU
+    /// thread. `retry` when it was not usable (to be translated again, or built here).
+    std::unique_ptr<GraphicsPipeline> AdoptJob(std::unique_ptr<TranslationJob> job, bool& retry);
+    /// The translation itself, on a translation thread.
+    void TranslateOnWorker(TranslationJob& job);
+    /// Between frames: adopts finished jobs whose draws did not come back, sweeps wedged ones
+    /// and logs the counts every 10 s.
+    void TickTranslations();
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
         bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
         std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr,
-        bool libraries_only = false);
+        bool libraries_only = false, TranslationRecord* record = nullptr);
 
     /// Builds a disk-cached graphics pipeline from the first of its records (newest first) that
     /// loads. When none does, the GPU thread's build of it is stored again.
@@ -374,6 +404,37 @@ private:
     std::chrono::steady_clock::time_point background_last_save{}; ///< Under background_mutex
     /// Last: destroyed (its threads joined) before the state above.
     std::unique_ptr<Common::ThreadWorker> background_workers;
+
+    /// EDEN_NX2_ASYNC_TRANSLATE=1/2: graphics pipelines translated off the GPU thread. Null with
+    /// the switch off. Reset first in the destructor (its threads build with the members above).
+    std::unique_ptr<TranslateQueue> translate_queue;
+    /// Keys whose translations kept failing their checks or were swept: built on the GPU thread.
+    std::unordered_set<GraphicsPipelineCacheKey> translate_sync_only;
+    /// Unusable translations per key (a stale texture descriptor, a guarded read that gave up).
+    std::unordered_map<GraphicsPipelineCacheKey, u32> translate_failures;
+    /// Counts for the 10 s line, GPU thread only.
+    struct TranslateStats {
+        u32 queued{};
+        u32 full{};        ///< Not queued: too many in flight
+        u32 adopted{};
+        u32 adopted_between_frames{};
+        u32 no_pipeline{};
+        u32 stale{};       ///< A texture descriptor changed before adoption
+        u32 gave_up{};     ///< A guarded read gave up
+        u32 differs{};     ///< Verify mode: not what the GPU thread made
+        u32 requeued{};
+        u32 waits{};
+        u32 fallbacks{};   ///< Built on the GPU thread after all
+        u32 swept{};
+        u64 skipped{};     ///< Lookups skipped while translating
+        size_t snapshot_bytes{};
+        std::chrono::steady_clock::duration enqueue_time{};
+        std::chrono::steady_clock::duration wait_time{};
+        std::chrono::steady_clock::duration translation_time{};
+        std::chrono::steady_clock::duration ready_total{};
+        std::chrono::steady_clock::duration ready_max{};
+        std::chrono::steady_clock::time_point window{};
+    } translate_stats;
 };
 
 } // namespace Vulkan

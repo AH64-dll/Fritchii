@@ -14,6 +14,7 @@ if(LIBVA_FOUND)
 endif()
 
 add_library(video_core STATIC
+    async_translate.h
     buffer_cache/buffer_base.h
     buffer_cache/buffer_cache_base.h
     buffer_cache/buffer_cache.cpp
@@ -224,6 +225,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_master_semaphore.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
+    renderer_vulkan/vk_pipeline_translate_queue.cpp
+    renderer_vulkan/vk_pipeline_translate_queue.h
     renderer_vulkan/vk_present_manager.cpp
     renderer_vulkan/vk_present_manager.h
     renderer_vulkan/vk_host_pacer.cpp

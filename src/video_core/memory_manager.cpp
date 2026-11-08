@@ -6,9 +6,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <thread>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -17,6 +19,7 @@
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "memory_manager.h"
+#include "video_core/async_translate.h"
 #include "video_core/guest_memory.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
@@ -231,13 +234,24 @@ void MemoryManager::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) 
     rasterizer = rasterizer_;
 }
 
+namespace {
+// The page table lock is only taken while translation workers read guest memory
+// (EDEN_NX2_ASYNC_TRANSLATE=1 or 2); otherwise the writers below run exactly as before.
+std::unique_lock<std::shared_mutex> LockPageTableForWrite(std::shared_mutex& lock) {
+    static const bool enabled = VideoCommon::AsyncTranslateWorkers();
+    return enabled ? std::unique_lock{lock} : std::unique_lock<std::shared_mutex>{};
+}
+} // Anonymous namespace
+
 GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size, PTEKind kind, bool is_big_pages) {
+    const auto lock = LockPageTableForWrite(page_table_lock);
     if (is_big_pages)
         return BigPageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
     return PageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
 }
 
 GPUVAddr MemoryManager::MapSparse(GPUVAddr gpu_addr, std::size_t size, bool is_big_pages) {
+    const auto lock = LockPageTableForWrite(page_table_lock);
     if (is_big_pages)
         return BigPageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Reserved);
     return PageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Reserved);
@@ -254,8 +268,44 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
     }
     page_stash.clear();
 
+    // Only around the table updates: the caches' unmap callbacks above stay outside the lock.
+    const auto lock = LockPageTableForWrite(page_table_lock);
     BigPageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Free);
     PageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Free);
+}
+
+bool MemoryManager::TryLockPageTableShared() const {
+    if (page_table_lock.try_lock_shared()) {
+        return true;
+    }
+    const auto give_up = std::chrono::steady_clock::now() + std::chrono::milliseconds{2};
+    do {
+        std::this_thread::yield();
+        if (page_table_lock.try_lock_shared()) {
+            return true;
+        }
+    } while (std::chrono::steady_clock::now() < give_up);
+    return false;
+}
+
+bool MemoryManager::ReadBlockGuarded(GPUVAddr gpu_src_addr, void* dest_buffer,
+                                     std::size_t size) const {
+    if (!TryLockPageTableShared()) {
+        return false;
+    }
+    ReadBlockUnsafe(gpu_src_addr, dest_buffer, size);
+    page_table_lock.unlock_shared();
+    return true;
+}
+
+std::optional<bool> MemoryManager::IsFullyMappedRangeGuarded(GPUVAddr gpu_addr,
+                                                             std::size_t size) const {
+    if (!TryLockPageTableShared()) {
+        return std::nullopt;
+    }
+    const bool mapped = IsFullyMappedRange(gpu_addr, size);
+    page_table_lock.unlock_shared();
+    return mapped;
 }
 
 std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
