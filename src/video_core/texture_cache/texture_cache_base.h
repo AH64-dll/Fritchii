@@ -40,6 +40,7 @@
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/game_dlss_status.h"
+#include "video_core/nx2.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/descriptor_table.h"
 #include "video_core/texture_cache/image_base.h"
@@ -593,6 +594,7 @@ private:
         u8 guard{};
         bool candidate_logged{};
         bool relocated_logged{};
+        u32 same_frame_refused{}; ///< Since the last report (render-frame clock line)
     };
     ::Common::unordered_map<u64, RelocationShape> relocation_shapes;
     /// Since the last report (TickFrame, every 600 frames once a candidate was seen).
@@ -601,7 +603,89 @@ private:
     u64 relocation_relocated{};
     u64 relocation_retired{};
     u64 relocation_crowded{}; ///< Cleared targets over two or more images of their shape
+    u64 relocation_same_frame{}; ///< Candidates whose only predecessors were written this frame
     bool relocation_seen{};
+
+    /// The frame last_write_frame, CheckCrossFrameUse and RelocationCandidate's same-frame rule
+    /// count in. frame_tick advances at the composite, a sync request the back serves wherever it
+    /// is, so one host tick holds the end of one guest frame and the start of the next
+    /// (fable_answer_16 1a). With EDEN_NX2_RENDER_CLOCK=1 it follows Tegra::g_nx2_render_frame
+    /// instead (bumped where the frame's last GPU work is), falling back to frame_tick while that
+    /// does not advance (no word learned yet, other titles). Monotonic across the switches; the
+    /// LRU, the collector and the logs keep frame_tick.
+    [[nodiscard]] u64 RenderFrame() const noexcept {
+        const u64 source = render_clock_live
+                               ? Tegra::g_nx2_render_frame.load(std::memory_order_relaxed)
+                               : frame_tick;
+        return render_clock_base + (source - render_clock_source_base);
+    }
+    /// TickFrame: follows the counter, or falls back to frame_tick after two host frames
+    /// without a count; logs the rate next to the relocation line.
+    void TickRenderClock();
+    bool render_clock_live{};
+    bool render_clock_logged{};
+    u64 render_clock_base{};
+    u64 render_clock_source_base{};
+    u64 render_clock_last_counter{};
+    u64 render_clock_window_counter{}; ///< The counter at the last report
+    u32 render_clock_idle{};           ///< Host frames since the counter last advanced
+    u32 render_clock_live_frames{};    ///< Since the last report
+    u32 render_clock_switches{};
+
+    /// EXP43=4 (fable_answer_16 1c): relocation as 3, under the render-frame clock, and each
+    /// relocated image's old range kept for 2 render frames. A read that lands on it (an image
+    /// made at the old address and then sampled or rendered to without a clear, or a CPU read of
+    /// the old range while the image there was GPU-written) is what relocation would have gotten
+    /// wrong: counted and its first few logged. Must stay 0.
+    struct RelocationTombstone {
+        GPUVAddr gpu_addr;
+        DAddr cpu_addr;
+        u64 size;
+        u64 shape_key;
+        u64 render_frame;
+        GPUVAddr moved_to;
+        bool gpu_modified;
+    };
+    enum TombstoneRead : u8 { TombstoneSampled, TombstoneLoaded, TombstoneCpuRead, TombstoneReads };
+    void AddRelocationTombstone(const ImageBase& old_image, GPUVAddr moved_to);
+    /// JoinImages: a new image at a tombstoned address waits for its first PrepareImage.
+    void CheckTombstoneCreation(ImageId image_id, const ImageBase& image, bool overwritten);
+    void CheckTombstonePrepare(ImageId image_id, const ImageBase& image, bool is_modification,
+                               bool invalidate);
+    void CheckTombstoneCpuRead(DAddr cpu_addr, u64 size);
+    void NoteTombstoneHit(const RelocationTombstone& tombstone, TombstoneRead reason,
+                          GPUVAddr gpu_addr, const ImageInfo* info);
+    /// TickFrame: drops tombstones older than 2 render frames; logs every 600 frames.
+    void TickRelocationTombstones();
+    std::vector<RelocationTombstone> relocation_tombstones;
+    DAddr tombstone_cpu_begin{~DAddr{0}}; ///< Bounds of all tombstones (quick reject)
+    DAddr tombstone_cpu_end{};
+    struct TombstoneBorn {
+        ImageId image_id;
+        GPUVAddr gpu_addr;
+        RelocationTombstone tombstone;
+    };
+    boost::container::small_vector<TombstoneBorn, 4> tombstone_born;
+    std::array<u64, TombstoneReads> tombstone_hits{}; ///< Since the last report
+    u64 tombstones_made{};
+    u64 tombstone_overlap_reads{}; ///< New images read over one, not at its address
+    u32 tombstone_hits_logged{};
+
+    /// Cold sweep (EDEN_NX2_TC_COLD_FRAMES=K, 0 = off; fable_answer_16 3.2): a relocation-shaped
+    /// image with BadOverlap (a member of a drifted chain) untouched for K host frames, with no
+    /// download queued and not bound, is deleted in TickFrame (at most 16 a frame), so its
+    /// VkImage goes to the EXP42 pool instead of waiting for the collector, which only starts
+    /// near the device budget. Never a GPU-written image that may be read again: one that was
+    /// itself read in a later frame or by the CPU, or of a shape guarded as read by the CPU, and
+    /// unless EDEN_NX2_TC_COLD_GUARDED=1 of a shape guarded as sampled or rendered to without a
+    /// clear in a later frame. JoinImages puts the chain members it sees on the watch list.
+    void WatchColdImage(ImageId image_id);
+    void SweepColdImages();
+    std::vector<std::pair<ImageId, u64>> cold_watch; ///< Image, frame_tick it was put on
+    ::Common::unordered_set<ImageId> cold_watch_set;
+    u64 cold_deleted{};       ///< Since the last report
+    u64 cold_kept_guarded{};  ///< Dropped from the watch: GPU-written and guarded
+    u64 cold_kept_read{};     ///< Dropped from the watch: GPU-written and read later or by the CPU
 
     [[nodiscard]] static bool RelocationShaped(const ImageInfo& info) noexcept {
         return info.type == ImageType::e2D && info.resources.levels == 1 &&
@@ -629,8 +713,8 @@ private:
     void NoteRelocationGuard(ImageBase& image, RelocationGuard reason);
     /// The cross-frame read checks of PrepareImage and the texture memo's touch.
     void CheckCrossFrameUse(ImageBase& image, bool is_modification, bool invalidate) {
-        if (image.last_write_frame == frame_tick || image.last_write_frame == ~u64{0} ||
-            invalidate) {
+        if (image.last_write_frame == ~u64{0} || invalidate ||
+            image.last_write_frame == RenderFrame()) {
             return;
         }
         const RelocationGuard reason = is_modification ? GuardLoaded : GuardSampled;

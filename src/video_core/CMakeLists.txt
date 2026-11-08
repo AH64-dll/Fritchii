@@ -28,6 +28,7 @@ add_library(video_core STATIC
     capture.h
     cdma_pusher.cpp
     cdma_pusher.h
+    churn_counters.h
     compatible_formats.cpp
     compatible_formats.h
     control/channel_state.cpp

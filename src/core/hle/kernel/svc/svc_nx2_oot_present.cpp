@@ -35,6 +35,7 @@
 #include "core/hle/kernel/svc_results.h"
 #include "core/loader/loader.h"
 #include "core/memory.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 
 namespace Kernel::Svc {
@@ -196,6 +197,8 @@ struct PresentPollState {
     std::vector<SeenWrite> seen;
     std::vector<const void*> learned;
     std::vector<u64> learned_devices; // (for the log)
+    // `learned` for the render-frame clock, read without wake_mutex (written under it).
+    std::array<std::atomic<const void*>, MaxLearned> learned_mirror{};
 
     // The polling thread's bookkeeping between waits, guarded by poll_mutex (not held in a wait).
     std::mutex poll_mutex;
@@ -302,6 +305,17 @@ bool Contains(const Container& container, const T& item) {
 void OnGpuWrite(Path path, u64 device_address, u64 gpu_address, const void* host_pointer,
                 u32 value) {
     PresentPollState& state = PollState();
+    // The render-frame clock (Tegra::g_nx2_render_frame, EDEN_NX2_RENDER_CLOCK=1): a write to a
+    // learned word is the frame's last GPU write, whether or not a poll waits for it.
+    if (host_pointer != nullptr && Tegra::g_nx2_render_clock_syncpt < 0 &&
+        Tegra::g_nx2_render_clock_wanted.load(std::memory_order_relaxed)) {
+        for (const auto& learned : state.learned_mirror) {
+            if (learned.load(std::memory_order_relaxed) == host_pointer) {
+                Tegra::g_nx2_render_frame.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+        }
+    }
     if (!state.has_waiter.load(std::memory_order_acquire)) {
         return;
     }
@@ -827,6 +841,10 @@ void Score(PresentPollState& state, const void* host, u64 device, bool ok) {
                  "OoT present poll (EXP24): forgot the word at device {:#x} ({} found set, {} "
                  "early wakes)",
                  it->device, it->ok, it->fail);
+    }
+    for (size_t i = 0; i < state.learned_mirror.size(); ++i) {
+        state.learned_mirror[i].store(i < state.learned.size() ? state.learned[i] : nullptr,
+                                      std::memory_order_relaxed);
     }
 }
 

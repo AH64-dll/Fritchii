@@ -27,6 +27,7 @@
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "video_core/churn_counters.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
@@ -836,6 +837,17 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             }
         }
     }
+    // Counts the allocator's vkAllocateMemory / vkFreeMemory calls (blocks and dedicated
+    // memory) for the "Churn (600 frames)" line.
+    static const VmaDeviceMemoryCallbacks churn_callbacks{
+        .pfnAllocate = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*) {
+            VideoCommon::Churn::Add(VideoCommon::Churn::DeviceAllocations);
+        },
+        .pfnFree = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*) {
+            VideoCommon::Churn::Add(VideoCommon::Churn::DeviceFrees);
+        },
+        .pUserData = nullptr,
+    };
     const VmaAllocatorCreateInfo allocator_info{
             .flags = flags,
             .physicalDevice = physical,
@@ -849,7 +861,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             // block (8 MiB) their own memory, which goes back to the driver when they are freed.
             .preferredLargeHeapBlockSize = 16u * 1024u * 1024u,
             .pAllocationCallbacks = nullptr,
-            .pDeviceMemoryCallbacks = nullptr,
+            .pDeviceMemoryCallbacks = &churn_callbacks,
             .pHeapSizeLimit = heap_size_limit != 0 ? heap_size_limits.data() : nullptr,
             .pVulkanFunctions = &functions,
             .instance = instance,
