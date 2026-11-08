@@ -3533,11 +3533,14 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         return;
     }
     const auto modified = std::filesystem::last_write_time(path, error).time_since_epoch().count();
-    // The driver keeps what it compiled; the step runs again for another file, driver or build.
+    // The driver keeps what it compiled; the step runs again for another file, driver, GPU or
+    // release. The release version, not the commit (2026-11-09, owner): every dev build re-ran the
+    // ~20 minute preparation. A translator change inside a release only costs a few runtime
+    // compiles, which the game handles anyway.
     const auto stamp_path =
         base_dir / fmt::format("precompiled_prepared.fork-v{}.txt", CACHE_VERSION);
     const std::string stamp = fmt::format("{} {} {:#x} {} {}\n", file_size, modified,
-                                          device.GetDriverVersion(), Common::g_scm_rev,
+                                          device.GetDriverVersion(), Common::g_build_version,
                                           device.GetModelName());
     if (!force && !VideoCommon::Nx2Precompile::Forced()) {
         std::ifstream stamp_file(stamp_path, std::ios::binary);
