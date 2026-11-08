@@ -25,7 +25,9 @@ namespace Vulkan {
 /// EDEN_NX2_ASYNC_TRANSLATE=2: what a graphics translation produced (CreateGraphicsPipeline's
 /// `record`), to compare the worker's with the GPU thread's.
 struct TranslationRecord {
-    /// SPIR-V of each stage, as emitted with the pipeline's bindings.
+    /// SPIR-V of each stage, as emitted with the pipeline's bindings. Unless translate_only, the
+    /// pipeline's own modules are built from these same words: a program is emitted only once,
+    /// because EmitSPIRV changes the IR it reads (CreateGraphicsPipeline).
     std::array<std::vector<u32>, 5> spirv;
     bool complete{};       ///< The translation got as far as the SPIR-V of every stage
     bool translate_only{}; ///< Stop there: no shader modules, no pipeline

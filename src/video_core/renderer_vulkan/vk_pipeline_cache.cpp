@@ -40,6 +40,7 @@
 #include "core/core.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/environment.h"
+#include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/ir_opt/passes.h"
@@ -429,14 +430,29 @@ size_t TranslateThreads() {
     return static_cast<size_t>(std::clamp(threads, 1, 8));
 }
 
-vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& profile,
-                                 const Shader::RuntimeInfo& runtime_info,
-                                 Shader::IR::Program& program, Shader::Backend::Bindings& binding,
-                                 u64 shader_hash, size_t stage_index,
-                                 std::span<const u32> reference = {},
-                                 u128* spirv_hash = nullptr) {
-    const auto code =
-        EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
+/// EDEN_NX2_SPIRV_SELFCHECK=1: throws (the pipeline is dropped, as one the translation rejects)
+/// when the emitted SPIR-V uses an id it never defines or its own result, before the driver gets
+/// it. Off: nothing.
+void SelfCheckSpirv(std::span<const u32> code, u64 shader_hash, const char* stage) {
+    if (!SpirvSelfCheck()) {
+        return;
+    }
+    if (std::string problem = FindSpirvIdProblem(code); !problem.empty()) {
+        LOG_ERROR(Render_Vulkan,
+                  "SPIR-V self-check (EDEN_NX2_SPIRV_SELFCHECK=1): shader {:016x} {}: {}; its "
+                  "pipeline is dropped instead of handed to the driver",
+                  shader_hash, stage, problem);
+        throw Shader::LogicError("SPIR-V self-check failed for shader {:016x} {}", shader_hash,
+                                 stage);
+    }
+}
+
+/// The shader module of a stage from its finished SPIR-V.
+vk::ShaderModule BuildStageModule(const Device& device, std::span<const u32> code,
+                                  u64 shader_hash, size_t stage_index, u128* spirv_hash) {
+    static constexpr std::array stage_names{"vertex", "tess_control", "tess_eval", "geometry",
+                                           "fragment"};
+    SelfCheckSpirv(code, shader_hash, stage_names[stage_index]);
     if (spirv_hash) {
         // Graphics pipeline libraries are keyed by the SPIR-V the stage was emitted to.
         *spirv_hash = Common::CityHash128(reinterpret_cast<const char*>(code.data()),
@@ -450,8 +466,6 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
     const bool should_log = GPU::Logging::IsActive();
     const bool should_dump = Settings::values.gpu_log_shader_dumps.GetValue();
     if (should_log || should_dump) {
-        static constexpr std::array stage_names{"vertex", "tess_control", "tess_eval", "geometry",
-                                               "fragment"};
         const std::string shader_name =
             fmt::format("shader_{:016x}_{}", shader_hash, stage_names[stage_index]);
         if (should_log) {
@@ -470,6 +484,17 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
         module.SetObjectNameEXT(name.c_str());
     }
     return module;
+}
+
+vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& profile,
+                                 const Shader::RuntimeInfo& runtime_info,
+                                 Shader::IR::Program& program, Shader::Backend::Bindings& binding,
+                                 u64 shader_hash, size_t stage_index,
+                                 std::span<const u32> reference = {},
+                                 u128* spirv_hash = nullptr) {
+    const auto code =
+        EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
+    return BuildStageModule(device, code, shader_hash, stage_index, spirv_hash);
 }
 
 // Graphics pipeline libraries (EDEN_NX2_GPL): each stage's resources go to its own descriptor
@@ -497,6 +522,9 @@ struct DeferredStages {
     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
     std::array<std::optional<Shader::RuntimeInfo>, Maxwell::MaxShaderStage> runtime_infos;
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
+    /// SPIR-V emitted already (EDEN_NX2_ASYNC_TRANSLATE=2 records it on the translating thread):
+    /// such a stage is built from these words, never emitted from its program a second time.
+    std::array<std::vector<u32>, Maxwell::MaxShaderStage> emitted_spirv;
 };
 
 size_t GetTotalPipelineWorkers() {
@@ -4127,6 +4155,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
     std::array<std::optional<Shader::RuntimeInfo>, Maxwell::MaxShaderStage> deferred_runtime_infos;
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
+    std::array<std::vector<u32>, Maxwell::MaxShaderStage> deferred_spirv;
 
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
@@ -4147,22 +4176,41 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         ConvertLegacyToGeneric(program, runtime_info);
         PrepareStageBindings(binding, stage_index, use_libraries);
         if (record) {
-            // EDEN_NX2_ASYNC_TRANSLATE=2: this stage's SPIR-V with the bindings the pipeline's
-            // own emission uses (from a copy, so they advance once).
-            Shader::Backend::Bindings record_binding = binding;
-            record->spirv[stage_index] = EmitSPIRV(profile, runtime_info, program, record_binding);
-            if (record->translate_only || (emit_pools && !VideoCommon::Nx2Perf::Verify())) {
-                // Nothing below advances them: the next stage starts where this one ended.
-                binding = record_binding;
-            }
+            // EDEN_NX2_ASYNC_TRANSLATE=2: this stage's SPIR-V, emitted once and used for the
+            // record and for the pipeline alike. EmitSPIRV changes the program it emits: the flag
+            // of an operation (GetZeroFromOp, GetSignFromOp, GetCarryFromOp, GetOverflowFromOp,
+            // GetSparseFromOp, GetInBoundsFromOp) gets its id from the operation's emitter and is
+            // turned into a Void, cut from the operation. A second emission of the same program
+            // never defines those flags again, and their users read the ids of the first one:
+            // ids the module never defines, "%782 = OpLogicalNot %u1 %782" at spirv-val, and the
+            // driver crash in verify mode.
+            const auto begin = std::chrono::steady_clock::now();
+            record->spirv[stage_index] = EmitSPIRV(profile, runtime_info, program, binding);
             if (record->translate_only) {
                 previous_stage = &program;
                 continue;
             }
+            if (emit_pools) {
+                // The workers build the module from these words (DeferredStages).
+                deferred_runtime_infos[stage_index] = runtime_info;
+                deferred_spirv[stage_index] = record->spirv[stage_index];
+            } else {
+                modules[stage_index] = BuildStageModule(
+                    device, record->spirv[stage_index], key.unique_hashes[index], stage_index,
+                    use_libraries ? &spirv_hashes[stage_index] : nullptr);
+            }
+            if (build_in_parallel) {
+                AddRuntimeSpirvTime(0, begin);
+            }
+            previous_stage = &program;
+            continue;
         }
         if (emit_pools) {
             deferred_runtime_infos[stage_index] = runtime_info;
             if (VideoCommon::Nx2Perf::Verify()) {
+                // EDEN_NX2_PERF_VERIFY: the workers' emission is the program's second, so a stage
+                // with an operation flag (see the record above) always differs from this one and
+                // falls back to it (EmitPipelineShader). This is the SPIR-V that gets used then.
                 reference_spirv[stage_index] = EmitSPIRV(profile, runtime_info, program, binding);
             }
         } else {
@@ -4190,6 +4238,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         job->programs = std::move(programs);
         job->runtime_infos = std::move(deferred_runtime_infos);
         job->reference_spirv = std::move(reference_spirv);
+        job->emitted_spirv = std::move(deferred_spirv);
         for (size_t stage = 0; stage < infos.size(); ++stage) {
             if (infos[stage]) {
                 infos[stage] = &job->programs[stage + 1].info;
@@ -4201,7 +4250,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             std::array<vk::ShaderModule, Maxwell::MaxShaderStage> stage_modules;
             Shader::Backend::Bindings stage_binding;
             for (size_t stage = 0; stage < stage_modules.size(); ++stage) {
-                if (job->runtime_infos[stage]) {
+                if (!job->emitted_spirv[stage].empty()) {
+                    // Emitted already: a program is emitted once (see the record in the loop).
+                    stage_modules[stage] =
+                        BuildStageModule(device, job->emitted_spirv[stage], hashes[stage + 1],
+                                         stage, use_libraries ? &stage_hashes[stage] : nullptr);
+                } else if (job->runtime_infos[stage]) {
                     PrepareStageBindings(stage_binding, stage, use_libraries);
                     stage_modules[stage] = EmitShaderModule(
                         device, profile, *job->runtime_infos[stage], job->programs[stage + 1],
@@ -4863,6 +4917,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         program.shared_memory_size = max_shared_memory;
     }
     const std::vector<u32> code{EmitSPIRV(profile, program)};
+    SelfCheckSpirv(code, key.unique_hash, "compute");
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
 
