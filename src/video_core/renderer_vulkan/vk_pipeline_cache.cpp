@@ -28,6 +28,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "common/shutdown_progress.h"
 #include "common/thread.h"
 #include "common/thread_worker.h"
 #include "core/core.h"
@@ -1035,21 +1036,47 @@ bool PreloadAllPipelines() {
 }
 } // Anonymous namespace
 
+namespace {
+/// Destroys the pipelines of `pipelines` (a map or a deque of pairs holding unique_ptrs), telling
+/// the frontend every few hundred that the teardown still moves: tens of thousands of them took
+/// longer than the frontend waited for the emulation thread.
+template <typename Container>
+void DestroyPipelinesWithProgress(Container& pipelines) {
+    constexpr size_t ProgressEvery = 256;
+    size_t destroyed = 0;
+    for (auto& entry : pipelines) {
+        entry.second.reset();
+        if (++destroyed % ProgressEvery == 0) {
+            Common::NoteShutdownProgress();
+        }
+    }
+    pipelines.clear();
+    Common::NoteShutdownProgress();
+}
+} // Anonymous namespace
+
 PipelineCache::~PipelineCache() {
-    // Stop the warm-ups first: their builds use the members below.
+    // Stop the warm-ups and background builds first: their builds use the members below.
+    warm_cancel = true;
+    background_stop.store(true, std::memory_order_relaxed);
     graphics_warm_threads.clear();
     compute_warm_threads.clear();
     StopBackgroundPipelines();
+    Common::NoteShutdownProgress();
     workers.WaitForRequests();
     serialization_thread.WaitForRequests();
+    Common::NoteShutdownProgress();
+    // The caches are written before anything slow is torn down, so a teardown cut short still
+    // leaves them on disk.
     SaveUsedPipelines();
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
     }
-    background_ready.clear();
-    graphics_cache.clear();
-    evicted_pipelines.clear();
+    Common::NoteShutdownProgress();
+    DestroyPipelinesWithProgress(background_ready);
+    DestroyPipelinesWithProgress(graphics_cache);
+    DestroyPipelinesWithProgress(evicted_pipelines);
 }
 
 void PipelineCache::SaveUsedPipelines() {
@@ -1573,6 +1600,17 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         compute_warm_threads.clear();
         warm_stop_callback.reset();
         compute_warm_done = true;
+        // The earlier load's background builds too: its pipelines no draw took are dropped
+        // (never bound, so no GPU work uses them).
+        StopBackgroundPipelines();
+        {
+            std::scoped_lock lock{background_mutex};
+            background_ready.clear();
+            background_claimed.clear();
+        }
+        background_active.store(false, std::memory_order_release);
+        background_stop.store(false, std::memory_order_relaxed);
+        background_slots.store(0, std::memory_order_relaxed);
         serialization_thread.WaitForRequests();
         if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
             SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -1859,8 +1897,14 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
     if (!stop_loading.stop_requested()) {
         warm_cancel = false;
+        // Stopping emulation also stops the background builds at once: they would otherwise
+        // compile on (minutes for a large cache) until the cache is destroyed, competing with
+        // the teardown for the CPU.
         warm_stop_callback = std::make_unique<std::stop_callback<std::function<void()>>>(
-            stop_loading, std::function<void()>{[this] { warm_cancel = true; }});
+            stop_loading, std::function<void()>{[this] {
+                warm_cancel = true;
+                background_stop.store(true, std::memory_order_relaxed);
+            }});
         StartComputeWarm(title_id);
         StartGraphicsWarm(title_id);
     }
@@ -3349,12 +3393,12 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
     auto temporary = filename;
     temporary += ".tmp";
     std::ofstream file(temporary, std::ios::binary);
-    file.exceptions(std::ifstream::failbit);
     if (!file.is_open()) {
         LOG_ERROR(Common_Filesystem, "Failed to open Vulkan driver pipeline cache file {}",
-                  Common::FS::PathToUTF8String(filename));
+                  Common::FS::PathToUTF8String(temporary));
         return;
     }
+    file.exceptions(std::ifstream::failbit);
     file.write(VULKAN_CACHE_MAGIC_NUMBER.data(), VULKAN_CACHE_MAGIC_NUMBER.size())
         .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
 
@@ -3365,7 +3409,15 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
         cache_data.resize(cache_size);
         pipeline_cache.Read(&cache_size, cache_data.data());
     }
-    file.write(cache_data.data(), cache_size);
+    Common::NoteShutdownProgress();
+    // In pieces: a cache of tens of thousands of pipelines is gigabytes, and a shutdown waiting
+    // on it is told the write still moves.
+    constexpr size_t Chunk = size_t{64} << 20;
+    for (size_t offset = 0; offset < cache_size; offset += Chunk) {
+        file.write(cache_data.data() + offset,
+                   static_cast<std::streamsize>((std::min)(Chunk, cache_size - offset)));
+        Common::NoteShutdownProgress();
+    }
     file.close();
     std::error_code error;
     std::filesystem::rename(temporary, filename, error);
@@ -3380,11 +3432,13 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
              Common::FS::PathToUTF8String(filename));
 
 } catch (const std::ios_base::failure& e) {
-    LOG_ERROR(Common_Filesystem, "{}", e.what());
-    if (!Common::FS::RemoveFile(filename)) {
-        LOG_ERROR(Common_Filesystem, "Failed to delete Vulkan driver pipeline cache file {}",
-                  Common::FS::PathToUTF8String(filename));
-    }
+    // Only the half-written copy goes: the cache on disk is still whole (deleting it on a failed
+    // write, e.g. a full disk, made the next boot compile every pipeline again).
+    LOG_ERROR(Common_Filesystem, "Writing the Vulkan driver pipeline cache failed: {}", e.what());
+    auto temporary = filename;
+    temporary += ".tmp";
+    std::error_code error;
+    std::filesystem::remove(temporary, error);
 }
 
 vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::path& filename,
