@@ -41,6 +41,7 @@
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/framebuffer_config.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_client_session.h"
@@ -3484,6 +3485,10 @@ public:
     }
 
     ~INx2GraphicsSystemSession() override {
+        if (m_syncpt_poll_now) {
+            system.Host1x().GetSyncpointManager().SetGuestIncrementHook(nullptr, nullptr);
+            system.CoreTiming().UnscheduleEvent(m_syncpt_poll_now);
+        }
         if (m_syncpt_poll) {
             system.CoreTiming().UnscheduleEvent(m_syncpt_poll);
         }
@@ -3661,6 +3666,24 @@ private:
                 system.CoreTiming().ScheduleLoopingEvent(SyncptPollInterval, SyncptPollInterval,
                                                          m_syncpt_poll);
             }
+            if (!m_syncpt_poll_now) {
+                // The driver's armed waits were answered only by the 500 us poll: the guest's
+                // syncpoint value reached the shared page up to 500 us late, and Ocarina of
+                // Time's present poll then slept up to 1 ms more (Fable answer 9). With EXP37 a
+                // guest increment queues one poll at once, on the same timing thread.
+                m_syncpt_poll_now = Core::Timing::CreateEvent(
+                    "nx2:gsv:SyncptPollNow",
+                    [this](s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
+                        m_syncpt_poll_now_pending.store(false, std::memory_order_release);
+                        PollSyncpts();
+                        return std::nullopt;
+                    });
+                system.Host1x().GetSyncpointManager().SetGuestIncrementHook(
+                    [](void* context) {
+                        static_cast<INx2GraphicsSystemSession*>(context)->OnGuestIncrement();
+                    },
+                    this);
+            }
         } else {
             LOG_ERROR(Service, "nx2:gsv TIPC 204: missing syncpt transfer memory");
         }
@@ -3688,6 +3711,15 @@ private:
             }
         }
         return changed;
+    }
+
+    /// A guest syncpoint was incremented (any thread): with EXP37, poll at once.
+    void OnGuestIncrement() {
+        if (VideoCore::Nx2Debug::Experiment(37) == 0 ||
+            m_syncpt_poll_now_pending.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        system.CoreTiming().ScheduleEvent(std::chrono::nanoseconds{0}, m_syncpt_poll_now);
     }
 
     // Answers every armed wait: the value page is current, so the client rechecks its threshold
@@ -4159,6 +4191,10 @@ private:
     u64 m_syncpt_ro{};
     u32 m_syncpt_count{};
     std::shared_ptr<Core::Timing::EventType> m_syncpt_poll;
+    /// EDEN_NX2_EXP37: PollSyncpts at once after a guest syncpoint increment (OnGuestIncrement),
+    /// at most one pending.
+    std::shared_ptr<Core::Timing::EventType> m_syncpt_poll_now;
+    std::atomic<bool> m_syncpt_poll_now_pending{};
 };
 
 } // namespace Service
