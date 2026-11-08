@@ -14,7 +14,8 @@ endfunction()
 
 get_timestamp(BUILD_DATE)
 
-# Frizti fork releases are numbered Frizti v1, v2, v3.5, ...: dist/frizti_version.txt holds the number.
+# Fritchii (the Frizti fork, named Frizti v1..v3.5 before v4) releases are numbered v1, v2, v3.5, v4...:
+# dist/frizti_version.txt holds the number.
 set(FRIZTI_VERSION_FILE "${CMAKE_SOURCE_DIR}/dist/frizti_version.txt")
 if (EXISTS "${FRIZTI_VERSION_FILE}")
     file(STRINGS "${FRIZTI_VERSION_FILE}" FRIZTI_VERSION LIMIT_COUNT 1 REGEX "^[0-9]+([.][0-9]+)?$")
@@ -29,7 +30,7 @@ if (LICHII_BUILD_TAG MATCHES "^build-[0-9]+$")
     set(BUILD_VERSION "${LICHII_BUILD_TAG}")
     set(IS_DEV_BUILD false)
 elseif (FRIZTI_VERSION)
-    set(BUILD_VERSION "Frizti v${FRIZTI_VERSION}")
+    set(BUILD_VERSION "v${FRIZTI_VERSION}")
     set(IS_DEV_BUILD false)
 elseif (DEFINED GIT_RELEASE)
     set(BUILD_VERSION "${GIT_TAG}")
@@ -63,6 +64,8 @@ set(BUILD_AUTO_UPDATE_WEBSITE "https://github.com")
 set(BUILD_AUTO_UPDATE_REPO "zortos293/Lichii")
 if (NIGHTLY_BUILD)
     set(REPO_NAME "Lichii Nightly")
+elseif (FRIZTI_VERSION AND NOT LICHII_BUILD_TAG MATCHES "^build-[0-9]+$")
+    set(REPO_NAME "Fritchii")
 else()
     set(REPO_NAME "Lichii")
 endif()

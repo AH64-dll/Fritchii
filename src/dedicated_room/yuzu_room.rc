@@ -9,7 +9,7 @@
 
 // Icon with lowest ID value placed first to ensure application icon
 // remains consistent on all systems.
-YUZU_ICON              ICON                    "../../dist/lichii.ico"
+YUZU_ICON              ICON                    "../../dist/fritchii.ico"
 
 
 /////////////////////////////////////////////////////////////////////////////
