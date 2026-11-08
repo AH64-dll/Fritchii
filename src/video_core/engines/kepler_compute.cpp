@@ -525,11 +525,16 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
 
     switch (method) {
     case KEPLER_COMPUTE_REG_INDEX(exec_upload): {
-        UploadInfo info{.upload_address = upload_address,
-                        .exec_address = upload_state.ExecTargetAddress(),
-                        .copy_size = upload_state.GetUploadSize(),
-                        .was_dirty = upload_dirty};
-        uploads.push_back(info);
+        // EDEN_NX2_EXP29 & 4 (zortos293/Lichii#717 EDEN_NX2_DROP_NATIVE_UPLOADS): only the
+        // launch case below reads the list, and native mode never gets there
+        // (ProcessNativeMethod takes 0xaf): the list grew by one entry per exec all session.
+        if (!native_mode || (VideoCore::Nx2Debug::Experiment(29) & 4) == 0) {
+            UploadInfo info{.upload_address = upload_address,
+                            .exec_address = upload_state.ExecTargetAddress(),
+                            .copy_size = upload_state.GetUploadSize(),
+                            .was_dirty = upload_dirty};
+            uploads.push_back(info);
+        }
         upload_state.ProcessExec(regs.exec_upload.linear != 0);
         break;
     }

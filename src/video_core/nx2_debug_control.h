@@ -119,8 +119,9 @@ inline std::atomic<int> g_idle_pause{-1};
 /// (BindSmallUniformReusing; zortos293/Lichii#641 EDEN_NX2_UBO_RANGE_REUSE).
 /// EXP18 (buffer binding memos, #641), bits: 1 = a constant buffer bind of the slot's current
 /// GPU range keeps its translation and resolved buffer (UBO_REBIND), 2 = storage bindings reuse
-/// their last FindBuffer result (STORAGE_MEMO), 4 = buffers touch the LRU once per frame. All
-/// while the mappings and the set of buffers are unchanged (BufferCache::binding_epoch).
+/// their last FindBuffer result (STORAGE_MEMO), 4 = buffers touch the LRU once per frame
+/// (default 4: exact, see LoadExperiments). All while the mappings and the set of buffers are
+/// unchanged (BufferCache::binding_epoch).
 /// EXP19 (graphics pipeline lookup without Refresh, PipelineCache::CurrentGraphicsPipelineClean):
 /// 1 = as EDEN_NX2_PIPELINE_CLEAN=1, 2 = also #641's patches (blend registers left to the
 /// dual-source bit and Dirty::Blending, attribute types redone alone under Dirty::VertexInput).
@@ -171,6 +172,14 @@ inline std::atomic<int> g_idle_pause{-1};
 /// on the split's back at once (FENCE_FOLD, FoldStubbedFence). Off by default; timing family
 /// (#161, boulder flashes): flash watch after each. "Fence decisions/s" (GPU profile) counts
 /// both.
+/// EXP29 (zortos293/Lichii#717's micro bundle), bits: 1 = Device::GetDeviceMemoryUsage reuses an
+/// answer younger than 50 ms (MEMSTAT_MS; the buffer and texture caches ask twice per frame on
+/// the back; zone "memory query" times the driver query), 2 = GPU::TickWork checks an atomic
+/// before taking the sync request mutex (OPT_TICKWORK), 4 = native compute engines no longer
+/// record inline upload execs for the old launch method they never run (DROP_NATIVE_UPLOADS).
+/// Default 6: 2 and 4 are exact (2 only allows interleavings the mutex already allowed, 4 drops
+/// a list nothing in native mode reads); 1 is off, since the caches' GC then sees usage up to
+/// 50 ms old. EDEN_NX2_EXP29=0 is the behaviour before.
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 
@@ -190,10 +199,18 @@ inline void LoadExperiments() {
         // EXP14: unchanged macro register writes dropped before FrontWrite's other checks.
         // Castle Town, profile toggle: front macro 250 -> 236 ms/s, push 77 -> 70 ms/s.
         g_experiments[14].store(1, std::memory_order_relaxed);
+        // EXP18 = 4 (exact, zortos293/Lichii#717 wave 1): a buffer touches its LRU node once
+        // per frame; a second touch in the same frame was already a no-op in LruCache::Touch
+        // (its tick is not older), so only the node's cache miss goes. Bits 1 and 2 stay off.
+        g_experiments[18].store(4, std::memory_order_relaxed);
         // EXP21 = 1: a texture whose handle word is a storage buffer's address gets no texture
         // (VideoCommon::HandleIsStoragePointer). Ocarina of Time's Zora's River waterfall
         // flickered every other frame in bursts without it.
         g_experiments[21].store(1, std::memory_order_relaxed);
+        // EXP29 = 6: the exact parts of #717's micro bundle (TickWork's lock-free check, native
+        // compute inline uploads not recorded); 1 (memory usage reuse) changes what the caches'
+        // GC sees and stays off.
+        g_experiments[29].store(6, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);
             if (const char* value = std::getenv(name.c_str())) {

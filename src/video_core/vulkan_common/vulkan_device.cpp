@@ -27,6 +27,8 @@
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -1911,6 +1913,28 @@ void Device::ReleaseCustomBorderColorSamplers(size_t count) const {
 }
 
 u64 Device::GetDeviceMemoryUsage() const {
+    // EDEN_NX2_EXP29 & 1 (zortos293/Lichii#717 EDEN_NX2_MEMSTAT_MS): the buffer and texture
+    // caches ask every frame; with the budget extension each answer is a driver and OS query.
+    // An answer younger than 50 ms is reused (so the caches' GC sees usage up to 50 ms old).
+    if ((VideoCore::Nx2Debug::Experiment(29) & 1) == 0) {
+        return QueryDeviceMemoryUsage();
+    }
+    constexpr s64 reuse_ns = 50'000'000;
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    const s64 last = memory_usage_time.load(std::memory_order_acquire);
+    if (last != 0 && now - last < reuse_ns) {
+        return memory_usage_value.load(std::memory_order_relaxed);
+    }
+    const u64 usage = QueryDeviceMemoryUsage();
+    memory_usage_value.store(usage, std::memory_order_relaxed);
+    memory_usage_time.store(now, std::memory_order_release);
+    return usage;
+}
+
+u64 Device::QueryDeviceMemoryUsage() const {
+    VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::MemoryQuery};
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
     budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
     physical.GetMemoryProperties(&budget);
