@@ -419,6 +419,8 @@ public:
         u32 framebuffers_scanned{}; ///< Framebuffer map entries RemoveFramebuffers looked at
         u32 framebuffers_created{};
         u32 pooled_images{};        ///< New images that took a pooled VkImage (EXP42)
+        u32 relocated_images{};     ///< Images moved instead of made (EXP43=2)
+        u32 retired_images{};       ///< Predecessors deleted at once (EXP43=1)
         u64 walk_ns{};              ///< JoinImages' overlap walk
         u64 create_ns{};            ///< Making the new image (vkCreateImage, memory)
         u64 refresh_ns{};           ///< Its upload (RefreshContents) or layout transition
@@ -598,6 +600,7 @@ private:
     u64 relocation_guarded{};
     u64 relocation_relocated{};
     u64 relocation_retired{};
+    u64 relocation_crowded{}; ///< Cleared targets over two or more images of their shape
     bool relocation_seen{};
 
     [[nodiscard]] static bool RelocationShaped(const ImageInfo& info) noexcept {
@@ -617,6 +620,11 @@ private:
     /// queued, bound as another target of this clear, registered in another channel). Else none.
     [[nodiscard]] ImageId RelocationCandidate(const ImageInfo& new_info, GPUVAddr gpu_addr,
                                               DAddr cpu_addr);
+    /// EXP43=2: moves the image to gpu_addr / cpu_addr in place of a new one (fable_answer_12 2A
+    /// steps 1-6); its VkImage, memory, views, framebuffers and scale state stay.
+    void RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr cpu_addr);
+    /// Drops the image's overlapping_images links from the other images (DeleteImage, relocation).
+    void DropOverlapLinks(ImageId image_id);
     /// Sets `reason` on the image's shape (once per image and reason; logs the shape's first).
     void NoteRelocationGuard(ImageBase& image, RelocationGuard reason);
     /// The cross-frame read checks of PrepareImage and the texture memo's touch.

@@ -695,11 +695,13 @@ void TextureCache<P>::TickFrame() {
         }
         LOG_INFO(HW_GPU,
                  "Render target relocation (EXP43={}) last 600 frames: {} candidates, {} kept by "
-                 "the guard, {} relocated, {} retired early; {} of {} shapes guarded",
+                 "the guard, {} relocated, {} retired early, {} over 2+ images of their shape; "
+                 "{} of {} shapes guarded",
                  VideoCore::Nx2Debug::Experiment(43), relocation_candidates, relocation_guarded,
-                 relocation_relocated, relocation_retired, guarded_shapes,
+                 relocation_relocated, relocation_retired, relocation_crowded, guarded_shapes,
                  relocation_shapes.size());
-        relocation_candidates = relocation_guarded = relocation_relocated = relocation_retired = 0;
+        relocation_candidates = relocation_guarded = relocation_relocated = relocation_retired =
+            relocation_crowded = 0;
     }
 
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
@@ -3324,27 +3326,78 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     };
     // EXP43 (fable_answer_12 2A): a cleared render target that drifted off exactly one image of
-    // its shape could take that image's place. Counted and logged here.
-    if (clearing_render_targets && join_bad_overlap_ids.size() == 1 && join_copies_to_do.empty() &&
+    // its shape takes that image's place (2: the image moves here) or retires it at once (1).
+    if (clearing_render_targets && !join_bad_overlap_ids.empty() && join_copies_to_do.empty() &&
         join_left_aliased_ids.empty() && join_right_aliased_ids.empty() &&
         join_ignore_textures.empty()) {
         if (const ImageId old_id = RelocationCandidate(new_info, gpu_addr, cpu_addr);
             old_id && overwritten_by_clear()) {
-            const ImageBase& old = slot_images[old_id];
+            const GPUVAddr old_gpu_addr = slot_images[old_id].gpu_addr;
+            const s64 drift = static_cast<s64>(gpu_addr) - static_cast<s64>(old_gpu_addr);
             RelocationShape& shape = relocation_shapes[RelocationShapeKey(new_info)];
+            const int mode = VideoCore::Nx2Debug::Experiment(43);
             relocation_seen = true;
             ++relocation_candidates;
             if (shape.guard != 0) {
                 ++relocation_guarded;
-            } else if (!shape.candidate_logged) {
-                shape.candidate_logged = true;
-                LOG_INFO(HW_GPU,
-                         "Render target relocation candidate (EXP43={}): format {} {}x{} at "
-                         "{:#x}, drifted {:+} bytes from the image at {:#x}",
-                         VideoCore::Nx2Debug::Experiment(43), static_cast<u32>(new_info.format),
-                         new_info.size.width, new_info.size.height, gpu_addr,
-                         static_cast<s64>(gpu_addr) - static_cast<s64>(old.gpu_addr),
-                         old.gpu_addr);
+            } else {
+                if (!shape.candidate_logged) {
+                    shape.candidate_logged = true;
+                    LOG_INFO(HW_GPU,
+                             "Render target relocation candidate (EXP43={}): format {} {}x{} at "
+                             "{:#x}, drifted {:+} bytes from the image at {:#x}",
+                             mode, static_cast<u32>(new_info.format), new_info.size.width,
+                             new_info.size.height, gpu_addr, drift, old_gpu_addr);
+                }
+                const bool relocate = mode == 2 || mode == 3;
+                if ((relocate || mode == 1) && !shape.relocated_logged) {
+                    shape.relocated_logged = true;
+                    LOG_INFO(HW_GPU,
+                             "Render target {} (EXP43={}): format {} {}x{}, {:#x} -> {:#x}",
+                             relocate ? "relocated" : "retired early", mode,
+                             static_cast<u32>(new_info.format), new_info.size.width,
+                             new_info.size.height, old_gpu_addr, gpu_addr);
+                }
+                if (relocate) {
+                    ++relocation_relocated;
+                    ++rt_stats.relocated_images;
+                    RelocateImage(old_id, gpu_addr, cpu_addr);
+                    // The other bad overlaps are linked to it as to a new image (below).
+                    Image& moved = slot_images[old_id];
+                    for (const ImageId other_id : join_bad_overlap_ids) {
+                        if (other_id == old_id) {
+                            continue;
+                        }
+                        ImageBase& other = slot_images[other_id];
+                        other.overlapping_images.push_back(old_id);
+                        moved.overlapping_images.push_back(other_id);
+                        if (other.info.resources.levels == 1 && other.info.block.depth == 0 &&
+                            other.overlapping_images.size() > 1) {
+                            other.flags |= ImageFlagBits::BadOverlap;
+                        }
+                        if (moved.info.resources.levels == 1 && moved.info.block.depth == 0 &&
+                            moved.overlapping_images.size() > 1) {
+                            moved.flags |= ImageFlagBits::BadOverlap;
+                        }
+                    }
+                    return old_id;
+                }
+                if (mode == 1) {
+                    // 2C: the predecessor goes now instead of 50 frames later; a new image is
+                    // made below as without the switch.
+                    ++relocation_retired;
+                    ++rt_stats.retired_images;
+                    Image& old = slot_images[old_id];
+                    MarkStale(old); // before UntrackImage (see MarkStale)
+                    if (True(old.flags & ImageFlagBits::Tracked)) {
+                        UntrackImage(old, old_id);
+                    }
+                    UnregisterImage(old_id);
+                    DeleteImage(old_id);
+                    join_bad_overlap_ids.erase(std::remove(join_bad_overlap_ids.begin(),
+                                                           join_bad_overlap_ids.end(), old_id),
+                                               join_bad_overlap_ids.end());
+                }
             }
         }
     }
@@ -4284,15 +4337,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         ASSERT_MSG(num_removed_aliases == 1, "Invalid number of removed aliases: {}",
                    num_removed_aliases);
     }
-    for (const ImageId overlap_id : image.overlapping_images) {
-        ImageBase& other_image = slot_images[overlap_id];
-        [[maybe_unused]] const size_t num_removed_overlaps = std::erase_if(
-            other_image.overlapping_images,
-            [image_id](const ImageId other_overlap_id) { return other_overlap_id == image_id; });
-        other_image.CheckBadOverlapState();
-        ASSERT_MSG(num_removed_overlaps == 1, "Invalid number of removed overlapps: {}",
-                   num_removed_overlaps);
-    }
+    DropOverlapLinks(image_id);
     for (const ImageViewId image_view_id : image_view_ids) {
         if (!immediate_delete) {
             sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
@@ -4328,6 +4373,84 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
             std::ranges::fill(channel_info.compute_image_table.LiveBoundIds(), CORRUPT_ID);
         }
 #endif
+        channel_info.graphics_image_table.Invalidate();
+        channel_info.compute_image_table.Invalidate();
+    }
+    has_deleted_images = true;
+}
+
+template <class P>
+void TextureCache<P>::DropOverlapLinks(ImageId image_id) {
+    ImageBase& image = slot_images[image_id];
+    for (const ImageId overlap_id : image.overlapping_images) {
+        ImageBase& other_image = slot_images[overlap_id];
+        [[maybe_unused]] const size_t num_removed_overlaps = std::erase_if(
+            other_image.overlapping_images,
+            [image_id](const ImageId other_overlap_id) { return other_overlap_id == image_id; });
+        other_image.CheckBadOverlapState();
+        ASSERT_MSG(num_removed_overlaps == 1, "Invalid number of removed overlapps: {}",
+                   num_removed_overlaps);
+    }
+}
+
+template <class P>
+void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr cpu_addr) {
+    Image& image = slot_images[image_id];
+    // 1. The GPU's data at the old address is lost, as when the collector deletes the image.
+    MarkStale(image); // before UntrackImage (see MarkStale)
+    if (True(image.flags & ImageFlagBits::Tracked)) {
+        UntrackImage(image, image_id);
+    }
+    UnregisterImage(image_id);
+    // RegisterImage below counts it again.
+    total_used_memory -= (std::min)(total_used_memory, ImageMemoryBytes(image));
+    // 2. No overlap links: the chain of drifted images does not form.
+    DropOverlapLinks(image_id);
+    image.overlapping_images.clear();
+    image.CheckBadOverlapState();
+    // 3. Out of the alloc entry of the old address (InsertImage files it under the new one).
+    if (const auto alloc_it = image_allocs_table.find(image.gpu_addr);
+        alloc_it != image_allocs_table.end()) {
+        const ImageAllocId alloc_id = alloc_it->second;
+        std::vector<ImageId>& alloc_images = slot_image_allocs[alloc_id].images;
+        std::erase(alloc_images, image_id);
+        if (alloc_images.empty()) {
+            image_allocs_table.erase(alloc_it);
+            slot_image_allocs.erase(alloc_id);
+        }
+    } else {
+        ASSERT_MSG(false, "Relocating an image without an alloc at {:#x}", image.gpu_addr);
+    }
+    // Lookups by address (descriptors, bound render targets) must not keep finding its views
+    // under the old address; the views themselves, and the framebuffers keyed by them, stay.
+    for (const ImageViewId image_view_id : image.image_view_ids) {
+        std::ranges::replace(render_targets.color_buffer_ids, image_view_id, ImageViewId{});
+        if (render_targets.depth_buffer_id == image_view_id) {
+            render_targets.depth_buffer_id = ImageViewId{};
+        }
+    }
+    RemoveImageViewReferences(image.image_view_ids);
+    // 4. The new address. Contents count as the guest's (the clear overwrites them whole, and
+    // PrepareImage's invalidate path drops the upload, as for a new image).
+    image.gpu_addr = gpu_addr;
+    image.cpu_addr = cpu_addr;
+    image.cpu_addr_end = cpu_addr + image.guest_size_bytes;
+    image.flags &= ~ImageFlagBits::GpuModified;
+    image.flags |= ImageFlagBits::CpuModified;
+    image.last_write_frame = ~u64{0};
+    image.relocation_guard_noted = 0;
+    // 5. Page tables, map view, page filter, LRU.
+    RegisterImage(image_id);
+    // 6. As DeleteImage: render targets and descriptor tables are looked up again.
+    ++bindings_epoch;
+    auto& dirty = maxwell3d->dirty.flags;
+    dirty[Dirty::RenderTargets] = true;
+    dirty[Dirty::ZetaBuffer] = true;
+    for (size_t rt = 0; rt < NUM_RT; ++rt) {
+        dirty[Dirty::ColorBuffer0 + rt] = true;
+    }
+    for (size_t c : active_channel_ids) {
+        auto& channel_info = channel_storage[c];
         channel_info.graphics_image_table.Invalidate();
         channel_info.compute_image_table.Invalidate();
     }
@@ -4444,18 +4567,54 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
 template <class P>
 ImageId TextureCache<P>::RelocationCandidate(const ImageInfo& new_info, GPUVAddr gpu_addr,
                                              DAddr cpu_addr) {
-    const ImageId old_id = join_bad_overlap_ids.front();
+    if (!RelocationShaped(new_info)) {
+        return ImageId{};
+    }
+    // Exactly one bad overlap of the same shape and layout; others (a neighbouring target of
+    // another shape the drift moved into) stay bad overlaps, as for a new image.
+    const auto same_shape = [&new_info](const ImageInfo& info) {
+        return RelocationShaped(info) && info.format == new_info.format &&
+               info.size.width == new_info.size.width &&
+               info.size.height == new_info.size.height &&
+               info.size.depth == new_info.size.depth && info.block == new_info.block &&
+               info.layer_stride == new_info.layer_stride &&
+               info.maybe_unaligned_layer_stride == new_info.maybe_unaligned_layer_stride &&
+               info.tile_width_spacing == new_info.tile_width_spacing &&
+               info.native_tiling == new_info.native_tiling &&
+               info.rescaleable == new_info.rescaleable &&
+               info.downscaleable == new_info.downscaleable &&
+               info.is_sparse == new_info.is_sparse && info.astc_opaque == new_info.astc_opaque;
+    };
+    // Predecessors: images of the shape the GPU did not write in this frame (one it did may
+    // still be read in this frame; it is never taken, and not counted).
+    ImageId old_id{};
+    u32 predecessors = 0;
+    for (const ImageId overlap_id : join_bad_overlap_ids) {
+        const ImageBase& overlap = slot_images[overlap_id];
+        if (!same_shape(overlap.info) || overlap.last_write_frame == frame_tick) {
+            continue;
+        }
+        ++predecessors;
+        // EXP43=3 takes the most recently modified of several.
+        if (!old_id || overlap.modification_tick > slot_images[old_id].modification_tick) {
+            old_id = overlap_id;
+        }
+    }
+    if (predecessors == 0) {
+        return ImageId{};
+    }
+    if (predecessors > 1) {
+        // A chain from before the switch (or two targets of the shape in reach): EXP43=1 and 2
+        // need exactly one.
+        ++relocation_crowded;
+        relocation_seen = true;
+        if (VideoCore::Nx2Debug::Experiment(43) != 3) {
+            return ImageId{};
+        }
+    }
     const ImageBase& old = slot_images[old_id];
-    const ImageInfo& info = old.info;
-    if (!RelocationShaped(new_info) || !RelocationShaped(info) || info.format != new_info.format ||
-        info.size.width != new_info.size.width || info.size.height != new_info.size.height ||
-        info.size.depth != new_info.size.depth || info.block != new_info.block ||
-        info.layer_stride != new_info.layer_stride ||
-        info.maybe_unaligned_layer_stride != new_info.maybe_unaligned_layer_stride ||
-        info.tile_width_spacing != new_info.tile_width_spacing ||
-        info.native_tiling != new_info.native_tiling || info.rescaleable != new_info.rescaleable ||
-        info.downscaleable != new_info.downscaleable || info.is_sparse != new_info.is_sparse ||
-        info.astc_opaque != new_info.astc_opaque || info.forced_flushed || info.dma_downloaded) {
+    // Read by the CPU.
+    if (old.info.forced_flushed || old.info.dma_downloaded) {
         return ImageId{};
     }
     constexpr ImageFlagBits excluded =
