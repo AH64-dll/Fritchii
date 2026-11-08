@@ -186,6 +186,14 @@ void GpuSplit::Stop() {
     previous_memory_write_position = 0;
     last_method_write_position = 0;
     previous_method_write_position = 0;
+    if (write_stamps) {
+        // The next session's positions start at 0 again.
+        std::fill_n(block_stamps.get(), BlockStamps, StampSlot{});
+        std::fill_n(page_stamps.get(), PageStamps, StampSlot{});
+    }
+    write_stamp_floor = 0;
+    unknown_write_position = 0;
+    write_stamp_tag = 0;
     ranged_writes.clear();
     last_function_position = 0;
     writes.Reset();
@@ -448,6 +456,9 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
     if (last_method_write_position == write_position) {
         last_method_write_position = previous_method_write_position;
     }
+    if (write_stamps) [[unlikely]] {
+        StampWrite(begin, end, true);
+    }
     static const bool forward = [] {
         const char* const value = std::getenv("EDEN_NX2_FORWARD_READS");
         return value == nullptr || value[0] != '0';
@@ -625,6 +636,77 @@ GpuSplit::GuestWriters GpuSplit::QueuedGuestWriters(u64 done, GPUVAddr address, 
     found.noted = (std::min)(found.noted, write_position);
     found.unbounded = (std::min)(found.unbounded, write_position);
     return found;
+}
+
+namespace {
+// Device and GPU addresses share the tables (a collision only makes a stamp newer).
+constexpr u64 GpuStampSalt = 0x9e3779b97f4a7c15ULL;
+size_t StampIndex(u64 key, size_t size) {
+    return static_cast<size_t>((key * 0xff51afd7ed558ccdULL) >> 40) & (size - 1);
+}
+} // Anonymous namespace
+
+void GpuSplit::EnableWriteStamps() {
+    if (write_stamps) {
+        return;
+    }
+    block_stamps = std::make_unique<StampSlot[]>(BlockStamps);
+    page_stamps = std::make_unique<StampSlot[]>(PageStamps);
+    // Writes sent so far were never stamped: they all count.
+    write_stamp_floor = write_position;
+    write_stamps = true;
+}
+
+void GpuSplit::StampWrite(u64 begin, u64 end, bool gpu_address) {
+    if (end <= begin) {
+        return;
+    }
+    if (end - begin > (u64{1} << 20)) {
+        write_stamp_floor = write_position;
+        return;
+    }
+    const u64 salt = gpu_address ? GpuStampSalt : 0;
+    const bool pages = end - begin > (u64{16} << 10);
+    const u32 shift = pages ? 12 : 8;
+    StampSlot* const table = pages ? page_stamps.get() : block_stamps.get();
+    const size_t size = pages ? PageStamps : BlockStamps;
+    for (u64 key = begin >> shift; key <= (end - 1) >> shift; ++key) {
+        StampSlot& slot = table[StampIndex(key ^ salt, size)];
+        if (slot.last_tag != write_stamp_tag || write_stamp_tag == 0) {
+            slot.before = (std::max)(slot.before, slot.last);
+            slot.last_tag = write_stamp_tag;
+        }
+        slot.last = write_position;
+    }
+}
+
+u64 GpuSplit::StampOf(u64 begin, u64 end, bool gpu_address, u64 skip_tag) const {
+    const u64 salt = gpu_address ? GpuStampSalt : 0;
+    const auto read = [skip_tag](const StampSlot& slot) {
+        return skip_tag != 0 && slot.last_tag == skip_tag ? slot.before : slot.last;
+    };
+    u64 stamp = 0;
+    for (u64 key = begin >> 8; key <= (end - 1) >> 8; ++key) {
+        stamp = (std::max)(stamp, read(block_stamps[StampIndex(key ^ salt, BlockStamps)]));
+    }
+    for (u64 key = begin >> 12; key <= (end - 1) >> 12; ++key) {
+        stamp = (std::max)(stamp, read(page_stamps[StampIndex(key ^ salt, PageStamps)]));
+    }
+    return stamp;
+}
+
+u64 GpuSplit::WriteStamp(u64 device, u64 size, GPUVAddr address, u64 skip_tag) const {
+    if (!write_stamps) {
+        return write_position;
+    }
+    u64 stamp = (std::max)({write_stamp_floor, unknown_write_position,
+                            last_unbounded_writer_position, last_unranged_position,
+                            last_function_position, last_method_write_position});
+    if (size != 0) {
+        stamp = (std::max)(stamp, StampOf(device, device + size, false, skip_tag));
+        stamp = (std::max)(stamp, StampOf(address, address + size, true, skip_tag));
+    }
+    return (std::min)(stamp, write_position);
 }
 
 bool GpuSplit::HasQueuedMemoryWriters(GPUVAddr begin, GPUVAddr end) {
@@ -864,6 +946,9 @@ GpuSplit::ReleaseNote GpuSplit::TryNoteWriterRange(const Tegra::MemoryManager& m
         WriterRange& last = writer_ranges[(writer_range_count - 1) % writer_ranges.size()];
         last.position = write_position;
         last.kind = kind;
+        if (write_stamps) [[unlikely]] {
+            StampWrite(last.begin, last.end, false);
+        }
         return ReleaseNote::Ranged;
     }
     writer_range_memory = nullptr;
@@ -886,6 +971,9 @@ GpuSplit::ReleaseNote GpuSplit::TryNoteWriterRange(const Tegra::MemoryManager& m
     }
     writer_ranges[writer_range_count++ % writer_ranges.size()] = {write_position, *device,
                                                                   *device + size, kind};
+    if (write_stamps) [[unlikely]] {
+        StampWrite(*device, *device + size, false);
+    }
     writer_range_memory = &memory;
     writer_range_address = address;
     writer_range_size = size;

@@ -84,12 +84,29 @@ enum class Kind : u8 {
     AtLeast,   ///< A QMD max release (bit 19): max(word, payload), at a fence
     Reduction, ///< ReduceSemaphore(op, is_signed, word, payload), at a fence
 };
+/// EXP13=2/3: where the QMD copy read the QMD a record's release came from (fable_answer_6 6f).
+enum class Source : u8 {
+    Other,             ///< Not from a QMD (copy, puller and report releases: the front's own)
+    InlineOverlay,     ///< The words a 0x107 sent
+    PatchedOverlay,    ///< The same, with inline uploads patched over them
+    OverlayFromMemory, ///< Guest memory with a small upload patched over it
+    Shadow,            ///< An upload shadow's block
+    Memory,            ///< Guest memory, nothing queued writing it
+    Waited,            ///< Guest memory after waiting for the work writing it
+    Count,
+};
 struct Record {
     Writer writer;
     Kind kind;
     u32 payload;
     u32 op;         ///< Reduction: ReduceSemaphore's op (0 add .. 7 xor)
     bool is_signed; ///< Reduction: the signed format (QMD release flags bit 24)
+    /// The QMD read it came from: the source, the back's position then, and the inline
+    /// overlay's and upload shadow block's positions (0 for none).
+    Source source;
+    u64 read_done;
+    u64 overlay_position;
+    u64 block_position;
 };
 /// Front, EXP13=2: a release sent at ring `position` (of the QMD at `qmd`, 0 for others) to the
 /// u32 at `device`, which held `before` in guest memory then.
@@ -129,7 +146,10 @@ void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing site);
 void SetRecordsValid(bool valid, u64 position);
 
 /// Back: the release just made by the entry at `entry_position`, of the QMD at `qmd`.
-void Verify(Writer writer, u64 device, u32 payload, u64 qmd, u64 entry_position, bool reduction);
+/// `slots`: the QMD's three release slots' flags and payload words as the back read them
+/// (words 25, 26, 29, 30, 53, 54; null for copies).
+void Verify(Writer writer, u64 device, u32 payload, u64 qmd, u64 entry_position, bool reduction,
+            const u32* slots = nullptr);
 
 /// Front: the payloads of predictions for `device` still queued (position > `consumed`), and
 /// whether any prediction for it is known at all.
