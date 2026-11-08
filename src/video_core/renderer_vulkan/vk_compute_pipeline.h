@@ -44,7 +44,8 @@ public:
                              Common::ThreadWorker* thread_worker,
                              PipelineStatistics* pipeline_statistics,
                              VideoCore::ShaderNotify* shader_notify, const Shader::Info& info,
-                             vk::ShaderModule spv_module, u64 shader_hash);
+                             vk::ShaderModule spv_module, u64 shader_hash,
+                             std::function<vk::ShaderModule()> make_module = {});
 
     ComputePipeline& operator=(ComputePipeline&&) noexcept = delete;
     ComputePipeline(ComputePipeline&&) noexcept = delete;
@@ -91,6 +92,19 @@ public:
     /// Advances the frame window of EDEN_NX2_UPSCALER_TRACE
     static void TickUpscalerTrace();
 
+    /// Made from a precompiled pipeline's kept info, its module from the kept SPIR-V
+    /// (EDEN_NX2_PRECOMPILED_FAST): a failed build is replaced by a translated pipeline.
+    void MarkPrecompiled() noexcept {
+        precompiled = true;
+    }
+    [[nodiscard]] bool IsPrecompiled() const noexcept {
+        return precompiled;
+    }
+    /// Whether the build ended without a pipeline (its module could not be made).
+    [[nodiscard]] bool BuildFailed() const noexcept {
+        return is_built.load(std::memory_order::acquire) && !pipeline;
+    }
+
     /// Whether no build of this pipeline is left queued on a worker thread, which holds it
     [[nodiscard]] bool IsBuildTaskDone() const noexcept {
         return build_task_done.load(std::memory_order::acquire);
@@ -123,6 +137,7 @@ private:
     vk::Pipeline pipeline;
 
     std::function<void()> build_task;
+    bool precompiled{};
     std::atomic_bool build_claimed{false};
     std::atomic_bool build_task_done{true};
     std::condition_variable build_condvar;

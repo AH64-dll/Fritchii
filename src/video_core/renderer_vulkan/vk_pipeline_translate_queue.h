@@ -29,6 +29,12 @@ struct TranslationRecord {
     /// pipeline's own modules are built from these same words: a program is emitted only once,
     /// because EmitSPIRV changes the IR it reads (CreateGraphicsPipeline).
     std::array<std::vector<u32>, 5> spirv;
+    /// With keep_infos (the precompiled preparation and its audit): each stage's Shader::Info,
+    /// serialized right after its SPIR-V (Shader::SerializeInfo), and whether the stages were
+    /// emitted for graphics pipeline libraries.
+    std::array<std::vector<u8>, 5> infos;
+    bool keep_infos{};
+    bool libraries{};
     bool complete{};       ///< The translation got as far as the SPIR-V of every stage
     bool translate_only{}; ///< Stop there: no shader modules, no pipeline
 };

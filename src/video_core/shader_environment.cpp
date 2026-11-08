@@ -41,6 +41,8 @@
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/textures/texture.h"
+#include "shader_recompiler/byte_addressed_image.h"
+#include "video_core/surface.h"
 
 namespace VideoCommon {
 
@@ -1546,6 +1548,119 @@ bool FileEnvironment::RecordFits(std::istream& file, u64 bytes_left) {
         body += counts[i] * UnitSizes[i];
     }
     return body <= left;
+}
+
+namespace {
+/// What translation uses of a pixel format (texture_pass.cpp): whether it is an integer format,
+/// R16_FLOAT and the byte-addressed 32-bit color formats (byte-addressed image stores), the snorm
+/// formats (texel fetch patching without snorm render buffers).
+u32 PixelFormatTraits(Shader::TexturePixelFormat format) {
+    using F = Shader::TexturePixelFormat;
+    const bool snorm = format == F::A8B8G8R8_SNORM || format == F::R8G8_SNORM ||
+                       format == F::R8_SNORM || format == F::R16G16B16A16_SNORM ||
+                       format == F::R16G16_SNORM || format == F::R16_SNORM;
+    return (VideoCore::Surface::IsPixelFormatInteger(
+                static_cast<VideoCore::Surface::PixelFormat>(format))
+                ? 1U
+                : 0U) |
+           (format == F::R16_FLOAT ? 2U : 0U) |
+           (Shader::IsByteAddressed32BitColorFormat(format) ? 4U : 0U) | (snorm ? 8U : 0U);
+}
+} // Anonymous namespace
+
+bool FileEnvironment::AnswersHoldFor(Shader::Environment& live, const char** why,
+                                     u32 format_traits) {
+    const auto fail = [why](const char* reason) {
+        if (why) {
+            *why = reason;
+        }
+        return false;
+    };
+    if (live.ShaderStage() != stage || live.StartAddress() != start_address ||
+        live.LocalMemorySize() != local_memory_size || live.IsNativeProgram() != IsNativeProgram()) {
+        return fail("program");
+    }
+    // Fritchii: the bound texture buffer is the constant buffer bindless handles are read from
+    // (texture_pass), and compute programs take their workgroup and shared memory sizes from the
+    // environment; #896 leaves them to the key.
+    if (live.TextureBoundBuffer() != texture_bound) {
+        return fail("bound texture buffer");
+    }
+    if (stage == Shader::Stage::Compute &&
+        (live.WorkgroupSize() != workgroup_size || live.SharedMemorySize() != shared_memory_size)) {
+        return fail("workgroup");
+    }
+    // Only a vertex program asks (PositionPass).
+    if (stage == Shader::Stage::VertexB &&
+        live.ReadViewportTransformState() != viewport_transform_state) {
+        return fail("viewport transform");
+    }
+    // HLE replacements are asked for every constant buffer read when there are any.
+    if (live.HasHLEMacroState() || HasHLEMacroState()) {
+        return fail("HLE constant replacements");
+    }
+    const auto is_pointer_word = [&](u64 key) {
+        const u32 index = static_cast<u32>(key >> 32);
+        const u32 offset = static_cast<u32>(key);
+        return storage_pointer_types.contains(MakeCbufKey(index, offset)) ||
+               (offset >= 4 && storage_pointer_types.contains(MakeCbufKey(index, offset - 4)));
+    };
+    std::vector<u32> handles_read;
+    for (const auto& [key, value] : cbuf_values) {
+        const u32 index = static_cast<u32>(key >> 32);
+        const u32 offset = static_cast<u32>(key);
+        const u32 live_value = live.ReadCbufValue(index, offset);
+        const auto type = texture_types.find(value);
+        const auto format = texture_pixel_formats.find(value);
+        if (type != texture_types.end() || format != texture_pixel_formats.end()) {
+            // A texture handle. Asked of `live` even when it is the same value, so `live` holds
+            // the answers its translation would have asked for (it is what the disk cache keeps).
+            if (type != texture_types.end() && live.ReadTextureType(live_value) != type->second) {
+                return fail("texture type");
+            }
+            if (format != texture_pixel_formats.end() &&
+                ((PixelFormatTraits(live.ReadTexturePixelFormat(live_value)) ^
+                  PixelFormatTraits(format->second)) &
+                 format_traits) != 0) {
+                return fail("texture pixel format");
+            }
+            handles_read.push_back(value);
+            continue;
+        }
+        if (live_value != value && !is_pointer_word(key)) {
+            return fail("constant buffer value");
+        }
+    }
+    const auto read_from_cbuf = [&](u32 handle) {
+        return std::ranges::find(handles_read, handle) != handles_read.end();
+    };
+    // Handles not read from a constant buffer (or built from several words): asked as they are.
+    for (const auto& [handle, type] : texture_types) {
+        if (!read_from_cbuf(handle) && live.ReadTextureType(handle) != type) {
+            return fail("texture type");
+        }
+    }
+    for (const auto& [handle, format] : texture_pixel_formats) {
+        if (!read_from_cbuf(handle) &&
+            ((PixelFormatTraits(live.ReadTexturePixelFormat(handle)) ^ PixelFormatTraits(format)) &
+             format_traits) != 0) {
+            return fail("texture pixel format");
+        }
+    }
+    for (const auto& [key, mapped] : storage_pointer_types) {
+        // The keys of MakeCbufKey and MakeIndirectCbufKey.
+        const bool indirect = (key >> 63) != 0;
+        const u32 index = static_cast<u32>(key >> 32) & (indirect ? 0xffU : 0xffffffffU);
+        const u32 offset = static_cast<u32>(key);
+        const bool live_mapped =
+            indirect ? live.IsCbufIndirectStorageBufferPointer(
+                           index, offset, static_cast<u32>((key >> 40) & 0x3fffff))
+                     : live.IsCbufStorageBufferPointer(index, offset);
+        if (live_mapped != (mapped != 0)) {
+            return fail("storage buffer pointer");
+        }
+    }
+    return true;
 }
 
 void FileEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {

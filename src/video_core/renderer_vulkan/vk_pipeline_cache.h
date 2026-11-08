@@ -99,6 +99,11 @@ class TranslateQueue;
 struct TranslationJob;
 struct TranslationRecord;
 
+namespace PrecompiledKept {
+class Index;
+struct Record;
+} // namespace PrecompiledKept
+
 using VideoCommon::ShaderInfo;
 
 struct ShaderPools {
@@ -286,6 +291,55 @@ private:
         std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr,
         bool libraries_only = false, TranslationRecord* record = nullptr);
 
+    /// EDEN_NX2_PRECOMPILED_FAST (zortos293/Lichii#896): the current key's pipeline from the
+    /// shader infos and SPIR-V the precompiled preparation kept, when the key is precompiled and
+    /// the game's state answers the recorded environments' questions as they were answered
+    /// (FileEnvironment::AnswersHoldFor): created on the GPU thread without translating, built on
+    /// a worker from the kept SPIR-V, stored in the disk cache like a translated one. Null when
+    /// the key is not precompiled or a check differs: the draw takes the normal path then.
+    std::unique_ptr<GraphicsPipeline> CreatePrecompiledGraphicsPipeline();
+    /// The compute counterpart: the first of the key's records (one per storage pointer state it
+    /// was prepared in) whose answers hold for `env`. An entry without a pipeline otherwise.
+    ComputePipelineCacheEntry CreatePrecompiledComputePipeline(const ComputePipelineCacheKey& key,
+                                                               Shader::Environment& env);
+    /// TickFrame: precompiled graphics pipelines whose build failed are dropped (their keys
+    /// rejected), so their next draw translates them.
+    void CheckPrecompiledBuilds();
+    /// TickFrame: the fast path's counts of the last 10 s.
+    void ReportPrecompiled();
+    /// Publishes the kept file's index for the GPU thread (`kept`, or a finished `part` the
+    /// preparation could not rename over it); false when there is none for `stamp`.
+    bool LoadKept(const std::filesystem::path& kept, const std::filesystem::path& part,
+                  const std::filesystem::path& precompiled, const std::string& stamp);
+    [[nodiscard]] std::shared_ptr<const PrecompiledKept::Index> KeptIndex() const;
+    /// What a kept file must have been written for, beyond the prepared stamp: this exe, the
+    /// settings and switches translation reads.
+    [[nodiscard]] std::string KeptStamp(const std::string& prepared_stamp) const;
+
+    /// Set by LoadKept; read by the GPU thread when a new key is looked up.
+    mutable std::mutex kept_mutex;
+    std::shared_ptr<const PrecompiledKept::Index> kept_index;
+    std::atomic<bool> kept_available{};
+    /// GPU thread: keys whose precompiled build failed or whose audit differed.
+    std::unordered_set<u64> precompiled_rejected;
+    /// GPU thread: precompiled graphics pipelines not built yet (checked by TickFrame).
+    std::vector<GraphicsPipelineCacheKey> precompiled_pending;
+    /// GPU thread counts for the 10 s line (the worker builds count in an atomic).
+    struct PrecompiledStats {
+        u32 graphics{};
+        u32 compute{};
+        u32 failed{};
+        u32 not_precompiled{};
+        u32 audited{};
+        u32 audit_differ{};
+        std::chrono::steady_clock::duration gpu_time{};
+        std::chrono::steady_clock::duration gpu_worst{};
+        std::vector<std::pair<const char*, u32>> misses; ///< By reason (string literals)
+        u64 bytes_at_window{};
+        std::chrono::steady_clock::time_point window{};
+    } precompiled_stats;
+    void NotePrecompiledMiss(const char* reason);
+
     /// Builds a disk-cached graphics pipeline from the first of its records (newest first) that
     /// loads. When none does, the GPU thread's build of it is stored again.
     std::unique_ptr<GraphicsPipeline> CreateCachedGraphicsPipeline(
@@ -301,11 +355,20 @@ private:
                                                     const ShaderInfo* shader,
                                                     std::span<const u64> keep_pointers = {});
 
+    /// A compute translation's SPIR-V and serialized info (the precompiled preparation keeps
+    /// them; its audit compares them). With translate_only no pipeline is made.
+    struct ComputeKeep {
+        std::vector<u32> spirv;
+        std::vector<u8> info;
+        bool translate_only{};
+    };
+
     ComputePipelineCacheEntry CreateComputePipeline(ShaderPools& pools,
                                                      const ComputePipelineCacheKey& key,
                                                      Shader::Environment& env,
                                                      PipelineStatistics* statistics,
-                                                     bool build_in_parallel, bool warm = false);
+                                                     bool build_in_parallel, bool warm = false,
+                                                     ComputeKeep* keep = nullptr);
 
     void SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                       const vk::PipelineCache& pipeline_cache, u32 cache_version);
@@ -410,6 +473,9 @@ private:
     u64 visual_workaround_title{};
     const size_t num_pipeline_workers;
     EmissionBudget emission_budget;
+
+    /// EDEN_NX2_CANONICAL_KEYS=1, read by LoadDiskResources (draws look up canonical keys).
+    bool canonical_keys{};
 
     GraphicsPipelineCacheKey graphics_key{};
     u64 vertex_attribute_types{}; ///< graphics_key's attribute types before the programs' mask
