@@ -160,6 +160,9 @@ private:
     std::deque<Frame> history;
     u64 checked{};
     u64 flashes{};
+    /// Frames brighter than both neighbours in a presented tile (flicker, every other frame).
+    u64 alternating{};
+    u64 alternating_window{};
     u32 reports{};
 
     std::thread worker;

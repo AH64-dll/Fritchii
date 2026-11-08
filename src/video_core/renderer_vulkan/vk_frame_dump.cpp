@@ -250,6 +250,9 @@ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
     start = std::chrono::steady_clock::now();
     const char* const at = std::getenv("EDEN_NX2_FRAME_DUMP_AT");
     const std::string_view value = at ? at : "60";
+    if (const char* const pair_value = std::getenv("EDEN_NX2_FRAME_DUMP_PAIR")) {
+        pair = *pair_value != '\0' && *pair_value != '0';
+    }
     if (value == "file") {
         // Captures once <dir>/capture.now exists, so a frame can be picked while playing.
         trigger_file = directory / "capture.now";
@@ -512,6 +515,23 @@ bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
             continue;
         }
         recorded |= RecordBuffer(buffer.host, buffer.host_offset, buffer.size, std::move(tags));
+    }
+    for (const BoundBuffer& buffer : buffers) {
+        if (!buffer.also_host || buffer.host == VK_NULL_HANDLE) {
+            continue;
+        }
+        const size_t program = compute ? 0 : buffer.stage + 1;
+        const u64 shader = program < shader_hashes.size() ? shader_hashes[program] : 0;
+        const std::string owner =
+            compute ? fmt::format(R"("dispatch":{},"after_draws":{})", dispatches, draws)
+                    : fmt::format(R"("pass":{},"draw":{})", pass_index, draws - 1);
+        recorded |= RecordBuffer(
+            buffer.host, buffer.host_offset, buffer.size,
+            fmt::format(
+                R"("kind":"buffer",{},"stage":{},"shader":"{:016x}","type":"{}","index":{},"written":{},"gpu_addr":"{:#x}","device_addr":"{:#x}","bound_size":{},"size":{},"gpu_modified":{},"source":"host_copy")",
+                owner, buffer.stage, shader, buffer.storage ? "storage" : "uniform", buffer.index,
+                buffer.written, buffer.gpu_addr, buffer.device_addr, buffer.bound_size, buffer.size,
+                buffer.gpu_modified));
     }
     return recorded;
 }
@@ -963,13 +983,17 @@ void FrameDump::TickFrame() {
             done = true;
         } else {
             Rearm();
+            // The pair's second capture starts right away, so it records the next frame.
+            pair_next = pair && !std::exchange(pair_next, false);
         }
-        return;
+        if (!pair_next) {
+            return;
+        }
     }
     const double elapsed =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     std::error_code error;
-    if (frame < trigger_frame && elapsed < trigger_seconds &&
+    if (frame < trigger_frame && elapsed < trigger_seconds && !pair_next &&
         (trigger_file.empty() || frame % 30 != 0 ||
          !std::filesystem::exists(trigger_file, error))) {
         return;

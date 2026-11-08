@@ -612,6 +612,37 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         for (const auto& desc : info.texture_descriptors) {
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{read_handle(desc, index)};
+                // EDEN_NX2_HANDLE_TRACE=<shader hash>: each new handle of that shader's textures.
+                static const u64 trace_hash{[] {
+                    const char* const value{std::getenv("EDEN_NX2_HANDLE_TRACE")};
+                    return value ? std::strtoull(value, nullptr, 16) : u64{0};
+                }()};
+                if (trace_hash != 0 && key.unique_hashes[stage + 1] == trace_hash) {
+                    static std::set<std::tuple<size_t, u32, u32>> traced;
+                    const size_t slot = static_cast<size_t>(&desc - info.texture_descriptors.data());
+                    if (traced.size() < 512 && traced.emplace(slot, index, handle.first).second) {
+                        std::string program;
+                        if (desc.handle_program != ~0U &&
+                            desc.handle_program < info.handle_programs.size()) {
+                            for (const u32 word : info.handle_programs[desc.handle_program]) {
+                                program += fmt::format(" {:x}", word);
+                            }
+                        }
+                        LOG_INFO(Render_Vulkan,
+                                 "Handle trace {:016x} stage {} texture {}[{}]: cbuf {} offset {:#x} "
+                                 "shift {} secondary {} ({} {:#x} shift {}) size_shift {} program {}:{} "
+                                 "-> tic {} tsc {} (c{}[{:#x}] = {:#x})",
+                                 trace_hash, stage, slot, index, desc.cbuf_index, desc.cbuf_offset,
+                                 desc.shift_left, desc.has_secondary, desc.secondary_cbuf_index,
+                                 desc.secondary_cbuf_offset, desc.secondary_shift_left,
+                                 desc.size_shift, desc.handle_program, program, handle.first,
+                                 handle.second, desc.cbuf_index, desc.cbuf_offset,
+                                 desc.cbuf_index < cbufs.size() && cbufs[desc.cbuf_index].enabled
+                                     ? gpu_memory->ReadHandleWord(
+                                           cbufs[desc.cbuf_index].address + desc.cbuf_offset)
+                                     : 0U);
+                    }
+                }
                 views.push_back({handle.first});
 
                 VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};

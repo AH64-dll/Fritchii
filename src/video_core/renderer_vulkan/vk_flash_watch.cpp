@@ -40,6 +40,7 @@ constexpr u32 MAX_PASS_SHADERS = 32;
 constexpr size_t WINDOW = 5;
 constexpr size_t CENTER = 2;
 constexpr u64 STATUS_FRAMES = 3600;
+constexpr u64 ALTERNATION_FRAMES = 300;
 
 struct PushConstants {
     std::array<u32, 2> size;
@@ -714,6 +715,44 @@ void FlashWatch::Analyze() {
     };
     std::vector<Flagged> flagged;
     const Output* trigger = nullptr;
+    // A flicker that alternates every other frame is flagged once, at its start: count each
+    // frame brighter than both neighbours too, logged every ALTERNATION_FRAMES.
+    bool alternates = false;
+    for (const Output& output : now.outputs) {
+        if (output.kind != Kind::Present || alternates) {
+            continue;
+        }
+        const auto found = matches(output);
+        if (!found[CENTER - 1] || !found[CENTER + 1]) {
+            continue;
+        }
+        u32 tiles = 0;
+        for (u32 y = 0; y < output.grid_y && !alternates; ++y) {
+            for (u32 x = 0; x < output.grid_x; ++x) {
+                std::array<double, 3> mean{};
+                for (size_t f = 0; f < 3; ++f) {
+                    Stats stats;
+                    Add(stats, *found[CENTER - 1 + f], history[CENTER - 1 + f].tiles, x, y);
+                    mean[f] = stats.Mean();
+                }
+                const double neighbours = std::max(mean[0], mean[2]);
+                if (mean[1] - neighbours >= 0.5 * delta && mean[1] >= 1.2 * neighbours &&
+                    ++tiles >= 2) {
+                    alternates = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (alternates) {
+        ++alternating;
+        ++alternating_window;
+    }
+    if (now.frame % ALTERNATION_FRAMES == 0) {
+        LOG_INFO(Render_Vulkan, "Flash watch: frame {}: {} alternating frames in the last {}, {} in all",
+                 now.frame, alternating_window, ALTERNATION_FRAMES, alternating);
+        alternating_window = 0;
+    }
     for (const Output& output : now.outputs) {
         if (output.kind != Kind::Present) {
             continue;

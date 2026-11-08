@@ -2666,6 +2666,10 @@ bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shade
             buffer.guest.resize(size);
             device_memory.ReadBlockUnsafe(binding.device_addr, buffer.guest.data(), size);
         }
+        // EDEN_NX2_FRAME_DUMP_HOST: the host copy of guest-sourced ranges read from the buffer
+        // cache (storage, and uniforms too large for the stream path), to find stale uploads.
+        static const bool host_too = std::getenv("EDEN_NX2_FRAME_DUMP_HOST") != nullptr;
+        buffer.also_host = host_too && host && !gpu_modified && (storage || bound_size > 4096);
     });
     return frame_dump.NoteBuffers(compute, shader_hashes, buffers);
 }
