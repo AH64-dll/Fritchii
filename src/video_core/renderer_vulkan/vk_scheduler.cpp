@@ -23,6 +23,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/dkb_cpu_trace.h"
+#include "common/nx2_timeline.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_perf.h"
@@ -283,6 +284,9 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
 void Scheduler::WaitWorker() {
     DispatchWork();
 
+    // Waits for the Vulkan worker (tools/nx2/critical_path.py's table): the queue, then the
+    // chunk it is running.
+    Common::Nx2Timeline::Span timeline_span{"wait for Vulkan worker"};
     // Ensure the queue is drained.
     {
         std::unique_lock ql{queue_mutex};
@@ -549,10 +553,13 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             std::unique_lock lk{queue_mutex};
 
             // Wait for work.
-            event_cv.wait(lk, stop_token, [&] {
-                worker_waiting = !TryPopQueue(work);
-                return !worker_waiting;
-            });
+            {
+                Common::Nx2Timeline::Span wait_span{"worker: wait for work"};
+                event_cv.wait(lk, stop_token, [&] {
+                    worker_waiting = !TryPopQueue(work);
+                    return !worker_waiting;
+                });
+            }
             worker_waiting = false;
 
             // If we've been asked to stop, we're done.
@@ -813,6 +820,10 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     InvalidateState();
 
     const u64 signal_value = master_semaphore->NextTick();
+    // The recording thread's hand-off of this tick to the worker (and the GPU).
+    if (Common::Nx2Timeline::Active()) {
+        Common::Nx2Timeline::Instant("submit", {"tick", signal_value});
+    }
     RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
@@ -844,6 +855,10 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         }
 
         std::scoped_lock lock{submit_mutex};
+        // Lines up with DkbFrameTrace's begin stamp and the driver's queue packets.
+        if (Common::Nx2Timeline::Active()) {
+            Common::Nx2Timeline::Instant("vkQueueSubmit", {"tick", signal_value});
+        }
         switch (const VkResult result = master_semaphore->SubmitQueue(
                     cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
         case VK_SUCCESS:

@@ -9,6 +9,7 @@
 
 #include "common/assert.h"
 #include "common/dkb_cpu_trace.h"
+#include "common/nx2_timeline.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -111,8 +112,26 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 // in order, and so does the signal that the command ran.
                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
                 if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
-                    Profile::Scope scope{Profile::Zone::Push};
-                    scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
+                    const bool timeline = Common::Nx2Timeline::Active();
+                    if (timeline) {
+                        // The list's sequence number (PushCommand's "submit list") on each
+                        // stage: here, and from a one-entry marker where the back reaches it.
+                        Common::Nx2Timeline::Instant("front: list begin", {"seq", next.fence},
+                                                     {"channel", submit_list->channel});
+                        split.Defer(
+                            [seq = next.fence] {
+                                Common::Nx2Timeline::Instant("back: list", {"seq", seq});
+                            },
+                            VideoCommon::GpuSplit::Effect::None);
+                    }
+                    {
+                        Profile::Scope scope{Profile::Zone::Push};
+                        scheduler.Push(system.GPU(), submit_list->channel,
+                                       std::move(submit_list->entries));
+                    }
+                    if (timeline) {
+                        Common::Nx2Timeline::Instant("front: list end", {"seq", next.fence});
+                    }
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
                     split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
                 } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
@@ -144,8 +163,19 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 continue;
             }
             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
-                Profile::Scope scope{Profile::Zone::Push};
-                scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
+                const bool timeline = Common::Nx2Timeline::Active();
+                if (timeline) {
+                    Common::Nx2Timeline::Instant("front: list begin", {"seq", next.fence},
+                                                 {"channel", submit_list->channel});
+                }
+                {
+                    Profile::Scope scope{Profile::Zone::Push};
+                    scheduler.Push(system.GPU(), submit_list->channel,
+                                   std::move(submit_list->entries));
+                }
+                if (timeline) {
+                    Common::Nx2Timeline::Instant("front: list end", {"seq", next.fence});
+                }
             } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
                 Profile::Scope scope{Profile::Zone::Tick};
                 system.GPU().TickWork();
@@ -211,9 +241,22 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
 
     std::unique_lock lk(state.write_lock);
     const u64 fence{++state.last_fence};
+    if (Common::Nx2Timeline::Active()) {
+        // The command's sequence number, which the GPU threads' list markers repeat
+        // (tools/nx2/critical_path.py follows a list through the stages with it). This is also
+        // what wakes the front from "idle".
+        if (const auto* list = std::get_if<SubmitListCommand>(&command_data)) {
+            Common::Nx2Timeline::Instant("submit list", {"seq", fence}, {"channel", list->channel},
+                                         {"entries", list->entries.command_lists.size()});
+        } else {
+            Common::Nx2Timeline::Instant("submit command", {"seq", fence});
+        }
+    }
     state.queue.EmplaceWait(std::move(command_data), fence, block);
 
     if (block) {
+        // With the split, SignalCommand runs on the back.
+        Common::Nx2Timeline::ArgSpan timeline_span{"guest: wait for GPU command", {"seq", fence}};
         state.cv.wait(lk, thread.get_stop_token(), [this, fence] {
             return fence <= state.signaled_fence.load(std::memory_order_relaxed);
         });

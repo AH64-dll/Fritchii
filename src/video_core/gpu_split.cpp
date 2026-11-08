@@ -19,6 +19,7 @@
 
 #include "common/dkb_cpu_trace.h"
 #include "common/logging.h"
+#include "common/nx2_timeline.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -322,7 +323,10 @@ void GpuSplit::Drain(DrainSite site) {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
-    Common::Nx2Timeline::Span timeline_span{drain_site_names[static_cast<size_t>(site)]};
+    // "behind": the ring words the back had left to run, which tells a slow back from a front
+    // far ahead (tools/nx2/critical_path.py).
+    Common::Nx2Timeline::ArgSpan timeline_span{drain_site_names[static_cast<size_t>(site)],
+                                               {"behind", write_position - consumed_cache}};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
@@ -801,7 +805,8 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
         return false;
     }
     Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
-    Common::Nx2Timeline::Span timeline_span{drain_site_names[static_cast<size_t>(site)]};
+    Common::Nx2Timeline::ArgSpan timeline_span{drain_site_names[static_cast<size_t>(site)],
+                                               {"behind", target - consumed_cache}};
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
@@ -1257,7 +1262,12 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         Nx2Profile::Report("GPU back thread");
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
-            Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
+            // On the timeline (not through the zone) with the phase the wait reached: 0 = spin,
+            // 1 = the idle hook ran, 2 = slept on `wake` (tools/nx2/critical_path.py).
+            Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait, Nx2Profile::Enabled(), false};
+            Common::Nx2Timeline::ArgSpan timeline_span{
+                Nx2Profile::zone_names[static_cast<size_t>(Nx2Profile::Zone::SplitWait)],
+                {"phase", 0}};
             // EXP27 & 2: the front publishes each entry while this is set.
             back_idle.store(true, std::memory_order_relaxed);
             // The front usually sends more within microseconds: spin briefly before sleeping.
@@ -1270,6 +1280,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if (available == read_position && idle_hook != nullptr) {
                 hook_requested.store(false, std::memory_order_seq_cst);
                 ForgetFencesQuiet();
+                timeline_span.Set(0, {"phase", 1});
                 idle_hook(idle_argument);
                 available = published.load(std::memory_order_acquire);
                 if (available == read_position) {
@@ -1285,6 +1296,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // A request made after the hook ran (RequestIdleHook) runs it before sleeping.
                 if (available == read_position && !stop_token.stop_requested() &&
                     !hook_requested.load(std::memory_order_seq_cst)) {
+                    timeline_span.Set(0, {"phase", 2});
                     wake.wait(seen, std::memory_order_seq_cst);
                 }
                 back_waiting.store(false, std::memory_order_relaxed);

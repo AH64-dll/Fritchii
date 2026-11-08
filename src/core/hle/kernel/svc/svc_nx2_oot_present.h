@@ -18,4 +18,9 @@ namespace Kernel::Svc {
 /// min(ns, 1 ms), and true is returned. Returns false (and does nothing) for any other sleep.
 bool SleepNx2OotPresentPoll(Core::System& system, s64 ns);
 
+/// Whether this sleep is that poll's, whatever EXP24 is: the timeline marks those sleeps
+/// ("OoT: present poll sleep", a timer wait). Reads the caller's frames: call it only while a
+/// timeline records.
+bool IsNx2OotPresentPollSleep(Core::System& system, s64 ns);
+
 } // namespace Kernel::Svc

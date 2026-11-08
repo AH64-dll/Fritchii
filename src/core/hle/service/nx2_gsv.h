@@ -1737,9 +1737,11 @@ private:
     // at once (changes.patch's default mask is 0x7fff).
     void PresentClientBuffer(HLERequestContext& ctx) {
         Common::Nx2Timeline::OnPresent();
-        Common::Nx2Timeline::Span timeline_span{"guest present"};
+        // The frame boundary of tools/nx2/critical_path.py; "frame" is this present's number.
+        Common::Nx2Timeline::ArgSpan timeline_span{"guest present"};
         const auto* w = ctx.CommandBuffer();
         ++m_presents;
+        timeline_span.Set(0, {"frame", m_presents});
         if (Common::DkbFrameTrace::Enabled()) {
             m_vsync->trace_present.store(m_presents, std::memory_order_relaxed);
         }
@@ -2071,7 +2073,9 @@ private:
     /// GPU channel was seen suspended on a semaphore (it may be one this thread releases later).
     /// Returns whether the fence was reached.
     bool WaitForFrame(u32 fence_id, u32 fence_value, bool unless_gpu_waits = false) {
-        Common::Nx2Timeline::Span timeline_span{"present: wait for frame fence"};
+        // Ended by the guest syncpoint increment ("syncpoint: guest increment", on the back).
+        Common::Nx2Timeline::ArgSpan timeline_span{"present: wait for frame fence",
+                                                   {"syncpoint", fence_id}, {"value", fence_value}};
         if (fence_id >= 192) {
             return true;
         }

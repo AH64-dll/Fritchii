@@ -22,6 +22,7 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/nx2_timeline.h"
 #include "common/settings.h"
 #include "video_core/nx2_debug_control.h"
 #include "common/thread.h"
@@ -358,9 +359,13 @@ private:
                 std::unique_lock lock(guard);
                 // Work the GPU thread runs inline (FoldStubbedFence) goes before any fence
                 // queued meanwhile.
-                cv.wait(lock, [&] {
-                    return stop_token.stop_requested() || (!fences.empty() && !inline_running);
-                });
+                {
+                    // Fences come from SignalFence (the split's back).
+                    Common::Nx2Timeline::Span wait_span{"fence: wait for work"};
+                    cv.wait(lock, [&] {
+                        return stop_token.stop_requested() || (!fences.empty() && !inline_running);
+                    });
+                }
                 if (stop_token.stop_requested()) [[unlikely]] {
                     return;
                 }
@@ -368,8 +373,13 @@ private:
                 fence_thread_busy = true;
             }
             if (!batch.front().fence->IsStubbed()) {
+                // The host GPU reaching the fence's submission.
+                Common::Nx2Timeline::Span wait_span{"fence: wait for fence"};
                 WaitFence(batch.front().fence);
             }
+            // The batch's landings, waiter latches and operations (host syncpoint increments,
+            // which signal the guest's GPU events): the host GPU -> guest hand-off.
+            Common::Nx2Timeline::ArgSpan release_span{"fence: release"};
             {
                 std::unique_lock lock(guard);
                 while (batch.size() < MaxBatch && !fences.empty() &&
@@ -377,6 +387,7 @@ private:
                     take_front();
                 }
             }
+            release_span.Set(0, {"fences", batch.size()});
             size_t texture_pops = 0;
             size_t buffer_pops = 0;
             for (const Released& released : batch) {
