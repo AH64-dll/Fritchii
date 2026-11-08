@@ -87,6 +87,16 @@ inline std::atomic<int> g_dma_snapshot{-1};
 /// measure how long each frame was shown.
 inline std::atomic<int> g_host_pace{-1};
 
+/// EDEN_NX2_ARB_SPIN (zortos293/Lichii#641; off by default here, #641 uses 8): microseconds a
+/// guest thread about to sleep in WaitForAddress first watches the word (KAddressArbiter), 0 =
+/// off. Live: read on every wait, so profile_toggle.py can A/B it in one session.
+inline std::atomic<int> g_arb_spin{-1};
+/// EDEN_NX2_IDLE_PAUSE=1 (zortos293/Lichii#641; off by default here, on in #641): the guest
+/// core's idle poll (PhysicalCore::Idle, EDEN_NX2_IDLE_SPIN_US) runs PAUSE and reads the clock
+/// every 16 pauses, instead of a SwitchToThread and a clock read per iteration. Live: read on
+/// every Idle.
+inline std::atomic<int> g_idle_pause{-1};
+
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
 /// (E:\OotRemakeEmulation\work\EXPERIMENTS.md lists which fix uses which slot). 0 = off.
@@ -199,6 +209,12 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_HOST_PACE") {
         return &g_host_pace;
+    }
+    if (name == "EDEN_NX2_ARB_SPIN") {
+        return &g_arb_spin;
+    }
+    if (name == "EDEN_NX2_IDLE_PAUSE") {
+        return &g_idle_pause;
     }
     return nullptr;
 }

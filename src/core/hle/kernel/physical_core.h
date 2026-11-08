@@ -13,6 +13,7 @@
 #include <mutex>
 
 #include "core/arm/arm_interface.h"
+#include "core/hle/kernel/k_spin_lock.h"
 
 namespace Kernel {
 class KernelCore;
@@ -67,8 +68,15 @@ public:
     }
 
 private:
+    class ScopedGuard;
+
     const std::size_t m_core_index;
+    // EDEN_NX2_CORE_LOCK (boot switch, physical_core.cpp): m_fast_guard replaces m_guard, and
+    // Idle sleeps on m_is_interrupted with an address wait instead of m_on_interrupt. Fixed for
+    // the core's lifetime, so the two locks are never mixed.
+    const bool m_core_lock;
     std::mutex m_guard;
+    KSpinLock m_fast_guard;
     std::condition_variable m_on_interrupt;
     Core::ArmInterface* m_arm_interface{};
     KThread* m_current_thread{};
