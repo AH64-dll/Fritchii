@@ -27,8 +27,9 @@ std::filesystem::path GraphicsWarmPath(u64 title_id);
 
 /// "Already warmed" marker of a warm file (same folder, extension .done: warm-compute.done),
 /// written by the emulator after a warm-up ran to the end. It holds the warm file's size and
-/// last-write time, its entry count, the GPU driver version and device ID and the pipeline
-/// cache version; a matching marker skips that warm-up at boot.
+/// last-write time, its entry count, the GPU driver version and device ID, the pipeline
+/// cache version and the settings that change the emitted SPIR-V (vk_pipeline_cache.cpp
+/// SpirvSettingsStamp); a matching marker skips that warm-up at boot.
 std::filesystem::path WarmMarkerPath(const std::filesystem::path& warm_file);
 
 /// "In progress" marker of a warm file (same folder, `.running` appended:

@@ -1747,8 +1747,8 @@ size_t WarmThreads() {
 }
 
 /// The "already warmed" marker: warm file size and last-write time, entry count, GPU driver
-/// version and device ID, pipeline cache version. Next to the warm file, or in the title's
-/// shader folder when that folder is not writable.
+/// version and device ID, pipeline cache version and the SPIR-V settings below. Next to the warm
+/// file, or in the title's shader folder when that folder is not writable.
 struct WarmStamp {
     u64 size{};
     s64 write_time{};
@@ -1756,7 +1756,24 @@ struct WarmStamp {
     u32 driver{};
     u32 device_id{};
     u32 cache_version{};
+    u64 spirv_settings{};
 };
+
+/// The settings that change the SPIR-V the warm-up emits (so the driver cache entries it made),
+/// packed: resolution scaling (the rescaling pass bakes its factors in), shader loop safety
+/// checks, the bloom fix and renderer debug. GPU accuracy is not here: no shader emission reads
+/// it. Markers written before this field no longer match, so those warm-ups run once more.
+u64 SpirvSettingsStamp() {
+    const auto& resolution = Settings::values.resolution_info;
+    u64 bits = static_cast<u64>(resolution.up_scale & 0xFF);
+    bits |= static_cast<u64>(resolution.down_shift & 0xFF) << 8;
+    bits |= static_cast<u64>(resolution.active ? 1 : 0) << 16;
+    bits |= static_cast<u64>(Settings::values.disable_shader_loop_safety_checks.GetValue() ? 1 : 0)
+            << 17;
+    bits |= static_cast<u64>(Settings::values.fix_bloom_effects.GetValue() ? 1 : 0) << 18;
+    bits |= static_cast<u64>(Settings::values.renderer_debug.GetValue() ? 1 : 0) << 19;
+    return bits;
+}
 
 std::optional<WarmStamp> CurrentStamp(const std::filesystem::path& file, const Device& device,
                                       u64 entries) {
@@ -1769,8 +1786,13 @@ std::optional<WarmStamp> CurrentStamp(const std::filesystem::path& file, const D
     if (ec) {
         return std::nullopt;
     }
-    return WarmStamp{size, static_cast<s64>(time.time_since_epoch().count()), entries,
-                     device.GetDriverVersion(), device.GetDeviceID(), CACHE_VERSION};
+    return WarmStamp{size,
+                     static_cast<s64>(time.time_since_epoch().count()),
+                     entries,
+                     device.GetDriverVersion(),
+                     device.GetDeviceID(),
+                     CACHE_VERSION,
+                     SpirvSettingsStamp()};
 }
 
 std::array<std::filesystem::path, 2> MarkerPaths(const std::filesystem::path& file,
@@ -1785,12 +1807,13 @@ bool StampMatches(const std::filesystem::path& marker, const WarmStamp& stamp) {
     std::ifstream in(marker);
     WarmStamp saved;
     if (!(in >> saved.size >> saved.write_time >> saved.entries >> saved.driver >>
-          saved.device_id >> saved.cache_version)) {
+          saved.device_id >> saved.cache_version >> saved.spirv_settings)) {
         return false;
     }
     return saved.size == stamp.size && saved.write_time == stamp.write_time &&
            saved.driver == stamp.driver && saved.device_id == stamp.device_id &&
-           saved.cache_version == stamp.cache_version;
+           saved.cache_version == stamp.cache_version &&
+           saved.spirv_settings == stamp.spirv_settings;
 }
 
 /// Writes `stamp` to `marker`; false when it could not be written.
@@ -1799,7 +1822,8 @@ bool WriteStamp(const std::filesystem::path& marker, const WarmStamp& stamp) {
     std::filesystem::create_directories(marker.parent_path(), ec);
     std::ofstream out(marker, std::ios::trunc);
     out << stamp.size << ' ' << stamp.write_time << ' ' << stamp.entries << ' ' << stamp.driver
-        << ' ' << stamp.device_id << ' ' << stamp.cache_version << '\n';
+        << ' ' << stamp.device_id << ' ' << stamp.cache_version << ' ' << stamp.spirv_settings
+        << '\n';
     out.close();
     return static_cast<bool>(out);
 }
