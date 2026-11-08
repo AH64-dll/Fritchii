@@ -108,6 +108,20 @@ struct FrontQmdMirror {
     /// The newest position of an inline QMD overlay replaced by another QMD's: reads of a QMD
     /// without an overlay wait for it while it is queued.
     u64 evicted{};
+    /// Where the copy last read each QMD, for the unpredicted lines (6g/6h discriminators).
+    struct ReadNote {
+        u64 position;
+        const MemoryManager* space;
+        VideoCommon::QmdPrediction::Source source;
+    };
+    std::unordered_map<u64, ReadNote> reads;
+    void NoteRead(u64 address, u64 position, const MemoryManager* space,
+                  VideoCommon::QmdPrediction::Source source) {
+        if (reads.size() >= 16384) {
+            reads.clear();
+        }
+        reads[address] = {position, space, source};
+    }
     /// Reads in the current window, those that waited for queued writes, and resyncs; the
     /// reads of the session and the windows in a row over the auto-off limit.
     u32 window_reads{};
@@ -236,6 +250,7 @@ struct FrontQmdMirror {
             shadow.position = 0;
         }
         evicted = 0;
+        reads.clear();
     }
 
     void ResetWindow() {
@@ -254,10 +269,140 @@ std::string ProbeFrontQmd(u64 qmd) {
         return "absent";
     }
     const NativeQmdScheduler::State& state = it->second;
-    return fmt::format("loaded {}, scheduled {}, completed {}, dependencies {}, deferred {}, base "
-                       "count {}",
-                       state.loaded, state.scheduled, state.completed, state.dependencies,
-                       state.deferred, (state.descriptor[4] >> 14) & 0xffff);
+    const auto& d = state.descriptor;
+    std::string text = fmt::format(
+        "table: loaded {}, scheduled {}, completed {}, dependencies {}, deferred {}, base count "
+        "{}; its release slots (words 24-27, 28-31, 52-55) {:08x} {:08x} {:08x} {:08x} | {:08x} "
+        "{:08x} {:08x} {:08x} | {:08x} {:08x} {:08x} {:08x}",
+        state.loaded, state.scheduled, state.completed, state.dependencies, state.deferred,
+        (d[4] >> 14) & 0xffff, d[24], d[25], d[26], d[27], d[28], d[29], d[30], d[31], d[52],
+        d[53], d[54], d[55]);
+    const auto read = g_front_qmd.reads.find(qmd);
+    if (read == g_front_qmd.reads.end() || read->second.space == nullptr) {
+        return text + "; no read noted";
+    }
+    constexpr std::array<const char*, 7> sources{"not a QMD", "inline QMD", "patched inline QMD",
+                                                 "overlay from memory", "upload shadow",
+                                                 "memory", "memory after a wait"};
+    constexpr std::array<const char*, 12> causes{
+        "none", "noted write", "writer range", "3D ranged write", "unbounded writer",
+        "unranged writer", "queued function", "3D method write", "unknown noted write",
+        "noted-write scan limit", "writer-range scan limit", "evicted inline QMD"};
+    const auto source = static_cast<size_t>(read->second.source);
+    text += fmt::format("; read at {} from {}", read->second.position,
+                        source < sources.size() ? sources[source] : "?");
+    const auto device = read->second.space->GpuToCpuAddress(qmd);
+    if (!device) {
+        return text;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    const u64 stamp = split.WriteStamp(*device, sizeof(NativeQmdScheduler::Descriptor), qmd);
+    text += fmt::format("; the front's newest write over it at {} ({} the read)", stamp,
+                        stamp > read->second.position ? "after" : "not after");
+    const u64 done = split.ConsumedNow();
+    const auto writers =
+        split.QueuedGuestWriters(done, qmd, *device, sizeof(NativeQmdScheduler::Descriptor));
+    const bool noted = writers.noted >= writers.unbounded;
+    const auto cause = static_cast<size_t>(noted ? writers.noted_cause : writers.unbounded_cause);
+    if ((std::max)(writers.noted, writers.unbounded) > done) {
+        text += fmt::format("; still queued: {} at {}{}",
+                            cause < causes.size() ? causes[cause] : "?",
+                            (std::max)(writers.noted, writers.unbounded),
+                            !noted && writers.what != nullptr
+                                ? fmt::format(" ({})", writers.what)
+                                : std::string{});
+    }
+    return text;
+}
+
+// The game patches the release words of QMDs already written (native_qmd.h: "The SDK patches
+// release payloads while a scheduled QMD is waiting"): an overlay or shadow block that still
+// holds its bytes (nothing but this write since it took them) takes the new ones and counts as
+// written at `position`, so a read takes it instead of waiting. One that holds newer bytes than
+// this write (stream order crossed) is dropped: the read then waits rather than serving a mix.
+// Returns which of the (at most two) 256-byte blocks from first's were taken.
+std::array<bool, 2> PatchHolders(VideoCommon::GpuSplit& split, const MemoryManager& memory,
+                                 GPUVAddr first, GPUVAddr last, const u8* data, u64 position,
+                                 u64 tag, const FrontQmdMirror::Shadow* own, u64 done) {
+    namespace Prediction = VideoCommon::QmdPrediction;
+    auto& mirror = g_front_qmd;
+    constexpr u64 block_bytes = FrontQmdMirror::BlockBytes;
+    // Write stamps (6f (c) a): no write but this one's since `held_position`.
+    const auto still_holds = [&](GPUVAddr address, u64 bytes, u64 held_position) {
+        const auto device = memory.GpuToCpuAddress(address);
+        if (!device || held_position <= done) {
+            return false;
+        }
+        return split.WriteStamp(*device, bytes, address, tag) <= held_position;
+    };
+    std::array<bool, 2> block_patched{};
+    const GPUVAddr first_block = first & ~GPUVAddr{block_bytes - 1};
+    const auto note_patched = [&](GPUVAddr address, u64 bytes) {
+        for (u64 block = 0; block < block_patched.size(); ++block) {
+            const GPUVAddr block_address = first_block + block * block_bytes;
+            if (address <= block_address && block_address + block_bytes <= address + bytes) {
+                block_patched[block] = true;
+            }
+        }
+    };
+    for (FrontQmdMirror::Shadow& shadow : mirror.shadows) {
+        if (&shadow == own || shadow.id == 0 || shadow.position == 0 ||
+            shadow.space != &memory || last <= shadow.address ||
+            shadow.address + shadow.filled <= first) {
+            continue;
+        }
+        // Block by block: each holds its bytes as of its own position.
+        const u64 first_index = (std::max)(first, shadow.address) - shadow.address;
+        const u64 last_index = (std::min)(last, shadow.address + shadow.filled) - shadow.address;
+        for (u64 block = first_index / block_bytes; block * block_bytes < last_index; ++block) {
+            const GPUVAddr block_address = shadow.address + block * block_bytes;
+            if (block_address + block_bytes > shadow.address + shadow.filled) {
+                continue;
+            }
+            if (shadow.block_position[block] > position) {
+                shadow.block_position[block] = 0; // Newer than this write: unknown mix
+                continue;
+            }
+            if (!still_holds(block_address, block_bytes, shadow.block_position[block])) {
+                continue;
+            }
+            const GPUVAddr from = (std::max)(first, block_address);
+            const GPUVAddr to = (std::min)(last, block_address + block_bytes);
+            std::memcpy(shadow.bytes.data() + (from - shadow.address), data + (from - first),
+                        to - from);
+            FrontQmdMirror::StampBlock(shadow, static_cast<size_t>(block), position);
+            note_patched(block_address, block_bytes);
+            Prediction::NoteMirror(Prediction::Mirror::ShadowPatched);
+        }
+        shadow.last_use = ++mirror.use_clock;
+    }
+    constexpr u64 size = sizeof(NativeQmdScheduler::Descriptor);
+    for (FrontQmdMirror::Overlay& overlay : mirror.overlays) {
+        if (overlay.position == 0 || overlay.space != &memory || last <= overlay.address ||
+            overlay.address + size <= first || overlay.position <= done) {
+            continue;
+        }
+        if (overlay.position > position) {
+            // Newer than this write: unknown mix. A queued inline QMD dropped keeps its floor.
+            if (overlay.inline_qmd) {
+                mirror.evicted = (std::max)(mirror.evicted, overlay.position);
+            }
+            overlay.position = 0;
+            continue;
+        }
+        if (!still_holds(overlay.address, size, overlay.position)) {
+            continue; // Something else wrote it since: the read waits
+        }
+        const GPUVAddr from = (std::max)(first, overlay.address);
+        const GPUVAddr to = (std::min)(last, overlay.address + size);
+        std::memcpy(reinterpret_cast<u8*>(overlay.words.data()) + (from - overlay.address),
+                    data + (from - first), to - from);
+        overlay.position = position;
+        overlay.patched = true;
+        note_patched(overlay.address, size);
+        Prediction::NoteMirror(Prediction::Mirror::Patched);
+    }
+    return block_patched;
 }
 
 // The back runs everything sent (the signal being noted too), then the front copies its table.
@@ -293,6 +438,15 @@ void StopFrontQmd(bool disable) {
 }
 
 } // Anonymous namespace
+
+void Nx2PatchQmdCopy(VideoCommon::GpuSplit& split, const MemoryManager& memory, GPUVAddr address,
+                     const u8* data, u64 size, u64 position, u64 tag) {
+    if (size == 0 || !VideoCommon::QmdPrediction::MirrorMode() || !g_front_qmd.synced) {
+        return;
+    }
+    (void)PatchHolders(split, memory, address, address + size, data, position, tag, nullptr,
+                       split.ConsumedNow());
+}
 
 KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
     : memory_manager{memory_manager_}
@@ -1861,7 +2015,6 @@ struct KeplerCompute::FrontState {
     /// EXP13=2: the upload's write-stamp tag (its own stamps don't count against its patches),
     /// and its data words not yet given to the copy, with the position of the last one sent.
     u64 upload_tag{};
-    u64 upload_tags{};
     std::vector<u32> upload_batch;
     u64 upload_batch_position{};
 };
@@ -2136,6 +2289,7 @@ void KeplerCompute::FrontNoteWriter(VideoCommon::GpuSplit& split, FrontState& fs
     }
     case KEPLER_COMPUTE_REG_INDEX(exec_upload):
         FrontNoteUpload(fs, argument);
+        fs.upload_tag = split.NewWriteStampTag();
         return;
     case KEPLER_COMPUTE_REG_INDEX(data_upload):
         if (fs.upload_known) {
@@ -2305,6 +2459,7 @@ void KeplerCompute::FrontQmdSignal(VideoCommon::GpuSplit& split, GPUVAddr qmd_ad
         const bool ok = FrontReadQmd(split, address, descriptor, unknown, read_info);
         read_base = ok ? (descriptor[4] >> 14) & 0xffff : ~0U;
         Prediction::NoteReadSource(read_info.source);
+        mirror.NoteRead(address, position, &memory_manager, read_info.source);
         return ok;
     };
     // As ProcessNativeMethod's release callback: a reduction (bit 26), else a four-word release
@@ -2550,71 +2705,9 @@ void KeplerCompute::FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState&
         }
         own->last_use = ++mirror.use_clock;
     }
-    // The game patches the release words of QMDs already written (native_qmd.h: "The SDK
-    // patches release payloads while a scheduled QMD is waiting"): an overlay or shadow that
-    // still holds its bytes (its write queued, nothing else queued writing them) takes the
-    // words, and counts as written by this upload, so a read takes it instead of waiting.
-    // Write stamps (6f (c) a): no write but this upload's since `held_position`.
-    const auto still_holds = [&](GPUVAddr address, u64 bytes, u64 held_position) {
-        const auto device = memory_manager.GpuToCpuAddress(address);
-        if (!device || held_position <= done) {
-            return false;
-        }
-        return split.WriteStamp(*device, bytes, address, fs.upload_tag) <= held_position;
-    };
-    std::array<bool, 2> block_patched{}; // The (at most two) QMD blocks of a small patch
+    const std::array<bool, 2> block_patched = PatchHolders(
+        split, memory_manager, first, last, data, position, fs.upload_tag, own, done);
     const GPUVAddr first_block = first & ~GPUVAddr{size - 1};
-    const auto note_patched = [&](GPUVAddr address, u64 bytes) {
-        for (u64 block = 0; block < block_patched.size(); ++block) {
-            const GPUVAddr block_address = first_block + block * size;
-            if (address <= block_address && block_address + size <= address + bytes) {
-                block_patched[block] = true;
-            }
-        }
-    };
-    for (FrontQmdMirror::Shadow& shadow : mirror.shadows) {
-        if (&shadow == own || shadow.id == 0 || shadow.position == 0 ||
-            shadow.space != &memory_manager || last <= shadow.address ||
-            shadow.address + shadow.filled <= first) {
-            continue;
-        }
-        // Block by block: each holds its bytes as of its own position.
-        const u64 first_index = (std::max)(first, shadow.address) - shadow.address;
-        const u64 last_index = (std::min)(last, shadow.address + shadow.filled) - shadow.address;
-        for (u64 block = first_index / block_bytes; block * block_bytes < last_index; ++block) {
-            const GPUVAddr block_address = shadow.address + block * block_bytes;
-            if (block_address + block_bytes > shadow.address + shadow.filled ||
-                !still_holds(block_address, block_bytes, shadow.block_position[block])) {
-                continue;
-            }
-            const GPUVAddr from = (std::max)(first, block_address);
-            const GPUVAddr to = (std::min)(last, block_address + block_bytes);
-            std::memcpy(shadow.bytes.data() + (from - shadow.address), data + (from - first),
-                        to - from);
-            FrontQmdMirror::StampBlock(shadow, static_cast<size_t>(block), position);
-            note_patched(block_address, block_bytes);
-            Prediction::NoteMirror(Prediction::Mirror::ShadowPatched);
-        }
-        shadow.last_use = ++mirror.use_clock;
-    }
-    for (FrontQmdMirror::Overlay& overlay : mirror.overlays) {
-        if (overlay.position == 0 || overlay.space != &memory_manager ||
-            last <= overlay.address || overlay.address + size <= first ||
-            overlay.position <= done) {
-            continue;
-        }
-        if (!still_holds(overlay.address, size, overlay.position)) {
-            continue; // Something else wrote it since: the read waits
-        }
-        const GPUVAddr from = (std::max)(first, overlay.address);
-        const GPUVAddr to = (std::min)(last, overlay.address + size);
-        std::memcpy(reinterpret_cast<u8*>(overlay.words.data()) + (from - overlay.address),
-                    data + (from - first), to - from);
-        overlay.position = position;
-        overlay.patched = true;
-        note_patched(overlay.address, size);
-        Prediction::NoteMirror(Prediction::Mirror::Patched);
-    }
     // A small patch of a QMD nothing above holds: when guest memory holds the QMD now (nothing
     // else queued writes it, not GPU-written, no inline QMD of it queued or evicted), an overlay
     // from memory with the patch over it.
@@ -2663,7 +2756,6 @@ void KeplerCompute::FrontNoteUpload(FrontState& fs, u32 exec) {
     fs.upload_known = true;
     fs.upload_offset = 0;
     fs.upload_shadow = 0;
-    fs.upload_tag = ++fs.upload_tags;
     // Linear, one line or lines back to back: its bytes land at upload_address as they come.
     fs.upload_contiguous = (exec & 1) != 0 && (lines == 1 || reg(4) == line_length);
     if (line_length == 0 || lines == 0) {

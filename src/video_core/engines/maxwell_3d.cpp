@@ -25,6 +25,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_qmd_prediction.h"
+#include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
@@ -1126,6 +1127,8 @@ struct Maxwell3D::FrontState {
     u64 upload_device{};
     u32 upload_size{};
     u32 upload_offset{};
+    /// EXP13=2-4: the upload's write-stamp tag (Nx2PatchQmdCopy looks past its own stamps).
+    u64 upload_tag{};
     /// Macro DMA read snapshots (EDEN_NX2_DMA_SNAPSHOT, from EvilOOT's dma-snapshot fix): device
     /// pages a drained read flushed whole, and the split position right after. Cleared past 8192
     /// pages.
@@ -1972,6 +1975,7 @@ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& f
         fs.upload_device = device.value_or(0);
         fs.upload_size = static_cast<u32>((std::min<u64>)(size, ~0U));
         fs.upload_offset = 0;
+        fs.upload_tag = split.NewWriteStampTag();
         if (!fs.upload_known) {
             if (!device || size == 0 || size > (u64{64} << 20)) {
                 return unknown("upload unmapped or huge");
@@ -1999,9 +2003,20 @@ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& f
     const u32 remaining_bytes =
         fs.upload_offset < fs.upload_size ? fs.upload_size - fs.upload_offset : 0;
     const u32 whole = (std::min<u32>)(count, remaining_bytes / 4);
+    // Tagged, so the QMD copy's patch below looks past this upload's own stamps.
+    split.SetWriteStampTag(fs.upload_tag);
     split.NoteMemoryWriteData(fs.upload_device + fs.upload_offset, words, whole);
     if (whole < count && remaining_bytes % 4 != 0) {
         split.NoteMemoryWrite(fs.upload_device + fs.upload_offset + whole * 4, remaining_bytes % 4);
+    }
+    split.SetWriteStampTag(0);
+    if (VideoCommon::QmdPrediction::MirrorMode()) {
+        // EXP13=2-4: a QMD patched by a 3D inline upload (6h): the copy takes the bytes too.
+        const GPUVAddr destination = (GPUVAddr{fs.regs[base + 2]} << 32) | fs.regs[base + 3];
+        Nx2PatchQmdCopy(split, memory_manager, destination + fs.upload_offset,
+                        reinterpret_cast<const u8*>(words),
+                        (std::min<u64>)(u64{count} * sizeof(u32), remaining_bytes),
+                        split.SentPosition(), fs.upload_tag);
     }
     split.RangedMethodWrite();
     fs.upload_offset += (std::min<u32>)(count * 4, remaining_bytes);
