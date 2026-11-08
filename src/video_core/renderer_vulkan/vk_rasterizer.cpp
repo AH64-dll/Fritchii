@@ -272,6 +272,20 @@ bool IsPrimitiveRestartSupported(const Device& device, VkPrimitiveTopology topol
             (topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST &&
              device.IsPatchListPrimitiveRestartSupported()));
 }
+
+/// Before a dispatch: earlier writes visible to it, its indirect arguments included.
+void RecordDispatchBarrier(vk::CommandBuffer cmdbuf) {
+    static constexpr VkMemoryBarrier READ_BARRIER{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+    };
+    cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                           VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           0, READ_BARRIER);
+}
 } // Anonymous namespace
 
 RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra::GPU& gpu_,
@@ -1706,23 +1720,9 @@ void RasterizerVulkan::DispatchCompute() {
     }
 
     const auto& qmd{kepler_compute->launch_description};
-    // Earlier writes must be visible to the dispatch, its indirect arguments included, and what it
-    // writes to the next render pass.
-    const auto record_read_barrier = [this] {
-        static constexpr VkMemoryBarrier READ_BARRIER{
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
-        };
-        scheduler.Record([](vk::CommandBuffer cmdbuf) {
-            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
-                                   VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
-                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                   0, READ_BARRIER);
-        });
-        scheduler.NoteComputeWrites();
-    };
+    // Earlier writes must be visible to the dispatch, its indirect arguments included
+    // (RecordDispatchBarrier, recorded at the start of the dispatch's own command), and what it
+    // writes to the next render pass (NoteComputeWrites).
     if (frame_dump.CapturingSampled()) {
         std::optional<std::array<u32, 3>> indirect_grid;
         if (indirect_address) {
@@ -1742,10 +1742,11 @@ void RasterizerVulkan::DispatchCompute() {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         scheduler.RequestOutsideRenderPassOperationContext();
-        record_read_barrier();
+        scheduler.NoteComputeWrites();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
         scheduler.Record([this, pipeline, indirect_buffer = buffer->Handle(),
                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
+            RecordDispatchBarrier(cmdbuf);
             if (!pipeline->IsBound()) {
                 return;
             }
@@ -1763,7 +1764,11 @@ void RasterizerVulkan::DispatchCompute() {
         return;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
-    record_read_barrier();
+    scheduler.NoteComputeWrites();
+    if (can_replace) {
+        // DLSS's evaluation may be recorded next, before the dispatch: the barrier goes first.
+        scheduler.Record([](vk::CommandBuffer cmdbuf) { RecordDispatchBarrier(cmdbuf); });
+    }
 #ifdef EGLANTINE_STREAMLINE
     const auto* const replacement =
         can_replace && !byte_addressed_shadow && TryOcarinaDlss(*pipeline, true)
@@ -1775,11 +1780,15 @@ void RasterizerVulkan::DispatchCompute() {
 #else
     scheduler.TraceComputePipeline(pipeline->ShaderHash());
 #endif
-    scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind)
+    scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind),
+                      barrier_recorded = can_replace
 #ifdef EGLANTINE_STREAMLINE
                       , replacement
 #endif
                      ](vk::CommandBuffer cmdbuf) {
+        if (!barrier_recorded) {
+            RecordDispatchBarrier(cmdbuf);
+        }
 #ifdef EGLANTINE_STREAMLINE
         if (replacement && !replacement->EvaluationFailed()) {
             return;
