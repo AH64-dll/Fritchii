@@ -410,8 +410,8 @@ TEST_CASE("Ampere global to shared copy guards reads and zero fills disabled sou
                             machine.shared[4096 + static_cast<u32>(offset) + 4 * i] = 0xfeedface;
                         }
                         machine.Run(lowered.instructions);
-                        REQUIRE(machine.reads == (active && enabled ? 4 : 0));
-                        REQUIRE(machine.writes == (active ? 4 : 0));
+                        REQUIRE(machine.reads == (active && enabled ? 4U : 0U));
+                        REQUIRE(machine.writes == (active ? 4U : 0U));
                         REQUIRE(machine.shared.size() == 4);
                         for (u32 i = 0; i < 4; ++i)
                             REQUIRE(machine.shared.at(4096 + static_cast<u32>(offset) + 4 * i) ==

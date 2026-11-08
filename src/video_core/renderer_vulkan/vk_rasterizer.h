@@ -7,17 +7,21 @@
 #pragma once
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 
 #include <boost/container/static_vector.hpp>
 
 #include "common/common_types.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/dkb_frame_trace.h"
+#include "video_core/buffer_cache/nx2_write_handoff.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/oot_network.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -107,13 +111,18 @@ public:
     GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out,
                                              bool past_sync) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
+    void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
+    bool QueueFlushRegion(DAddr addr, u64 size) override;
+    bool HasPendingQueries(DAddr addr, u64 size) override;
     void InvalidateRegion(DAddr addr, u64 size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
+    void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
     void OnCacheInvalidation(DAddr addr, u64 size) override;
+    void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;
     bool TryCacheInvalidation(DAddr addr, u64 size) override;
     bool OnCPUWrite(DAddr addr, u64 size) override;
     void InvalidateGPUCache() override;
@@ -124,6 +133,7 @@ public:
     void SignalSyncPoint(u32 value) override;
     void SignalReference() override;
     void ReleaseFences(bool force = true) override;
+    void FlushQueryResults(DAddr addr, u64 size) override;
     void FlushAndInvalidateRegion(
         DAddr addr, u64 size, VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void WaitForIdle() override;
@@ -150,6 +160,7 @@ public:
                                    const Tegra::Texture::TICEntry* depth,
                                    std::array<f32, 2> jitter,
                                    std::array<f32, 2> motion_scale, bool use_history = true) override;
+    VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;
@@ -183,6 +194,8 @@ private:
     void CaptureIndirectTrace();
     void CollectIndirectTrace();
     void TraceDrawFailure(std::string_view reason);
+    /// Remembers render target 0 of a draw with one of Ocarina of Time's tonemap shaders.
+    void TrackOotTonemappedImage(const GraphicsPipeline& pipeline);
     bool TryNx2IndirectReset(bool is_indexed, u32 instance_count);
 
     void FlushWork();
@@ -193,7 +206,9 @@ private:
     /// the GPU makes them now (BufferCache::Nx2CopyListPages).
     void SubmitNx2ListCopies();
 
-    void UpdateDynamicStates();
+    /// Records the dynamic state of the draw being prepared with `pipeline` (null for
+    /// DrawTexture's blit).
+    void UpdateDynamicStates(const GraphicsPipeline* pipeline);
 
     void HandleTransformFeedback();
 
@@ -225,12 +240,70 @@ private:
     void UpdateStencilOp(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateStencilTestEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateLogicOp(Tegra::Engines::Maxwell3D::Regs& regs);
-    void UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs);
+    void UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs, const GraphicsPipeline* pipeline);
     void UpdateColorWriteEnable(Tegra::Engines::Maxwell3D::Regs& regs);
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
+    /// EDEN_NX2_DYNSTATE_CACHE: one slot per dynamic state whose last recorded value is cached.
+    enum class DynSlot : u32 {
+        Viewports,
+        Scissors,
+        DepthBias,
+        BlendConstants,
+        DepthBounds,
+        LineWidth,
+        CullMode,
+        DepthBoundsTestEnable,
+        DepthTestEnable,
+        DepthWriteEnable,
+        StencilTestEnable,
+        DepthCompareOp,
+        FrontFace,
+        StencilOp,
+        PrimitiveRestartEnable,
+        RasterizerDiscardEnable,
+        DepthBiasEnable,
+        LogicOp,
+        ColorWriteEnable,
+        VertexInput,
+    };
+
+    /// False when `value` is what slot last recorded into the current command buffer (the
+    /// record can be skipped); otherwise caches it and returns true.
+    template <typename T>
+    bool DynamicStateChanged(DynSlot slot, T& cached, const T& value);
+    void ForgetDynamicState(DynSlot slot) noexcept {
+        dyn_cache.valid &= ~(u64{1} << static_cast<u32>(slot));
+    }
+    void BuildDynamicStateMask();
+
+    struct VertexInputLayout {
+        boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> bindings;
+        boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> attributes;
+    };
+    /// Attribute formats, per binding stride, instancing and divisor, and the repacked bindings.
+    using VertexInputKey = std::array<u32, 32 + 32 * 3 + 1>;
+    struct VertexInputKeyHash {
+        size_t operator()(const VertexInputKey& key) const noexcept;
+    };
+    void BuildVertexInputLayout(const Tegra::Engines::Maxwell3D::Regs& regs, u32 max_attributes,
+                                u32 max_bindings, VertexInputLayout& layout) const;
+    /// BufferCacheRuntime::SetVertexRepackLayout, skipped while its inputs are unchanged.
+    u32 UpdateVertexRepackLayout(bool dynamic_input);
+
     void FrameDumpPass(const Framebuffer* framebuffer);
+    /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
+    void TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes);
+#ifdef EGLANTINE_STREAMLINE
+    bool OcarinaDlssEnabled() const;
+    void TrackOcarinaCamera();
+    void TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect);
+    bool TryOcarinaDlss(const ComputePipeline& pipeline, bool replace);
+    void ReadOcarinaActor(struct OcarinaActorMesh& mesh);
+#endif
+    /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
+    bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
 
     Tegra::GPU& gpu;
     Tegra::MaxwellDeviceMemoryManager& device_memory;
@@ -252,6 +325,7 @@ private:
     TextureCache texture_cache;
     BufferCacheRuntime buffer_cache_runtime;
     BufferCache buffer_cache;
+    VideoCommon::Nx2WriteHandoff write_handoff;
     QueryCacheRuntime query_cache_runtime;
     QueryCache query_cache;
     PipelineCache pipeline_cache;
@@ -259,18 +333,136 @@ private:
     FenceManager fence_manager;
     FrameDump frame_dump;
 
-    vk::Event wfi_event;
-
     boost::container::static_vector<u32, MAX_IMAGE_VIEWS> image_view_indices;
     std::array<VideoCommon::ImageViewId, MAX_IMAGE_VIEWS> image_view_ids;
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+#ifdef EGLANTINE_STREAMLINE
+    std::optional<u64> oot_camera_sample_frame;
+    struct OcarinaMotionTrace {
+        const Tegra::MemoryManager* camera_channel{};
+        const Tegra::MemoryManager* depth_channel{};
+        u64 depth_frame{};
+        GPUVAddr depth_address{};
+        u32 depth_tic{};
+        VkExtent2D extent{};
+        std::array<f32, 16> current{};
+        std::array<f32, 16> previous{};
+    } oot_motion;
+    std::unique_ptr<class OcarinaLiveDlss> oot_live_dlss;
+    bool oot_live_failed{};
+    const char* oot_fallback_reason{};
+    u32 oot_fallback_repeats{};
+    std::optional<u64> oot_dlss_frame;
+    std::optional<u64> oot_4k_scene_frame;
+    VkImage oot_4k_guest_present{};
+    struct OcarinaActorPose {
+        u64 frame{};
+        const Tegra::MemoryManager* channel{};
+        GPUVAddr vertex{};
+        GPUVAddr indices{};
+        s32 base_vertex{};
+        std::array<f32, 4> origin{};
+        std::array<f32, 280 * 12> bones{};
+    } oot_actor, oot_previous_actor;
+#endif
+    u64 nx2_dispatch_serial = 0;     ///< Compute dispatches recorded (EDEN_NX2_WFI_DEFER)
+    u64 nx2_wfi_dispatch_serial = 0; ///< nx2_dispatch_serial at the last real wait for idle
     u64 render_trace_frame = 0;
     u32 render_trace_draws = 0;
     u32 render_trace_clears = 0;
     bool pending_native_work{};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+    /// Fragment output components the dynamic color write mask was last recorded with
+    u32 last_color_output_mask{};
+    VideoCommon::OotNetwork::BypassState oot_network_bypass;
+    u32 mesh_emulation_groups{};             ///< mesh workgroups of the emulated draw
+    u32 mesh_emulation_vertices_per_group{}; ///< 0 unless the draw is an emulated mesh draw
+    /// Mesh emulation diagnostics with a task program: one draw's distribution arguments.
+    struct {
+        std::span<const u8> args;
+        u64 tick{};
+        u32 tasks{};
+        u32 capacity{};
+        bool pending{};
+    } mesh_task_probe;
+    /// With a task program: the vkCmdDrawIndirect arguments the distribution pass writes.
+    struct {
+        VkBuffer buffer{};
+        VkDeviceSize offset{};
+    } mesh_emulation_indirect;
+    /// Mesh emulation diagnostics: one draw's output, read back once the GPU has written it.
+    struct MeshEmulationProbe {
+        std::span<const u8> data;
+        u64 tick{};
+        u64 frame{};
+        u32 groups{};
+        u32 block_words{};
+        u32 vertex_lines{};
+        u32 max_vertices{};
+        u32 max_primitives{};
+        std::array<u32, 4> position_lines{};
+        bool pending{};
+    } mesh_probe;
+    void ReadMeshEmulationProbe();
+    /// Mesh emulation with a task program: the output arena every task draw of a submission
+    /// allocates its mesh workgroups from, and its host-visible counter of allocated words.
+    struct MeshArena {
+        vk::Buffer buffer;
+        vk::Buffer counter;
+        u64 size{};
+        u64 tick{};
+        bool counted{}; ///< the counter of its last submission was read
+    };
+    std::vector<MeshArena> mesh_arenas;
+    size_t mesh_arena_current{~size_t{}};
+    u64 mesh_arena_size{64ULL << 20};
+    /// The current submission's arena, after its counter is reset.
+    const MeshArena& AcquireMeshArena();
+
+    /// Dynamic state last recorded into the command buffer of `epoch` (bit per DynSlot in
+    /// `valid`). Viewports and scissors are keyed on the registers they are computed from.
+    struct DynamicStateCache {
+        u64 epoch{};
+        u64 valid{};
+        std::array<u32, 6 + 16 * 7> viewports{};
+        std::array<u32, 6 + 16 * 3> scissors{};
+        std::array<f32, 3> depth_bias{};
+        std::array<f32, 4> blend_constants{};
+        std::array<f32, 2> depth_bounds{};
+        f32 line_width{};
+        u32 cull_mode{};
+        u32 depth_bounds_test{};
+        u32 depth_test{};
+        u32 depth_write{};
+        u32 stencil_test{};
+        u32 depth_compare{};
+        u32 front_face{};
+        std::array<u32, 9> stencil_op{};
+        u32 primitive_restart{};
+        u32 rasterizer_discard{};
+        u32 depth_bias_enable{};
+        u32 logic_op{};
+        std::array<VkBool32, 8> color_write_enable{};
+        const void* vertex_input{};
+    };
+    DynamicStateCache dyn_cache;
+    /// The dirty flags UpdateDynamicStates consumes on this device: none set, nothing to record.
+    Tegra::Engines::Maxwell3D::DirtyState::Flags dyn_state_mask{};
+    bool dyn_state_mask_built{};
+    bool dyn_state_never_skip{};
+
+    /// EDEN_NX2_VERTEX_INPUT_CACHE: vertex input layouts, built once and recorded by pointer
+    /// (immutable while the rasterizer lives).
+    std::unordered_map<VertexInputKey, std::unique_ptr<VertexInputLayout>, VertexInputKeyHash>
+        vertex_input_layouts;
+    VertexInputKey last_vertex_input_key{};
+    const VertexInputLayout* last_vertex_input_layout{};
+    /// Attribute formats and strides SetVertexRepackLayout last chose its repack mask from.
+    std::array<u32, 64> repack_key{};
+    bool repack_key_valid{};
+    bool repack_key_dynamic{};
 
     struct IndirectTrace {
         vk::Buffer readback;

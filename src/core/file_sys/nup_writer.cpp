@@ -450,7 +450,28 @@ Layout BuildLayout(const Plan& plan) {
     for (auto& root : roots) {
         Layout::Package package;
         package.root_dir = AssignDir(root, layout);
-        const auto& root_dir = layout.dirs[package.root_dir];
+        layout.packages.push_back(package);
+    }
+
+    std::vector<u64> file_counts(layout.dirs.size(), 0);
+    for (std::size_t i = layout.dirs.size(); i-- > 0;) {
+        u64 total = 0;
+        const auto first = layout.dirs[i].first_child;
+        const auto count = layout.dirs[i].child_count;
+        for (u32 slot = first; slot < first + count; ++slot) {
+            const u64 child = layout.children[slot];
+            if (child & Layout::FileTag) {
+                total += 1;
+            } else {
+                total += file_counts[static_cast<std::size_t>(child)];
+            }
+        }
+        file_counts[i] = total;
+    }
+
+    for (std::size_t i = 0; i < layout.packages.size(); ++i) {
+        const auto& root_dir = layout.dirs[layout.packages[i].root_dir];
+        auto& package = layout.packages[i];
         for (u32 slot = root_dir.first_child; slot < root_dir.first_child + root_dir.child_count;
              ++slot) {
             const u64 child = layout.children[slot];
@@ -458,13 +479,12 @@ Layout BuildLayout(const Plan& plan) {
                 continue;
             }
             const auto id = static_cast<u32>(child);
-            if (layout.dirs[id].name == "exefs") {
+            if (layout.dirs[id].name == "exefs" && file_counts[id] > 0) {
                 package.exefs_dir = id;
-            } else if (layout.dirs[id].name == "romfs") {
+            } else if (layout.dirs[id].name == "romfs" && file_counts[id] > 0) {
                 package.romfs_dir = id;
             }
         }
-        layout.packages.push_back(package);
     }
 
     if (layout.dirs.size() + layout.files.size() >= NoDir) {
@@ -593,7 +613,19 @@ public:
 
 private:
     static bool HasContent(const fs::path& dir) {
-        return !FindDirectory(dir, "exefs").empty() || !FindDirectory(dir, "romfs").empty();
+        return DirHasFiles(FindDirectory(dir, "exefs")) ||
+               DirHasFiles(FindDirectory(dir, "romfs"));
+    }
+
+    static bool DirHasFiles(const fs::path& dir) {
+        std::error_code ec;
+        for (auto it = fs::recursive_directory_iterator(dir, ec);
+             !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+            if (it->is_regular_file(ec)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // Returns the package's title ID: the NPDM program ID, else the folder's or base's.
@@ -629,10 +661,10 @@ private:
         }
         plan.packages.push_back(std::move(package));
 
-        if (!exefs.empty()) {
+        if (!exefs.empty() && DirHasFiles(exefs)) {
             CollectTree(index, exefs, "exefs");
         }
-        if (!romfs.empty()) {
+        if (!romfs.empty() && DirHasFiles(romfs)) {
             CollectTree(index, romfs, "romfs");
         }
         std::error_code ec;
@@ -1677,9 +1709,10 @@ PackResult UpdateMetadata(const fs::path& archive, const MetadataUpdate& update,
         const size_t pos = static_cast<size_t>(TocHeaderSize + u64{i} * PackageRecordSize);
         const u64 offset = read_le(toc, pos + 0x20, 8);
         const u64 size = read_le(toc, pos + 0x28, 4);
+        const u64 region_end = offset < blob_offset ? blob_offset : actual_size;
         if ((size == 0 && offset != 0) ||
-            (size != 0 && (offset < blob_offset || offset > actual_size ||
-                           size > actual_size - offset)) ||
+            (size != 0 && (offset < toc_offset + toc_size || offset > region_end ||
+                           size > region_end - offset)) ||
             size > MaxMetadataSize - total_metadata) {
             return fail(PackResult::InvalidSource, "invalid or oversized NUP metadata range");
         }
@@ -2314,9 +2347,13 @@ EditResult EditNupMetadata(const fs::path& archive, const MetadataEdit& edit,
             meta_start = std::min(meta_start, raw.meta_offset);
         }
     }
-    if (meta_start < blob_offset || meta_start > file_size) {
+    if (meta_start > file_size) {
         return fail(EditResult::InvalidSource, "bad meta start");
     }
+    // Metadata after the blob region is rewritten where it starts. Some packers put it between
+    // the TOC and the blob instead: then the whole blob is kept, the new metadata goes after it
+    // and the old blocks are zeroed with the rest of the gap.
+    const u64 blob_end = meta_start >= blob_offset ? meta_start : file_size;
 
     std::vector<std::vector<u8>> new_metas(raws.size());
     for (size_t i = 0; i < raws.size(); ++i) {
@@ -2355,7 +2392,7 @@ EditResult EditNupMetadata(const fs::path& archive, const MetadataEdit& edit,
         new_metas[i] = std::move(block);
     }
 
-    u64 cursor = meta_start;
+    u64 cursor = blob_end;
     std::vector<std::pair<u64, u32>> meta_addrs(raws.size());
     for (size_t i = 0; i < raws.size(); ++i) {
         if (new_metas[i].empty()) {
@@ -2440,7 +2477,7 @@ EditResult EditNupMetadata(const fs::path& archive, const MetadataEdit& edit,
             gap -= chunk;
         }
         std::vector<u8> buffer(ReadBufferSize);
-        u64 remaining = meta_start - blob_offset;
+        u64 remaining = blob_end - blob_offset;
         if (!in.Seek(static_cast<s64>(blob_offset))) {
             throw std::runtime_error("cannot seek to blob");
         }

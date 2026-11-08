@@ -76,6 +76,7 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, Robustness2, ROBUSTNESS_2, robustness2)                                           \
     FEATURE(EXT, TransformFeedback, TRANSFORM_FEEDBACK, transform_feedback)                        \
     FEATURE(EXT, VertexInputDynamicState, VERTEX_INPUT_DYNAMIC_STATE, vertex_input_dynamic_state)  \
+    FEATURE(KHR, CooperativeMatrix, COOPERATIVE_MATRIX, cooperative_matrix)                        \
     FEATURE(KHR, Maintenance5, MAINTENANCE_5, maintenance5)                                        \
     FEATURE(KHR, Maintenance6, MAINTENANCE_6, maintenance6)                                        \
     FEATURE(KHR, PipelineExecutableProperties, PIPELINE_EXECUTABLE_PROPERTIES,                     \
@@ -254,6 +255,9 @@ public:
     /// Reports a device loss.
     void ReportLoss() const;
 
+    /// Logs what VK_EXT_device_fault reports about a device loss.
+    void ReportDeviceFault() const;
+
     /// Reports a shader to Nsight Aftermath.
     void SaveShader(std::span<const u32> spirv) const;
 
@@ -414,6 +418,7 @@ public:
 #define FN_MAX_LIMIT_LIST \
     FN_MAX_LIMIT_ELEM(ComputeSharedMemorySize) \
     FN_MAX_LIMIT_ELEM(PerStageDescriptorSampledImages) \
+    FN_MAX_LIMIT_ELEM(PerStageDescriptorStorageBuffers) \
     FN_MAX_LIMIT_ELEM(PerStageResources) \
     FN_MAX_LIMIT_ELEM(DescriptorSetSamplers) \
     FN_MAX_LIMIT_ELEM(DescriptorSetUniformBuffers) \
@@ -422,7 +427,10 @@ public:
     FN_MAX_LIMIT_ELEM(DescriptorSetStorageBuffersDynamic) \
     FN_MAX_LIMIT_ELEM(DescriptorSetSampledImages) \
     FN_MAX_LIMIT_ELEM(DescriptorSetStorageImages) \
-    FN_MAX_LIMIT_ELEM(DescriptorSetInputAttachments)
+    FN_MAX_LIMIT_ELEM(DescriptorSetInputAttachments) \
+    FN_MAX_LIMIT_ELEM(FramebufferWidth) \
+    FN_MAX_LIMIT_ELEM(FramebufferHeight) \
+    FN_MAX_LIMIT_ELEM(FramebufferLayers)
 #define FN_MAX_LIMIT_ELEM(name) \
     u32 GetMax##name() const { return properties.properties.limits.max##name; }
 FN_MAX_LIMIT_LIST
@@ -481,7 +489,13 @@ FN_MAX_LIMIT_LIST
 
     /// Returns true if the device supports float16 natively.
     bool IsFloat16Supported() const {
-        return features.shader_float16_int8.shaderFloat16;
+        return float16_math;
+    }
+
+    /// Whether host-only shaders (frame generation) may use float16. Unlike IsFloat16Supported, it
+    /// stays on under the NVIDIA Ampere workaround, which concerns guest shaders only.
+    bool IsHostFloat16Supported() const {
+        return host_float16_supported;
     }
 
     /// Returns true if the device can run shaders built against the Vulkan memory model.
@@ -658,6 +672,18 @@ FN_MAX_LIMIT_LIST
         return extensions.workgroup_memory_explicit_layout &&
                features.workgroup_memory_explicit_layout.workgroupMemoryExplicitLayout16BitAccess &&
                features.features.shaderInt16;
+    }
+
+    /// Returns true if the guest's HMMA.16816.F16 can run on the host's cooperative matrices
+    /// (VK_KHR_cooperative_matrix with the same 16x8x16 shape on 16-bit floats, 32-lane subgroups).
+    bool IsCooperativeHmmaSupported() const {
+        return cooperative_hmma_16x8x16;
+    }
+
+    /// Returns true if the guest's HMMA can run through shared memory on 16x16x16 cooperative
+    /// matrices of 16-bit floats, with compute subgroups forced to the guest's 32 lanes.
+    bool IsCooperativeHmma16x16x16Supported() const {
+        return cooperative_hmma_16x16x16;
     }
 
     /// Returns true if the device supports VK_KHR_shader_quad_control.
@@ -1043,6 +1069,7 @@ FN_MAX_LIMIT_LIST
     }
 
     u64 GetDeviceMemoryUsage() const;
+    u64 QueryDeviceMemoryUsage() const;
 
     /// The driver's current memory budget for this process (VK_EXT_memory_budget), in
     /// GetDeviceMemoryUsage() terms: the usage at which the main device-local heap reaches its
@@ -1302,6 +1329,7 @@ private:
         VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5{};
         VkPhysicalDeviceDepthStencilResolveProperties depth_stencil_resolve{};
         VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color{};
+        VkPhysicalDeviceCooperativeMatrixPropertiesKHR cooperative_matrix{};
 
         VkPhysicalDeviceProperties properties{};
     };
@@ -1311,6 +1339,7 @@ private:
     Properties properties{};
 
     VkPhysicalDeviceFeatures2 features2{};
+    VkPhysicalDeviceFaultFeaturesEXT device_fault_features{};
     VkPhysicalDeviceProperties2 properties2{};
 
     // Misc features
@@ -1318,11 +1347,15 @@ private:
     bool is_blit_depth24_stencil8_supported{}; ///< Support for blitting from and to D24S8.
     bool is_blit_depth32_stencil8_supported{}; ///< Support for blitting from and to D32S8.
     bool is_warp_potentially_bigger{};         ///< Host warp size can be bigger than guest.
+    bool float16_math{};                       ///< Shaders may do float16 arithmetic.
+    bool cooperative_hmma_16x8x16{};           ///< HMMA runs on the guest's matrix shape.
+    bool cooperative_hmma_16x16x16{};          ///< HMMA runs on 16x16x16 matrices.
     bool is_integrated{};                      ///< Is GPU an iGPU.
     bool is_virtual{};                         ///< Is GPU a virtual GPU.
     bool is_non_gpu{};                         ///< Is SoftwareRasterizer, FPGA, non-GPU device.
     bool has_broken_compute{};                 ///< Compute shaders can cause crashes
     bool has_broken_cube_compatibility{};      ///< Has broken cube compatibility bit
+    bool host_float16_supported{};             ///< shaderFloat16 for host-only shaders
     bool has_broken_descriptor_aliasing{};     ///< Miscompiles descriptors aliased on one binding
     bool has_broken_parallel_compiling{};      ///< Has broken parallel shader compiling.
     bool has_renderdoc{};                      ///< Has RenderDoc attached
@@ -1341,6 +1374,8 @@ private:
     bool dynamic_state3_alpha_to_one{};
     bool supports_conditional_barriers{};      ///< Allows barriers in conditional control flow.
     mutable std::atomic<size_t> custom_border_color_samplers_used{};
+    mutable std::atomic<u64> memory_usage_value{}; ///< Last GetDeviceMemoryUsage() answer
+    mutable std::atomic<s64> memory_usage_time{};  ///< When it was taken (steady clock ns)
     u64 device_access_memory{};                ///< Total size of device local memory in bytes.
     u32 sets_per_pool{};                       ///< Sets per Description Pool
     NvidiaArchitecture nvidia_arch{NvidiaArchitecture::Arch_AmpereOrNewer};

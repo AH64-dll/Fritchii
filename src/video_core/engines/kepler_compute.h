@@ -66,6 +66,13 @@ public:
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
+    [[nodiscard]] bool MayWriteMemory(u32 method) const {
+        if (method >= native_plain_methods.size()) {
+            return true;
+        }
+        return native_mode ? !native_plain_methods[method] : execution_mask[method];
+    }
+
     /// The channel's MME data RAM, shared with its 3D engine.
     void SetNativeDataRam(std::array<u32, 0xc00>* data_ram) { native_data_ram = data_ram; }
     void SetNativeMacroMode(MacroEngine* shared_macro, std::span<u32> positions, NativeMacroContext* context = nullptr) {
@@ -246,6 +253,10 @@ public:
 
     bool IsNativeMode() const { return native_mode; }
     bool ProcessGameDlss(u64 program_id, u64 native_key);
+    /// Ocarina of Time with anti-aliasing at No sharpening (oot_network.h): true when this
+    /// dispatch of the game's network is skipped, or its output pass replaced by a copy of the
+    /// tonemapped image.
+    bool BypassOotNetwork(u64 program_id, u64 native_key);
     void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
@@ -257,20 +268,70 @@ public:
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending,
                               const GPUVAddr* segment);
+    /// GpuSplit's back (Kind::Writes, EDEN_NX2_COMPUTE_FUSE): runs a run of writes the front
+    /// sent as one entry, as the Method and MacroWrite entries it stands for.
+    void BackWrites(Core::System& system, const u64* writes, u32 count);
 
 private:
     struct FrontState;
     FrontState& Front(VideoCommon::GpuSplit& split);
+    void ReleaseFront();
     void FrontApply(FrontState& state, u32 method, u32 argument);
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    /// Narrow drains (EDEN_NX2_NARROW_COMPUTE): notes what the method just sent writes.
+    void FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
+    /// EDEN_NX2_QMD_PREDICT: whether the front's copy of the QMD scheduler is in use.
+    [[nodiscard]] static bool FrontQmdPredicts(VideoCommon::GpuSplit& split);
+    /// EDEN_NX2_QMD_PREDICT: runs the signal the method just sent will make on the back
+    /// (ProcessNativeMethod) on the front's copy of the scheduler, and notes the releases and
+    /// grids it runs. False: not modelled (the caller notes a dispatch as before).
+    bool FrontQmdSignal(VideoCommon::GpuSplit& split, GPUVAddr qmd_address, u32 argument);
+    /// Reads a QMD as the back will read it when it runs the work sent so far; false (and
+    /// `unknown`) where the front can't know that.
+    bool FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
+                      NativeQmdScheduler::Descriptor& descriptor, bool& unknown);
     std::unique_ptr<FrontState> front;
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
+
+    /// EDEN_NX2_COMPUTE_FUSE: writes the front holds back to send as one ring entry
+    /// (GpuSplit::Writes). Register stores and inline upload execs, which write no memory, stay
+    /// held until something else is sent (GpuSplit::SetPendingFlush). Within one macro call the
+    /// upload data words stay held too, with their narrow-drain notes taken at the write (the
+    /// registers they depend on) and recorded once the run is sent. Anything else ends the run.
+    struct FrontWriteRun {
+        static constexpr u32 MaxWrites = 128;
+        static constexpr u32 MaxNotes = 8;
+        static constexpr u32 UploadWords = 14; ///< Upload::Registers, exec_upload and data_upload
+        std::array<u64, MaxWrites> writes{};
+        /// What FrontNoteWrites reads for a held data word: the registers from upload on.
+        struct UploadNote {
+            std::array<u32, UploadWords> registers{};
+            bool linear{};
+            u32 copy_size{};
+        };
+        std::array<UploadNote, MaxNotes> notes{};
+        u32 count{};
+        u32 note_count{};
+        GPUVAddr segment{};
+        bool has_segment{};
+        bool writer{};   ///< Holds a method MayWriteMemory counts (DmaPusher::NoteWriter)
+        bool in_macro{}; ///< FrontRunMacro runs: data words may be held
+        u64 session{};   ///< GpuSplit::Session the held writes belong to
+    };
+    FrontWriteRun front_run;
+    /// Sends the write the way EDEN_NX2_COMPUTE_FUSE says, then notes it (FrontNoteWrites).
+    void FrontQueueWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                         u32 argument, bool is_last_call, bool direct, const GPUVAddr* segment);
+    /// GpuSplit::SetPendingFlush hook: sends the held run, then records its notes.
+    static void FrontFlushWrites(void* engine);
 
     bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
     void ProcessNativeReportSemaphore(u32 argument);
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
+    /// Texture descriptor that the handle at `offset` in constant buffer 0 selects.
+    std::optional<Texture::TICEntry> ConstBuffer0Image(u32 offset) const;
     void RememberDlssMotionVectors();
     bool TryFireEmblemUpscale(bool allow_history = true);
     void CaptureFireEmblemJitter();

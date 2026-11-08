@@ -210,8 +210,26 @@ public:
         last_accumulation_checkpoint = (std::max)(last_accumulation_checkpoint, num_slots_used);
     }
 
+    // Called at each submission. The running query carries the count across it: a guest's
+    // reset-to-report window can span one.
     void CloseCounter() override {
         PauseCounter();
+        // A title that counts without resetting or reporting grows the query by a slot at every
+        // submission and render pass, and the query keeps every bank it touches alive. Ocarina of
+        // Time's title screen and file select reached 16,384 slots over 64 banks (its gameplay
+        // windows span at most 36 slots). Past a bank, drop the count as a reset would.
+        if (current_query && current_query->size_slots > SamplesQueryBank::BANK_SIZE) {
+            // It drops a real count. Logged on the 1st, 2nd, 4th, 8th... drop, so a window this
+            // long during gameplay doesn't go unnoticed and a title screen doesn't flood the log.
+            ++bank_bound_resets;
+            if ((bank_bound_resets & (bank_bound_resets - 1)) == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "Samples query ran {} slots with no reset or report, dropped its "
+                            "count (drop {})",
+                            current_query->size_slots, bank_bound_resets);
+            }
+            ResetCounter();
+        }
     }
 
     bool HasPendingSync() const override {
@@ -616,6 +634,7 @@ private:
     bool accumulation_since_last_sync{};
     VideoCommon::HostQueryBase* current_query;
     bool has_started{};
+    u64 bank_bound_resets{}; ///< Counts CloseCounter dropped once a query outgrew a bank.
     std::mutex flush_guard;
     std::optional<QueriesPrefixScanPass> queries_prefix_scan_pass;
 };
@@ -1642,6 +1661,21 @@ void QueryCacheRuntime::Barriers(bool is_prebarrier) {
     }
 }
 
+void QueryCacheRuntime::NoteGuestWrittenRanges(std::span<VideoCommon::GuestWrittenRange> ranges) {
+    // The guest memory holds the values: the page uploads the buffer cache does before GPU work
+    // next uses them carry them, as for a guest CPU write. A page holding GPU-written data would
+    // need those bytes kept (WriteMemory downloads or re-uploads them): its value is copied.
+    std::scoped_lock lk(impl->buffer_cache.mutex);
+    for (VideoCommon::GuestWrittenRange& range : ranges) {
+        const DAddr page_begin = Common::AlignDown(range.address, Core::DEVICE_PAGESIZE);
+        const DAddr page_end = Common::AlignUp(range.address + range.size, Core::DEVICE_PAGESIZE);
+        range.needs_copy = impl->buffer_cache.IsRegionGpuModified(page_begin, page_end - page_begin);
+        if (range.mark && !range.needs_copy) {
+            impl->buffer_cache.WriteMemory(range.address, range.size);
+        }
+    }
+}
+
 template <typename SyncValuesType>
 void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer base_src_buffer) {
     if (values.size() == 0) {
@@ -1691,6 +1725,11 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
             const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
             const auto [buffer, offset] = impl->buffer_cache.ObtainCPUBuffer(
                 pair.first, static_cast<u32>(pair.second - pair.first), sync_info, post_op);
+            if (VideoCommon::LazyPayloadSync()) {
+                // A later upload of these pages (a CPU-written release, EDEN_NX2_QUERY_LAZY_SYNC)
+                // must not be moved ahead of this copy into the upload command buffer.
+                buffer->MarkUsage(offset, pair.second - pair.first);
+            }
             impl->buffers_to_upload_to.emplace_back(buffer->Handle(), offset);
         }
     });

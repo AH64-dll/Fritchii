@@ -51,8 +51,8 @@ TEST_CASE("Thread CPU clocks report monotonic execution counters", "[common][dkb
 TEST_CASE("Thread CPU deltas reject missing or replaced counters", "[common][dkb_cpu_trace]") {
     const ThreadSample before{.generation = 3, .active = true, .cpu_ns = 100};
     ThreadSample after{.generation = 3, .active = true, .cpu_ns = 145};
-    REQUIRE(CpuTimeDelta(before, after) == 45);
-    REQUIRE(CpuTimeDelta(before, before) == 0);
+    REQUIRE(CpuTimeDelta(before, after) == 45U);
+    REQUIRE(CpuTimeDelta(before, before) == 0U);
     after.generation = 4;
     REQUIRE_FALSE(CpuTimeDelta(before, after));
     after = before;

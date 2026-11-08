@@ -52,7 +52,7 @@ TEST_CASE("Ampere bindless surfaces preserve predicates", "[video_core][ampere]"
 
 TEST_CASE("Ampere bindless surfaces reject unsupported fields", "[video_core][ampere]") {
     for (const Instruction original : {Load, Store}) {
-        for (const auto [word, bit] : std::array{
+        for (const auto& [word, bit] : std::array{
                  std::pair{1U, 8U}, std::pair{1U, 28U}, std::pair{2U, 12U},
                  std::pair{2U, 13U}, std::pair{2U, 20U}, std::pair{2U, 31U},
                  std::pair{3U, 0U}, std::pair{3U, 30U}}) {

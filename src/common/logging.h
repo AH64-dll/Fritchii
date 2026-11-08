@@ -8,7 +8,9 @@
 
 #include <chrono>
 #include <algorithm>
+#include <string>
 #include <type_traits>
+#include <vector>
 #include <fmt/ranges.h>
 #include "common/swap.h"
 
@@ -142,5 +144,15 @@ void Stop();
 /// The global filter will prevent any messages from even being processed if they are filtered.
 void SetGlobalFilter(const Filter& filter);
 void SetColorConsoleBackendEnabled(bool enabled);
+
+/// A line kept by the in-memory log ring (the debug server's log tail).
+struct RingLine {
+    u64 sequence;
+    std::string text;
+};
+/// Keeps the last `capacity` formatted lines in memory; 0 turns the ring off and empties it.
+void SetRingCapacity(std::size_t capacity);
+/// The kept lines numbered above `after`, oldest first.
+[[nodiscard]] std::vector<RingLine> ReadRing(u64 after);
 
 } // namespace Common::Log

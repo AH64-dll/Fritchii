@@ -7,6 +7,10 @@
 #include <chrono>
 #include <thread>
 
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+
 #include "common/assert.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/scope_exit.h"
@@ -51,8 +55,17 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
     thread = std::jthread([&](std::stop_token stop_token) {
         const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuCommand};
         Common::SetCurrentThreadName("GPU");
+#ifdef __linux__
+        // The pending-channel polls below sleep 50 us; the default timer slack adds up to 50 more.
+        prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
+#endif
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
         Common::SetCurrentThreadToPerformanceCores();
+        if (Settings::values.pin_gpu_threads.GetValue()) {
+            Common::PinCurrentThread(Common::PinnedRole::GpuFront);
+        } else {
+            Common::PinHostThread(Common::HostThreadRole::GpuFront);
+        }
         system.RegisterHostThread();
 
         auto current_context = context.Acquire();
@@ -71,13 +84,22 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     scheduler.ResumePending(system.GPU());
                 }
                 if (!state.queue.TryPop(next)) {
+                    // EDEN_NX2_PUBLISH_WAITS: what the resumed channels sent goes to the back
+                    // before this thread yields or sleeps (Commit publishes every 256 words).
+                    if (split.Active()) {
+                        split.PublishBeforeWait();
+                    }
                     // The CPU usually releases the semaphore soon after: poll for half a
-                    // millisecond before sleeping, or every wait also waits out a host sleep
-                    // (title 1 waits ~25 times a second).
+                    // millisecond, then in short sleeps. Ocarina of Time waits here ~330 times a
+                    // second and its present waits for the work behind them: with 1 ms sleeps the
+                    // present waited ~17 ms a frame in Kokiri village, with 50 us ~1 ms. A channel
+                    // still waiting after 2 s (menus, loading) goes back to 1 ms sleeps.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
-                    if (std::chrono::steady_clock::now() - last_progress <
-                        std::chrono::microseconds{500}) {
+                    const auto waited = std::chrono::steady_clock::now() - last_progress;
+                    if (waited < std::chrono::microseconds{500}) {
                         std::this_thread::yield();
+                    } else if (waited < std::chrono::seconds{2}) {
+                        std::this_thread::sleep_for(std::chrono::microseconds{50});
                     } else {
                         std::this_thread::sleep_for(std::chrono::milliseconds{1});
                     }
@@ -118,6 +140,11 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     });
                 } else {
                     ASSERT(false);
+                }
+                if (!std::holds_alternative<SubmitListCommand>(next.data)) {
+                    // Syncs, maps, flushes and composites write guest memory anywhere.
+                    split.NoteUnboundedWrite(false,
+                                             VideoCommon::UnboundedCause::GpuThreadCommand);
                 }
                 split.Defer([state_ptr = &state, fence = next.fence, block = next.block] {
                     SignalCommand(*state_ptr, fence, block);

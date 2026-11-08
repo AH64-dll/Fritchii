@@ -52,11 +52,17 @@ public:
     ComputePipeline& operator=(const ComputePipeline&) = delete;
     ComputePipeline(const ComputePipeline&) = delete;
 
+    using BindCommand = std::function<void(vk::CommandBuffer)>;
+
     [[nodiscard]] bool Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                  Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
                                  BufferCache& buffer_cache, TextureCache& texture_cache,
                                  TextureCacheRuntime& texture_runtime,
-                                 std::optional<ByteAddressedShadow>& shadow);
+                                 std::optional<ByteAddressedShadow>& shadow,
+                                 BindCommand* deferred_bind = nullptr);
+
+    static constexpr u64 Ocarina1440pShader = 0x6bd913e1f34e83ebULL;
+    [[nodiscard]] bool CanReplaceOcarinaUpscale() const;
 
     bool IsBound() const noexcept {
         return static_cast<bool>(pipeline);
@@ -74,15 +80,21 @@ public:
     struct SampledImage {
         u32 tic;
         VideoCommon::ImageViewId id;
+        VideoCommon::SamplerId sampler;
     };
 
-    /// The textures sampled by the last configured dispatch, kept for EDEN_NX2_FRAME_DUMP_SAMPLED.
+    /// The textures sampled by the last configured dispatch, kept while a sampled frame dump runs.
     [[nodiscard]] std::span<const SampledImage> SampledImages() const noexcept {
         return sampled_images;
     }
 
     /// Advances the frame window of EDEN_NX2_UPSCALER_TRACE
     static void TickUpscalerTrace();
+
+    /// Whether no build of this pipeline is left queued on a worker thread, which holds it
+    [[nodiscard]] bool IsBuildTaskDone() const noexcept {
+        return build_task_done.load(std::memory_order::acquire);
+    }
 
 private:
     /// Builds the pipeline once, on whichever thread gets here first.
@@ -105,6 +117,13 @@ private:
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
     DescriptorBufferLayout descriptor_buffer_layout;
+    std::vector<u32> binding_kinds; ///< EDEN_NX2_BINDMEMO: per texture/image view, in read order
+    // EDEN_NX2_BINDCACHE: the previous dispatch's descriptor buffer allocation
+    std::vector<DescriptorUpdateEntry> last_descriptor_payload;
+    VkDeviceSize last_descriptor_buffer_offset{};
+    u32 last_descriptor_buffer_chunk{};
+    u64 last_descriptor_buffer_generation{};
+    bool has_last_descriptor_buffer{};
     DescriptorAllocator descriptor_allocator;
     vk::PipelineLayout pipeline_layout;
     vk::DescriptorUpdateTemplate descriptor_update_template;
@@ -112,6 +131,7 @@ private:
 
     std::function<void()> build_task;
     std::atomic_bool build_claimed{false};
+    std::atomic_bool build_task_done{true};
     std::condition_variable build_condvar;
     std::mutex build_mutex;
     std::atomic_bool is_built{false};

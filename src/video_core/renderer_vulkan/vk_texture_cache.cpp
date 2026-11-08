@@ -33,6 +33,7 @@
 
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/renderer_vulkan/blit_image.h"
+#include "video_core/renderer_vulkan/framebuffer_limits.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
@@ -453,7 +454,8 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
 [[nodiscard]] vk::Image MakeImage(const Device& device, const MemoryAllocator& allocator,
                                   const ImageInfo& info, std::span<const VkFormat> view_formats,
                                   std::optional<VkFormat> format_override = {},
-                                  bool unbacked = false, bool aliased = false) {
+                                  bool unbacked = false, bool aliased = false,
+                                  bool may_fail = false) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -486,7 +488,7 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
             return image;
         }
     }
-    return allocator.CreateImage(image_ci);
+    return may_fail ? allocator.TryCreateImage(image_ci) : allocator.CreateImage(image_ci);
 }
 
 [[nodiscard]] vk::ImageView MakeStorageView(const vk::Device& device, u32 level, VkImage image,
@@ -2899,8 +2901,12 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    UsesSparseTiles(runtime_.device, info, gpu_addr_) ||
                                    IsUnwrittenSparse(runtime_.device, info, gpu_addr_),
                                UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
-                                   SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased)),
+                                   SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
+                               true)),
       aspect_mask(ImageAspectMask(info.format)) {
+    if (OutOfMemory()) {
+        return;
+    }
     if (original_image.IsUnbacked()) {
         flags |= VideoCommon::ImageFlagBits::Unbacked;
         const ImageInfo host_info = TrimmedHostInfo(runtime_.device, info, host_level_offset);
@@ -4493,6 +4499,7 @@ void CustomBorderColorBudget::Release() noexcept {
 Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& tsc) {
     const auto& device = runtime.device;
     device_ptr = &device;
+    descriptor = tsc;
     border_color = tsc.BorderColor();
     srgb_border_color = tsc.SrgbBorderColor();
 
@@ -4804,6 +4811,12 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
     runtime_ptr = &runtime;
     render_area.width = (std::min)(render_area.width, width);
     render_area.height = (std::min)(render_area.height, height);
+    const FramebufferSize size = ClampFramebufferSize(
+        {render_area.width, render_area.height, layers},
+        {runtime.device.GetMaxFramebufferWidth(), runtime.device.GetMaxFramebufferHeight(),
+         runtime.device.GetMaxFramebufferLayers()});
+    render_area = VkExtent2D{.width = size.width, .height = size.height};
+    layers = size.layers;
 
     if (do_resolve_color) {
         for (size_t index = 0; index < NUM_RT; ++index) {
@@ -4938,25 +4951,44 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
         pending = std::move(*reusable);
         free_transcodes.erase(reusable);
     } else {
+        const VkImageCreateInfo decode_ci{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = DecodeFormat,
+            .extent = {width, height, 1},
+            .mipLevels = levels,
+            .arrayLayers = layers,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        vk::Image decode = memory_allocator.TryCreateImage(decode_ci, true);
+        if (!decode && !free_transcodes.empty()) {
+            // The GPU is done with these: their memory goes back to the driver now.
+            free_transcodes.clear();
+            decode = memory_allocator.TryCreateImage(decode_ci, true);
+        }
+        if (!decode) {
+            static u32 logged{};
+            if (logged++ < 32) {
+                LOG_ERROR(Render_Vulkan,
+                          "No memory to decode ASTC image {:#x} ({}x{}, {} levels); uploading it "
+                          "again when it is next used",
+                          image.gpu_addr, width, height, levels);
+            }
+            image.flags |= VideoCommon::ImageFlagBits::CpuModified;
+            TransitionImageLayout(image);
+            return;
+        }
         pending = PendingTranscode{
             .tick = 0,
-            .image = memory_allocator.CreateImage(VkImageCreateInfo{
-                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .imageType = VK_IMAGE_TYPE_2D,
-                .format = DecodeFormat,
-                .extent = {width, height, 1},
-                .mipLevels = levels,
-                .arrayLayers = layers,
-                .samples = VK_SAMPLE_COUNT_1_BIT,
-                .tiling = VK_IMAGE_TILING_OPTIMAL,
-                .usage = VK_IMAGE_USAGE_STORAGE_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .queueFamilyIndexCount = 0,
-                .pQueueFamilyIndices = nullptr,
-                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-            }, true),
+            .image = std::move(decode),
             .views = {},
             .width = width,
             .height = height,

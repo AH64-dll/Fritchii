@@ -47,8 +47,8 @@ TEST_CASE("Ampere per-tap gathers pass proven constant offsets to Maxwell TLD4.P
                 REQUIRE(lowered.required_texture_buffer == 14);
                 const u64 pred = u64{guard} << 16;
                 const std::array<u64, 9> expected{
-                    MoveImmediate(pred, 248, packed),
-                    MoveImmediate(pred, 249, 0x01000001),
+                    MoveImmediate(7ULL << 16, 248, packed),
+                    MoveImmediate(7ULL << 16, 249, 0x01000001),
                     Copy(pred, 250, 4),
                     Copy(pred, 251, 5),
                     0xc800000000000000ULL | pred | 250 | (250ULL << 8) | (248ULL << 20) |
@@ -108,7 +108,7 @@ TEST_CASE("Ampere per-tap gathers reject unproven offsets and unsupported modes"
             REQUIRE(lowered.error == "native per-tap gather offset range");
         }
     }
-    for (const u32 bit : {60U, 72U, 76U, 78U, 79U, 80U, 81U, 89U, 91U}) {
+    for (const u32 bit : {60U, 72U, 76U, 78U, 80U, 81U, 89U, 91U}) {
         auto invalid = PerTapProgram();
         invalid[2].words[bit / 32] ^= 1U << (bit % 32);
         INFO("bit " << bit);
@@ -155,6 +155,106 @@ TEST_CASE("Ampere gathers without per-tap offsets keep their previous lowering",
         REQUIRE(((tld4 >> 20) & 255) == (offsets ? 246U : 255U));
         REQUIRE(((tld4 >> 54) & 3) == offsets);
     }
+}
+
+TEST_CASE("Ampere depth gathers preserve coordinates reference and result pairs",
+          "[video_core][ampere][gather]") {
+    for (const u32 guard : {1U, 7U, 9U}) {
+        for (const u32 nodep : {0U, 1U}) {
+            Instruction gather{{0x180c7b63, 0x30800e1c, 0x001e4f0e, 0x000f4200}};
+            gather.words[0] = (gather.words[0] & ~0xf000U) | (guard << 12);
+            gather.words[2] |= nodep << 26;
+            const auto lowered = LowerToMaxwell(std::array{gather, Exit});
+            INFO(lowered.error);
+            REQUIRE(lowered);
+            REQUIRE(lowered.required_texture_buffer == 2);
+            const u64 pred = u64{guard} << 16;
+            const std::array<u64, 8> expected{
+                Copy(pred, 250, 24), Copy(pred, 251, 25), Copy(pred, 246, 28),
+                0xc800000000000000ULL | pred | 250 | (250ULL << 8) | (246ULL << 20) |
+                    (2ULL << 28) | (15ULL << 31) | (14ULL << 36) | (u64{nodep} << 49) |
+                    (1ULL << 50) | (7ULL << 51),
+                Copy(pred, 12, 250), Copy(pred, 13, 251),
+                Copy(pred, 14, 252), Copy(pred, 15, 253),
+            };
+            REQUIRE(std::equal(expected.begin(), expected.end(), lowered.instructions.begin()));
+            REQUIRE(lowered.instructions.size() == expected.size() + 1);
+        }
+    }
+}
+
+TEST_CASE("Ampere half gathers prove literal IMAD offsets across outgoing branches",
+          "[video_core][ampere][gather]") {
+    const std::array code{
+        Instruction{{0xff007424, 0x00010000, 0x078e00ff, 0}},
+        Instruction{{0xff017424, 0x01010100, 0x078e00ff, 0}},
+        Instruction{{0x00000947, 16, 0x03800000, 0}},
+        Instruction{{0x0a0c7b63, 0x30003000, 0x001eaf0d, 0}},
+        Exit,
+    };
+    const auto lowered = LowerToMaxwell(code);
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    const auto start = lowered.source_instruction_offsets[3];
+    CHECK(lowered.instructions[start] == MoveImmediate(7ULL << 16, 248, 0x00010000));
+    CHECK(lowered.instructions[start + 1] == MoveImmediate(7ULL << 16, 249, 0x01010100));
+    auto invalid = code;
+    invalid[2].words[1] = 0;
+    CHECK(LowerToMaxwell(invalid).error == "native per-tap gather control-flow proof");
+    invalid = code;
+    invalid[0].words[0] = 0xff001424;
+    CHECK(LowerToMaxwell(invalid).error == "native per-tap gather nonconstant offsets");
+    invalid = code;
+    invalid[2].words = {0x00007805, 0, 0x0001ff00, 0};
+    CHECK(LowerToMaxwell(invalid).error == "native per-tap gather nonconstant offsets");
+}
+
+TEST_CASE("Ampere guarded IMAD offsets remain constant across unrelated predicates",
+          "[video_core][ampere][gather]") {
+    const std::array code{
+        Instruction{{0xff109424, 0xfffeffff, 0x078e00ff, 0}},
+        Instruction{{0xff119424, 0xfffcfffd, 0x078e00ff, 0}},
+        Instruction{{0x1c1a7212, 0xff, 0x0784a003, 0}},
+        Instruction{{0x0000281c, 0, 0x03f0f070, 0}},
+        Instruction{{0x00002947, 16, 0x03800000, 0}},
+        Instruction{{0x06189b63, 0x30007c10, 0x001e2f0e, 0}},
+        Exit,
+    };
+    const auto lowered = LowerToMaxwell(code);
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    const auto start = lowered.source_instruction_offsets[5];
+    CHECK(lowered.instructions[start] == MoveImmediate(7ULL << 16, 248, 0xfffeffff));
+    CHECK(lowered.instructions[start + 1] == MoveImmediate(7ULL << 16, 249, 0xfffcfffd));
+    CHECK(((lowered.instructions[start + 4] >> 54) & 3) == 2);
+    for (const u32 definition : {0U, 1U}) {
+        for (const u32 guard : {1U, 2U, 7U}) {
+            auto changed = code;
+            changed[definition].words[0] = (changed[definition].words[0] & ~0xf000U) | (guard << 12);
+            if (guard == 7) {
+                CHECK(LowerToMaxwell(changed));
+            } else {
+                CHECK(LowerToMaxwell(changed).error == "native per-tap gather nonconstant offsets");
+            }
+        }
+    }
+    for (const u32 instruction : {2U, 3U}) {
+        auto invalid = code;
+        invalid[instruction].words[2] = (invalid[instruction].words[2] & ~(7U << 17)) | (1U << 17);
+        CHECK(LowerToMaxwell(invalid).error == "native per-tap gather nonconstant offsets");
+    }
+    auto invalid = code;
+    invalid[3].words[2] = (invalid[3].words[2] & ~(7U << 20)) | (1U << 20);
+    CHECK(LowerToMaxwell(invalid).error == "native per-tap gather nonconstant offsets");
+    invalid = code;
+    invalid[2].words = {0x041c7810, 4, 0x07f3e0ff, 0};
+    CHECK(LowerToMaxwell(invalid).error == "native per-tap gather nonconstant offsets");
+    invalid = code;
+    invalid[4].words[1] = 0;
+    CHECK(LowerToMaxwell(invalid).error == "native per-tap gather control-flow proof");
+    invalid = code;
+    invalid[2].words = {0x00107805, 0, 0x0001ff00, 0};
+    CHECK(LowerToMaxwell(invalid).error == "native per-tap gather nonconstant offsets");
 }
 
 TEST_CASE("Ampere half texture results keep the first component in the low lane",
@@ -285,4 +385,48 @@ TEST_CASE("Ampere array depth comparisons support nonlegacy descriptor bindings"
     const auto begin = mixed.instructions.begin() + mixed.source_instruction_offsets[1];
     REQUIRE(std::equal(alternate.begin(), alternate.end(), begin));
     REQUIRE(begin + alternate.size() + 1 == mixed.instructions.end());
+}
+
+TEST_CASE("Ampere gathers from a second descriptor buffer lower to Maxwell TLD4.B",
+          "[video_core][ampere][gather]") {
+    // The depth gather binds descriptor buffer 2; the gathers after it read buffer 14, whose
+    // handle at c[14][0x10] is loaded with MOV and passed as the first TLD4.B meta register.
+    const Instruction depth{{0x180c7b63, 0x30800e1c, 0x001e4f0e, 0x000f4200}};
+    const u64 pred = 7ULL << 16;
+    const u64 handle = 0x4c98000000070000ULL | (15ULL << 39) | (4ULL << 20) | (14ULL << 34);
+    const auto tld4b = [&](u32 meta, u32 offset_type) -> u64 {
+        return 0xdec0000000000000ULL | pred | 250 | (250ULL << 8) | (u64{meta} << 20) |
+               (2ULL << 28) | (15ULL << 31) | (u64{offset_type} << 36) | (1ULL << 49) |
+               (7ULL << 51);
+    };
+    const std::array<u64, 4> results{Copy(pred, 10, 250), Copy(pred, 11, 251), Copy(pred, 8, 252),
+                                     Copy(pred, 9, 253)};
+    const auto check = [&](const auto& lowered, u32 index, const auto& expected) {
+        INFO(lowered.error);
+        REQUIRE(lowered);
+        REQUIRE(lowered.required_texture_buffer == 2);
+        const auto begin = lowered.instructions.begin() + lowered.source_instruction_offsets[index];
+        REQUIRE(std::equal(expected.begin(), expected.end(), begin));
+        REQUIRE(std::equal(results.begin(), results.end(), begin + expected.size()));
+    };
+    // Plain and AOFFI: the handle in R246, the offset register after it.
+    const Instruction plain{{0x040a7b63, 0x33800408, 0x041e0f08, 0x100fc200}};
+    check(LowerToMaxwell(std::array{depth, plain, Exit}), 1,
+          std::array<u64, 4>{Copy(pred, 250, 4), Copy(pred, 251, 8), handle | 246, tld4b(246, 0)});
+    auto aoffi = plain;
+    aoffi.words[2] |= 1U << 12;
+    check(LowerToMaxwell(std::array{depth, aoffi, Exit}), 1,
+          std::array<u64, 5>{Copy(pred, 250, 4), Copy(pred, 251, 5), handle | 246, Copy(pred, 247, 8),
+                     tld4b(246, 1)});
+    // PTP: the handle in R247, so the packed offsets stay in R248 and R249.
+    const auto per_tap = PerTapProgram();
+    check(LowerToMaxwell(std::array{depth, per_tap[0], per_tap[1], per_tap[2], Exit}), 3,
+          std::array<u64, 6>{MoveImmediate(7ULL << 16, 248, 0xff00ff00),
+                     MoveImmediate(7ULL << 16, 249, 0x01000001), Copy(pred, 250, 4),
+                     Copy(pred, 251, 5), handle | 247, tld4b(247, 2)});
+    // Gathers from the bound buffer keep the bound TLD4.
+    const auto same = LowerToMaxwell(std::array{plain, plain, Exit});
+    INFO(same.error);
+    REQUIRE(same);
+    REQUIRE((same.instructions[same.source_instruction_offsets[1] + 2] >> 56) == 0xc8);
 }

@@ -37,7 +37,7 @@ TEST_CASE("Fast Fusion formatted stores preserve channel masks and barriers", "[
             const auto lowered = LowerToMaxwell(std::array{store, Exit});
             INFO(lowered.error);
             REQUIRE(lowered);
-            REQUIRE(lowered.instructions.size() == (strong ? 4 : 2));
+            REQUIRE(lowered.instructions.size() == (strong ? 4U : 2U));
             const auto encoded = lowered.instructions[strong ? 1 : 0];
             CHECK(((encoded >> 20) & 15) == mask);
             CHECK((encoded & 255) == 4);

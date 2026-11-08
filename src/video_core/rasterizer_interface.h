@@ -34,6 +34,10 @@ struct TICEntry;
 }
 } // namespace Tegra
 
+namespace VideoCommon::OotNetwork {
+struct BypassState;
+}
+
 namespace VideoCore {
 
 enum class LoadCallbackStage {
@@ -91,6 +95,11 @@ public:
     /// Release all pending fences.
     virtual void ReleaseFences(bool force = true) = 0;
 
+    /// Writes the region's query reports to guest memory, waiting for pending host results.
+    virtual void FlushQueryResults(DAddr addr, u64 size) {
+        FlushRegion(addr, size, VideoCommon::CacheType::QueryCache);
+    }
+
     /// Notify rasterizer that all caches should be flushed to Switch memory
     virtual void FlushAll() = 0;
 
@@ -116,15 +125,39 @@ public:
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
 
+    virtual void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
+        for (const DAddr page : pages) {
+            FlushRegion(page, 0x1000, VideoCommon::CacheType::BufferCache);
+        }
+    }
+
     /// Check if the the specified memory area requires flushing to CPU Memory.
     virtual bool MustFlushRegion(DAddr addr, u64 size,
                                  VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
 
     virtual RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) = 0;
 
+    /// EDEN_NX2_REACTIVE_ASYNC_FLUSH, on the GPU thread for a guest read: queues the GPU-written
+    /// buffer data in the range for download at a fence submitted now, without waiting for the
+    /// host GPU; the reader waits for it to land (Nx2Reactive::WaitLanding). False when it can't
+    /// (image data, nothing queued): the caller flushes.
+    virtual bool QueueFlushRegion([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size) {
+        return false;
+    }
+
+    /// Whether reports in the range wait for host query results not yet in guest memory.
+    [[nodiscard]] virtual bool HasPendingQueries([[maybe_unused]] DAddr addr,
+                                                 [[maybe_unused]] u64 size) {
+        return false;
+    }
+
     /// Notify rasterizer that any caches of the specified region should be invalidated
     virtual void InvalidateRegion(DAddr addr, u64 size,
                                   VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
+
+    /// Called before guest memory in the region is overwritten, ahead of InvalidateRegion
+    virtual void PrepareRegionWrite([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size,
+                                    [[maybe_unused]] VideoCommon::CacheType which) {}
 
     virtual void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
         if (!Settings::values.skip_cpu_inner_invalidation.GetValue()) {
@@ -136,6 +169,13 @@ public:
 
     /// Notify rasterizer that any caches of the specified region are desync with guest
     virtual void OnCacheInvalidation(PAddr addr, u64 size) = 0;
+
+    /// OnCacheInvalidation for each of the CPU writes InvalidateGPUCache collected.
+    virtual void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+        for (const auto& [addr, size] : ranges) {
+            OnCacheInvalidation(addr, size);
+        }
+    }
 
     virtual bool TryCacheInvalidation(DAddr addr, u64 size) {
         if (MustFlushRegion(addr, size, VideoCommon::CacheType::BufferCache)) return false;
@@ -218,6 +258,12 @@ public:
     [[nodiscard]] virtual std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
         const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst) {
         return std::nullopt;
+    }
+
+    /// State of the Ocarina of Time anti-aliasing network bypass (oot_network.h), or null when
+    /// this backend cannot bypass it or NVIDIA DLSS replaces the same output pass.
+    [[nodiscard]] virtual VideoCommon::OotNetwork::BypassState* OotNetworkBypass() {
+        return nullptr;
     }
 
     [[nodiscard]] virtual Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() = 0;

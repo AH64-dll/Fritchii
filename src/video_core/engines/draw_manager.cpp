@@ -11,6 +11,7 @@
 #include "common/settings.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/render_trace.h"
 
@@ -98,12 +99,20 @@ void Maxwell3D::DrawManager::Clear(Maxwell3D& maxwell3d, u32 layer_count) {
 }
 
 void Maxwell3D::DrawManager::DrawDeferred(Maxwell3D& maxwell3d, bool loop_continues) {
+    VideoCommon::Nx2Profile::Scope zone{VideoCommon::Nx2Profile::Zone::DrawManager};
     if (draw_state.draw_mode != DrawMode::Instance || draw_state.instance_count == 0) {
+        if (first_folded) [[unlikely]] {
+            // The loop a folded first instance began never came: draw it on its own after all.
+            first_folded = false;
+            draw_state.draw_mode = DrawMode::General;
+            DrawEnd(maxwell3d);
+        }
         if (!loop_continues) {
             draw_state.drawn_instances = 0;
         }
         return;
     }
+    first_folded = false;
     // The first draw of a batch also covers the loop's first instance; a batch that continues a
     // loop split by a register write draws only the instances after the ones already drawn.
     const bool continued = draw_state.drawn_instances != 0;
@@ -232,6 +241,7 @@ void Maxwell3D::DrawManager::SetInlineIndexBuffer(Maxwell3D& maxwell3d, u32 meth
 }
 
 void Maxwell3D::DrawManager::DrawBegin(Maxwell3D& maxwell3d) {
+    VideoCommon::Nx2Profile::Scope zone{VideoCommon::Nx2Profile::Zone::DrawManager};
     auto reset_instance_count = maxwell3d.regs.draw.instance_id == Maxwell3D::Regs::Draw::InstanceId::First;
     auto increment_instance_count = maxwell3d.regs.draw.instance_id == Maxwell3D::Regs::Draw::InstanceId::Subsequent;
     if (reset_instance_count) {
@@ -246,6 +256,17 @@ void Maxwell3D::DrawManager::DrawBegin(Maxwell3D& maxwell3d) {
 }
 
 void Maxwell3D::DrawManager::DrawEnd(Maxwell3D& maxwell3d, u32 instance_count, bool force_draw) {
+    VideoCommon::Nx2Profile::Scope zone{VideoCommon::Nx2Profile::Zone::DrawManager};
+    if (fold_first_instance) [[unlikely]] {
+        fold_first_instance = false;
+        if (draw_state.draw_mode == DrawMode::General && !force_draw &&
+            draw_state.instance_count == 0) {
+            // FoldFirstInstance: DrawDeferred draws this instance with the loop's others.
+            draw_state.draw_mode = DrawMode::Instance;
+            first_folded = true;
+            return;
+        }
+    }
     switch (draw_state.draw_mode) {
     case DrawMode::Instance:
         if (!force_draw) {

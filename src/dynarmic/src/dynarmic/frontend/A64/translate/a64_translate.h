@@ -38,6 +38,12 @@ struct TranslationOptions {
     /// If this is false, we treat the instruction as a NOP.
     /// If this is true, we emit an ExceptionRaised instruction.
     bool hook_hint_instructions = true;
+
+    /// DMB xxLD and DMB xxST are translated as NOPs (for TSO hosts).
+    bool elide_ld_st_barriers = false;
+
+    /// LSE atomics (not CASP) become AtomicRmwMemory/AtomicCasMemory (x64 backend only).
+    bool native_lse_atomics = false;
 };
 
 /**

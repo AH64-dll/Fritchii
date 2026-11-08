@@ -16,6 +16,25 @@ constexpr auto TwoVblanks = 33'333'333ns;
 constexpr auto ThreeVblanks = 50'000'000ns;
 }
 
+TEST_CASE("NX2 FPS limit only lengthens a vblank it is below", "[core][nx2_present_pacer]") {
+    using Service::PacedInterval;
+    // 0 leaves the game's own vblank and swap interval untouched.
+    REQUIRE(PacedInterval(OneVblank, 0) == OneVblank);
+    REQUIRE(PacedInterval(TwoVblanks, 0) == TwoVblanks);
+    // 60 Hz is exactly the one-vblank interval; 120 Hz is faster than the game asked for.
+    REQUIRE(PacedInterval(OneVblank, 60) == OneVblank);
+    REQUIRE(PacedInterval(OneVblank, 120) == OneVblank);
+    REQUIRE(PacedInterval(TwoVblanks, 60) == TwoVblanks);
+    // Lower limits hold a frame for longer: 50, 30, 20 and 15 Hz from one 60 Hz vblank.
+    REQUIRE(PacedInterval(OneVblank, 50) == 20'000'000ns);
+    REQUIRE(PacedInterval(OneVblank, 30) == 33'333'333ns);
+    REQUIRE(PacedInterval(OneVblank, 20) == 50'000'000ns);
+    REQUIRE(PacedInterval(OneVblank, 15) == 66'666'666ns);
+    // A game already pacing at two vblanks keeps that when the limit is not slower still.
+    REQUIRE(PacedInterval(TwoVblanks, 40) == TwoVblanks);
+    REQUIRE(PacedInterval(TwoVblanks, 20) == 50'000'000ns);
+}
+
 TEST_CASE("NX2 interval decreases apply to the current present", "[core][nx2_present_pacer]") {
     Pacer pacer;
     REQUIRE(pacer.Advance(Start, ThreeVblanks).reset);

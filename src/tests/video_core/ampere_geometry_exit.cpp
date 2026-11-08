@@ -265,7 +265,7 @@ TEST_CASE("Kirby geometry calls return before the exit handler", "[video_core][a
     CHECK((lowered.instructions[offsets[14]] & 0xfff8000000000000ULL) == 0xfbe0000000000000ULL);
     CHECK(lowered.instructions.back() == 0xe30000000007000fULL);
     const auto address = [](u32 i) { return 0x50U + i * 8 + ((i + 1) / 3) * 8; };
-    for (const auto [source, target] : {std::pair{11U, 13U}, std::pair{12U, 14U}}) {
+    for (const auto& [source, target] : {std::pair{11U, 13U}, std::pair{12U, 14U}}) {
         const u64 instruction = lowered.instructions[offsets[source]];
         const s64 relative = static_cast<s64>((instruction >> 20) & 0xffffff) << 40 >> 40;
         CHECK(s64{address(offsets[source])} + 8 + relative == address(offsets[target]));

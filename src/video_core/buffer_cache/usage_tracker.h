@@ -6,12 +6,17 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <span>
 #include <utility>
 #include <vector>
 
 #include "common/alignment.h"
 #include "common/common_types.h"
+#include "common/logging.h"
+#include "video_core/nx2_perf.h"
 
 namespace VideoCommon {
 
@@ -27,8 +32,14 @@ public:
     }
 
     void Reset() noexcept {
+        if (!tracked) {
+            return;
+        }
+        tracked = false;
         std::ranges::fill(pages, 0ULL);
         recent.fill({~u64{0}, 0});
+        full_begin = 0;
+        full_end = 0;
     }
 
     void Track(u64 offset, u64 size) noexcept {
@@ -40,6 +51,7 @@ public:
                 return;
             }
         }
+        tracked = true;
         recent[recent_cursor++ % recent.size()] = {offset, size};
         const size_t page = offset >> BUFFER_PAGE_SHIFT;
         const size_t page_end = (offset + size) >> BUFFER_PAGE_SHIFT;
@@ -50,9 +62,7 @@ public:
         if (page == page_end) {
             return;
         }
-        for (size_t i = page + 1; i < page_end; i++) {
-            pages[i] = ~u64{0};
-        }
+        FillPages(page + 1, page_end);
         const size_t offset_end = offset + size;
         const size_t offset_end_page_aligned = Common::AlignDown(offset_end, BUFFER_PAGE_BYTES);
         TrackPage(page_end, offset_end_page_aligned, offset_end - offset_end_page_aligned);
@@ -77,19 +87,70 @@ public:
         return IsPageUsed(page_end, offset_end_page_aligned, offset_end - offset_end_page_aligned);
     }
 
+    [[nodiscard]] std::span<const u64> Pages() const noexcept {
+        return pages;
+    }
+
 private:
+    void FillPages(size_t begin, size_t end) noexcept {
+        if (begin >= end) {
+            return;
+        }
+        // Pages in [full_begin, full_end) are all ones already (only Reset clears a page): fill
+        // around that run and grow it. Keeps tracking a multi-megabyte binding O(1) once filled.
+        if (end < full_begin || begin > full_end) {
+            std::fill(pages.begin() + begin, pages.begin() + end, ~u64{0});
+            if (end - begin > full_end - full_begin) {
+                full_begin = begin;
+                full_end = end;
+            }
+            return;
+        }
+        if (Nx2Perf::Verify()) {
+            static std::atomic<u32> logged{};
+            const size_t check_begin = (std::max)(begin, full_begin);
+            const size_t check_end = (std::min)(end, full_end);
+            if (!std::all_of(pages.begin() + check_begin, pages.begin() + check_end,
+                             [](u64 page) { return page == ~u64{0}; }) &&
+                logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+                LOG_ERROR(HW_GPU, "Nx2Perf draw-binds: usage pages {}..{} not all tracked",
+                          check_begin, check_end);
+            }
+            std::fill(pages.begin() + begin, pages.begin() + end, ~u64{0});
+        } else {
+            if (begin < full_begin) {
+                std::fill(pages.begin() + begin, pages.begin() + full_begin, ~u64{0});
+            }
+            if (end > full_end) {
+                std::fill(pages.begin() + full_end, pages.begin() + end, ~u64{0});
+            }
+        }
+        full_begin = (std::min)(begin, full_begin);
+        full_end = (std::max)(end, full_end);
+    }
+
     void TrackPage(u64 page, u64 offset, u64 size) noexcept {
+        if (size == 0) {
+            return;
+        }
         const size_t offset_in_page = offset % BUFFER_PAGE_BYTES;
         const size_t first_bit = offset_in_page >> BUFFER_BYTES_PER_BITSHIFT;
-        const size_t num_bits = std::min<size_t>(size, BUFFER_PAGE_BYTES) >> BUFFER_BYTES_PER_BITSHIFT;
+        const size_t bytes = std::min<size_t>(size, BUFFER_PAGE_BYTES - offset_in_page);
+        const size_t last_bit = (offset_in_page + bytes - 1) >> BUFFER_BYTES_PER_BITSHIFT;
+        const size_t num_bits = last_bit - first_bit + 1;
         const size_t mask = ~u64{0} >> (64 - num_bits);
         pages[page] |= (~u64{0} & mask) << first_bit;
     }
 
     bool IsPageUsed(u64 page, u64 offset, u64 size) const noexcept {
+        if (size == 0) {
+            return false;
+        }
         const size_t offset_in_page = offset % BUFFER_PAGE_BYTES;
         const size_t first_bit = offset_in_page >> BUFFER_BYTES_PER_BITSHIFT;
-        const size_t num_bits = std::min<size_t>(size, BUFFER_PAGE_BYTES) >> BUFFER_BYTES_PER_BITSHIFT;
+        const size_t bytes = std::min<size_t>(size, BUFFER_PAGE_BYTES - offset_in_page);
+        const size_t last_bit = (offset_in_page + bytes - 1) >> BUFFER_BYTES_PER_BITSHIFT;
+        const size_t num_bits = last_bit - first_bit + 1;
         const size_t mask = ~u64{0} >> (64 - num_bits);
         const size_t mask2 = (~u64{0} & mask) << first_bit;
         return (pages[page] & mask2) != 0;
@@ -100,6 +161,10 @@ private:
     /// Ranges tracked last, (offset, size).
     std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
     size_t recent_cursor{};
+    /// Pages known to be all ones (FillPages).
+    size_t full_begin{};
+    size_t full_end{};
+    bool tracked{};
 };
 
 } // namespace VideoCommon

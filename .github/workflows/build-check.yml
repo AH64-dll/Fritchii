@@ -1,0 +1,256 @@
+name: build-check
+
+on:
+  pull_request:
+    branches: [nx2]
+  push:
+    branches: [nx2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push cancels a pull request's run; nx2 runs finish so each merge saves its compiler cache.
+concurrency:
+  group: build-check-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: Detect source changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      build: ${{ steps.files.outputs.build }}
+    steps:
+      - name: Skip builds for documentation-only pull requests
+        id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          build=true
+          if [ -n "$PR" ]; then
+            files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename')
+            if ! printf '%s\n' "$files" | grep -qvE '^(docs/.*|.*\.md)$'; then
+              build=false
+            fi
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  linux-gcc:
+    name: Linux GCC 13 production build and tests
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 1G
+      CCACHE_COMPILERCHECK: content
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf gcc-13 g++-13 git glslang-tools libglu1-mesa-dev \
+            libpulse-dev libtool libudev-dev libxkbcommon-x11-0 \
+            mesa-common-dev nasm ninja-build qt6-base-private-dev \
+            qt6-charts-dev qt6-tools-dev libavfilter-dev libavcodec-dev \
+            libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
+            spirv-tools spirv-headers libusb-1.0-0-dev \
+            libboost-dev libboost-fiber-dev libboost-context-dev \
+            libopus-dev libasound2-dev ccache pipx \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+          pipx install cmake==4.4.4
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06
+        with:
+          version: "6.8.3"
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          modules: qtcharts
+          cache: true
+
+      # Objects are keyed by content, so the newest cache of this branch or nx2 always helps;
+      # keying it on cpmfile.json threw the whole cache away whenever a dependency changed.
+      - name: Restore dependencies and compiler objects
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: |
+            .cache/cpm
+            .ccache
+          key: gcc13-qt683-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            gcc13-qt683-${{ runner.os }}-
+
+      - name: Configure production and tests
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-13 \
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            -DENABLE_WERROR=ON \
+            -DBUILD_TESTING=ON \
+            -DYUZU_TESTS=ON \
+            -DENABLE_QT=ON \
+            -DYUZU_CMD=ON \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF \
+            "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR" \
+            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DVulkanHeaders_FORCE_BUNDLED=ON \
+            -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+            -DENABLE_UPDATE_CHECKER=ON \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DUSE_CCACHE=ON
+
+      - name: Build production and tests
+        run: |
+          ccache --zero-stats
+          cmake --build build --parallel "$(nproc)"
+          ccache --show-stats
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure --no-tests=error --parallel "$(nproc)"
+
+      - name: Test debug adapter
+        run: python3 tools/nx2/test_debug_mcp.py
+
+      - name: Test ThreadWorker wake-ups
+        run: |
+          python3 tools/nx2/test_thread_worker_wake.py
+          python3 -I tools/nx2/thread_worker_wake.py --cxx g++-13
+
+      - name: Test Linux switch discovery
+        run: CXX=g++-13 python3 tools/nx2/test_switches.py
+
+      - name: Save dependencies and compiler objects
+        if: always()
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: |
+            .cache/cpm
+            .ccache
+          key: gcc13-qt683-${{ runner.os }}-${{ github.sha }}
+
+  windows-clang-cl:
+    name: Windows clang-cl production build and tests
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 120
+    # ccache rather than sccache: sccache has no direct mode for clang-cl, so every hit still ran the
+    # preprocessor and a 99% hit build took 8.5 minutes.
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 1G
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+
+      # The release job's compiler; ThinLTO is left to the release build to keep this job short.
+      - name: Install LLVM
+        shell: pwsh
+        run: ./tools/windows/install-llvm.ps1
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts
+          cache: true
+
+      - name: Install ccache
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'ccache.zip'
+          Invoke-WebRequest -OutFile $zip https://github.com/ccache/ccache/releases/download/v4.14.2/ccache-4.14.2-windows-x86_64.zip
+          if ((Get-FileHash -Algorithm SHA256 $zip).Hash -ne '6993ce645e53192cec592ee23186200b574ac4c59097ecde8d9cfd681b47ae84') {
+              throw 'ccache checksum mismatch'
+          }
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          Join-Path $env:RUNNER_TEMP 'ccache-4.14.2-windows-x86_64' | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      # Restore and save separately so a test failure still keeps the compiled objects.
+      - name: Restore dependencies and compiler objects
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: |
+            .cache/cpm
+            .ccache
+          key: clang-cl-ccache-qt683-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            clang-cl-ccache-qt683-${{ runner.os }}-
+
+      - name: Configure production and tests
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          "-DCMAKE_C_COMPILER=$LLVM_ROOT/bin/clang-cl.exe"
+          "-DCMAKE_CXX_COMPILER=$LLVM_ROOT/bin/clang-cl.exe"
+          "-DCMAKE_LINKER=$LLVM_ROOT/bin/lld-link.exe"
+          "-DCMAKE_AR=$LLVM_ROOT/bin/llvm-lib.exe"
+          "-DCMAKE_C_FLAGS=-DWIN32 -D_WINDOWS -DNOMINMAX"
+          "-DCMAKE_CXX_FLAGS=-DWIN32 -D_WINDOWS -EHsc -DNOMINMAX"
+          -DENABLE_WERROR=ON
+          -DBUILD_TESTING=ON
+          -DYUZU_TESTS=ON
+          -DENABLE_QT=ON
+          -DYUZU_CMD=ON
+          -DYUZU_ROOM=OFF
+          -DYUZU_ROOM_STANDALONE=OFF
+          -DYUZU_USE_BUNDLED_QT=OFF
+          -DYUZU_USE_BUNDLED_SDL3=ON
+          -DENABLE_UPDATE_CHECKER=ON
+          -DUSE_DISCORD_PRESENCE=OFF
+          -DUSE_CCACHE=ON
+
+      # The install script pins clang-cl by checksum, so it identifies the compiler without hashing
+      # the binary on every call.
+      - name: Build production and tests
+        env:
+          CCACHE_COMPILERCHECK: string:${{ hashFiles('tools/windows/install-llvm.ps1') }}
+        run: |
+          ccache --zero-stats
+          cmake --build build --parallel
+          ccache --show-stats -v
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure --no-tests=error --parallel "$NUMBER_OF_PROCESSORS"
+
+      - name: Save dependencies and compiler objects
+        if: always()
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: |
+            .cache/cpm
+            .ccache
+          key: clang-cl-ccache-qt683-${{ runner.os }}-${{ github.sha }}

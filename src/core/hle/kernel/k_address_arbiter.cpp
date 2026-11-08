@@ -4,6 +4,14 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_address_arbiter.h"
@@ -14,6 +22,7 @@
 #include "core/hle/kernel/k_thread_queue.h"
 #include "core/hle/kernel/k_typed_address.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/physical_core.h"
 #include "core/hle/kernel/svc_results.h"
 #include "core/memory.h"
 
@@ -28,6 +37,19 @@ namespace {
 
 bool ReadFromUser(KernelCore& kernel, s32* out, KProcessAddress address) {
     *out = GetCurrentMemory(kernel).Read32(GetInteger(address));
+    return true;
+}
+
+bool ReadFromUser(KernelCore& kernel, s64* out, KProcessAddress address) {
+    auto& memory = GetCurrentMemory(kernel);
+    const u64 addr = GetInteger(address);
+
+    // Reject ranges that wrap past the end of the address space; the range check accepts them.
+    if (addr + sizeof(s64) < addr || !memory.IsValidVirtualAddressRange(addr, sizeof(s64))) {
+        return false;
+    }
+
+    *out = static_cast<s64>(memory.Read64(addr));
     return true;
 }
 
@@ -109,6 +131,73 @@ bool UpdateIfEqual(KernelCore& kernel, s32* out, KProcessAddress address, s32 va
     // We're done.
     *out = current_value;
     return true;
+}
+
+/// EDEN_NX2_ARB_SPIN: microseconds a thread about to wait on an address first watches the word
+/// (default 8; 0 turns it off).
+s64 ArbSpinMicroseconds() {
+    static const s64 microseconds = [] {
+        const char* value = std::getenv("EDEN_NX2_ARB_SPIN");
+        if (value == nullptr || value[0] == '\0') {
+            return s64{8};
+        }
+        return (std::max)(s64{0}, static_cast<s64>(std::strtoll(value, nullptr, 10)));
+    }();
+    return microseconds;
+}
+
+/// Guest job systems hand work between threads through these waits many times a frame, and the
+/// signal often comes a few microseconds later. Before the thread sleeps (scheduler lock, context
+/// switch, then the signaler's EndWait, interrupt and switch back), it watches the word briefly
+/// without any lock. If the word stops satisfying the wait, the wait ends with ResultInvalidState,
+/// exactly what the kernel returns to a thread that entered the SVC that much later. Threads whose
+/// spins rarely pay off stop spinning (m_nx2_arb_spin_credit).
+template <typename StillWaits>
+bool SpinBeforeWait(KernelCore& kernel, KThread* cur_thread, uint64_t addr, bool is_64_bit,
+                    StillWaits&& still_waits) {
+    const s64 spin_us = ArbSpinMicroseconds();
+    if (spin_us == 0 || !kernel.IsMulticore() || (addr & (is_64_bit ? 7 : 3)) != 0) {
+        return false;
+    }
+    u8& credit = cur_thread->m_nx2_arb_spin_credit;
+    if (credit == 0 && (++cur_thread->m_nx2_arb_spin_probe & 15) != 0) {
+        return false;
+    }
+    const u8* const pointer = GetCurrentMemory(kernel).GetPointerSilent(addr);
+    if (pointer == nullptr) {
+        return false;
+    }
+    const auto load_word = [&]() -> s64 {
+        if (is_64_bit) {
+            return *reinterpret_cast<const volatile s64*>(pointer);
+        }
+        return *reinterpret_cast<const volatile s32*>(pointer);
+    };
+    const PhysicalCore& core = kernel.CurrentPhysicalCore();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds{spin_us};
+    for (u32 spin = 1;; ++spin) {
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+        _mm_pause();
+#endif
+        if (!still_waits(load_word())) {
+            credit = static_cast<u8>((std::min)(credit + 2, 16));
+            // A terminating thread takes the normal path, which reports the termination first.
+            return !cur_thread->IsTerminationRequested();
+        }
+        if ((spin & 31) == 0) {
+            // Something else must run on this core: stop watching.
+            if (core.IsInterrupted()) {
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                break;
+            }
+        }
+    }
+    if (credit > 0) {
+        --credit;
+    }
+    return false;
 }
 
 class ThreadQueueImplForKAddressArbiter final : public KThreadQueue {
@@ -251,6 +340,10 @@ Result KAddressArbiter::SignalAndModifyByWaitingCountIfEqual(uint64_t addr, s32 
 Result KAddressArbiter::WaitIfLessThan(uint64_t addr, s32 value, bool decrement, s64 timeout) {
     // Prepare to wait.
     KThread* cur_thread = GetCurrentThreadPointer(system.Kernel());
+    if (timeout != 0 && SpinBeforeWait(system.Kernel(), cur_thread, addr, false,
+                                       [value](s64 user_value) { return user_value < value; })) {
+        R_THROW(ResultInvalidState);
+    }
     KHardwareTimer* timer{};
     ThreadQueueImplForKAddressArbiter wait_queue(system.Kernel(), std::addressof(m_tree));
 
@@ -306,6 +399,10 @@ Result KAddressArbiter::WaitIfLessThan(uint64_t addr, s32 value, bool decrement,
 Result KAddressArbiter::WaitIfEqual(uint64_t addr, s64 value, s64 timeout, bool is_64_bit) {
     // Prepare to wait.
     KThread* cur_thread = GetCurrentThreadPointer(system.Kernel());
+    if (timeout != 0 && SpinBeforeWait(system.Kernel(), cur_thread, addr, is_64_bit,
+                                       [value](s64 user_value) { return user_value == value; })) {
+        R_THROW(ResultInvalidState);
+    }
     KHardwareTimer* timer{};
     ThreadQueueImplForKAddressArbiter wait_queue(system.Kernel(), std::addressof(m_tree));
 
@@ -322,11 +419,7 @@ Result KAddressArbiter::WaitIfEqual(uint64_t addr, s64 value, s64 timeout, bool 
         s64 user_value{};
         bool succeeded{};
         if (is_64_bit) {
-            auto& memory = GetCurrentMemory(system.Kernel());
-            succeeded = memory.IsValidVirtualAddressRange(addr, sizeof(s64));
-            if (succeeded) {
-                user_value = static_cast<s64>(memory.Read64(addr));
-            }
+            succeeded = ReadFromUser(system.Kernel(), std::addressof(user_value), addr);
         } else {
             s32 user_value32{};
             succeeded = ReadFromUser(system.Kernel(), std::addressof(user_value32), addr);

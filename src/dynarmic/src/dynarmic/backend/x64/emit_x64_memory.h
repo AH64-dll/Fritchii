@@ -29,6 +29,12 @@ constexpr size_t page_table_const_bits = 12;
 constexpr size_t page_table_const_size = 1 << page_table_const_bits;
 constexpr size_t page_table_const_mask = (1 << page_table_const_bits) - 1;
 
+/// Where cold deferred code goes: the far region when there is one.
+template<typename Ctx>
+std::vector<std::function<void()>>& ColdEmits(BlockOfCode& code, Ctx& ctx) {
+    return code.HasFarCode() ? ctx.far_deferred_emits : ctx.deferred_emits;
+}
+
 template<typename EmitContext>
 void EmitDetectMisalignedVAddr(BlockOfCode& code, EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr, Xbyak::Reg64 tmp) {
     if (bitsize == 8 || (ctx.conf.detect_misaligned_access_via_page_table & bitsize) == 0) {
@@ -60,7 +66,7 @@ void EmitDetectMisalignedVAddr(BlockOfCode& code, EmitContext& ctx, size_t bitsi
         code.jnz(*detect_boundary, code.T_NEAR);
         code.L(*resume);
 
-        ctx.deferred_emits.emplace_back([=, &code] {
+        ColdEmits(code, ctx).emplace_back([=, &code] {
             code.L(*detect_boundary);
             code.mov(tmp, vaddr);
             code.and_(tmp, page_align_mask);
@@ -422,6 +428,11 @@ void EmitExclusiveTestAndClear(BlockOfCode& code, const UserConfig& conf, Xbyak:
         code.mov(qword[pointer], tmp);
         code.L(ok);
     }
+}
+
+/// A folded address displacement as an Xbyak displacement (sign-extended).
+inline size_t FoldedDisp(s32 disp) {
+    return static_cast<size_t>(static_cast<s64>(disp));
 }
 
 inline bool IsOrdered(IR::AccType acctype) {

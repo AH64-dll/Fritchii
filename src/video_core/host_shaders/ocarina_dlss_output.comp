@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D dlss_color;
+layout(binding = 1, r11f_g11f_b10f) uniform writeonly image2D guest_color;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = imageSize(guest_color);
+    if (any(greaterThanEqual(pixel, extent))) {
+        return;
+    }
+    // The guest upscaler squares its encoded RGB before writing the linear target.
+    vec3 sampled = all(equal(textureSize(dlss_color, 0), extent))
+        ? texelFetch(dlss_color, pixel, 0).rgb
+        : textureLod(dlss_color, (vec2(pixel) + 0.5) / vec2(extent), 0).rgb;
+    vec3 color = max(sampled, vec3(0.0));
+    imageStore(guest_color, pixel, vec4(color * color, 1.0));
+}

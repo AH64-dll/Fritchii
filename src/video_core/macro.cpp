@@ -29,9 +29,11 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/macro.h"
+#include "video_core/query_dma.h"
 
 #include "common/assert.h"
 #include "common/bit_field.h"
@@ -1431,6 +1433,20 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                                 VideoCommon::Nx2Profile::DmaReadPages().insert(*device >> 12);
                             }
                         }
+                    }
+                    // Accurate GPU mode holds report and semaphore writes in the query cache until a
+                    // fence: write them out, or occlusion predicates read stale values.
+                    const bool owns_caches = !VideoCommon::GpuSplit::Get().Active() ||
+                                             VideoCommon::GpuSplit::OnBackThread();
+                    if (owns_caches && VideoCommon::QueryDma::TraceEnabled() &&
+                        VideoCommon::QueryDma::HasPendingQueries(memory, maxwell3d.Rasterizer(),
+                                                                 source, read_bytes)) {
+                        VideoCommon::QueryDma::Trace(memory, maxwell3d.Rasterizer(), method, address,
+                                                     source, read_bytes);
+                    }
+                    if (owns_caches) {
+                        VideoCommon::QueryDma::FlushPending(memory, maxwell3d.Rasterizer(), source,
+                                                            read_bytes);
                     }
                     if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);

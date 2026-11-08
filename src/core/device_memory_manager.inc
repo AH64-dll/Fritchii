@@ -5,8 +5,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <cstdlib>
 #include <limits>
 #include <memory>
+#include <source_location>
+#include <string_view>
 #include <type_traits>
 #include <algorithm>
 #include <vector>
@@ -24,6 +27,7 @@
 #include "core/device_memory.h"
 #include "core/device_memory_manager.h"
 #include "core/memory.h"
+#include "video_core/nx2_perf.h"
 
 namespace Core {
 
@@ -138,6 +142,29 @@ struct EmptyAllocator {
 };
 
 } // namespace
+
+// An unmapped read returns zeros. The first 16 are logged with their caller, every one with
+// EDEN_NX2_READBLOCK_TRACE=1.
+inline void ReportUnmappedRead(DAddr first_unmapped, DAddr address, size_t size,
+                               size_t unmapped_bytes, const std::source_location& caller) {
+    static const bool trace = [] {
+        const char* value = std::getenv("EDEN_NX2_READBLOCK_TRACE");
+        return value != nullptr && value[0] == '1';
+    }();
+    static std::atomic<u32> reported{};
+    if (!trace && reported.fetch_add(1, std::memory_order_relaxed) >= 16) {
+        return;
+    }
+    std::string_view file{caller.file_name()};
+    if (const size_t slash = file.find_last_of("/\\"); slash != std::string_view::npos && slash > 0) {
+        const size_t parent = file.find_last_of("/\\", slash - 1);
+        file.remove_prefix(parent == std::string_view::npos ? 0 : parent + 1);
+    }
+    LOG_ERROR(HW_Memory,
+              "Unmapped Device ReadBlock @ {:#016x} (start address = {:#016x}, size = {}, {} "
+              "bytes unmapped) from {}:{}",
+              first_unmapped, address, size, unmapped_bytes, file, caller.line());
+}
 
 template <typename DTraits>
 struct DeviceMemoryManagerAllocator {
@@ -462,7 +489,8 @@ void DeviceMemoryManager<Traits>::WalkBlock(DAddr addr, std::size_t size, auto o
 }
 
 template <typename Traits>
-void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, size_t size) {
+void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, size_t size,
+                                            std::source_location caller) {
     device_inter->FlushRegion(address, size);
     const std::size_t page_offset = address & Memory::YUZU_PAGEMASK;
     if (size <= Memory::YUZU_PAGESIZE - page_offset) {
@@ -485,16 +513,15 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
             return;
         }
     }
+    DAddr first_unmapped = 0;
+    size_t unmapped_bytes = 0;
     WalkBlock(
         address, size,
         [&](size_t copy_amount, DAddr current_vaddr) {
-            static std::atomic<u32> reported{};
-            if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_ERROR(
-                    HW_Memory,
-                    "Unmapped Device ReadBlock @ {:#016x} (start address = {:#016x}, size = {})",
-                    current_vaddr, address, size);
+            if (unmapped_bytes == 0) {
+                first_unmapped = current_vaddr;
             }
+            unmapped_bytes += copy_amount;
             std::memset(dest_pointer, 0, copy_amount);
         },
         [&](size_t copy_amount, const u8* const src_ptr) {
@@ -503,6 +530,9 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
         [&](const std::size_t copy_amount) {
             dest_pointer = static_cast<u8*>(dest_pointer) + copy_amount;
         });
+    if (unmapped_bytes != 0) {
+        ReportUnmappedRead(first_unmapped, address, size, unmapped_bytes, caller);
+    }
 }
 
 template <typename Traits>
@@ -528,7 +558,8 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
 }
 
 template <typename Traits>
-void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_pointer, size_t size) {
+void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_pointer, size_t size,
+                                                  std::source_location caller) {
     const std::size_t page_offset = address & Memory::YUZU_PAGEMASK;
     if (size <= Memory::YUZU_PAGESIZE - page_offset) {
         const DAddr guest_page = address & ~static_cast<DAddr>(Memory::YUZU_PAGEMASK);
@@ -550,16 +581,15 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
             return;
         }
     }
+    DAddr first_unmapped = 0;
+    size_t unmapped_bytes = 0;
     WalkBlock(
         address, size,
         [&](size_t copy_amount, DAddr current_vaddr) {
-            static std::atomic<u32> reported{};
-            if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_ERROR(
-                    HW_Memory,
-                    "Unmapped Device ReadBlock @ {:#016x} (start address = {:#016x}, size = {})",
-                    current_vaddr, address, size);
+            if (unmapped_bytes == 0) {
+                first_unmapped = current_vaddr;
             }
+            unmapped_bytes += copy_amount;
             std::memset(dest_pointer, 0, copy_amount);
         },
         [&](size_t copy_amount, const u8* const src_ptr) {
@@ -568,6 +598,9 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
         [&](const std::size_t copy_amount) {
             dest_pointer = static_cast<u8*>(dest_pointer) + copy_amount;
         });
+    if (unmapped_bytes != 0) {
+        ReportUnmappedRead(first_unmapped, address, size, unmapped_bytes, caller);
+    }
 }
 
 template <typename Traits>
@@ -709,6 +742,22 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
     if (ranges.empty()) {
         return;
     }
+    // Runs already sorted with gaps between them (the buffer tracker's) are what the sort and
+    // merge below would produce: use them as they are instead of two heap copies.
+    const bool separated =
+        std::ranges::adjacent_find(ranges, [](const auto& a, const auto& b) {
+            return a.first > b.first || a.first + a.second >= b.first;
+        }) == ranges.end();
+    if (separated && !VideoCommon::Nx2Perf::Verify()) {
+        const DAddr lock_begin = ranges.front().first;
+        const DAddr lock_end = ranges.back().first + ranges.back().second;
+        Common::ScopedRangeLock lk(counter_guard, lock_begin,
+                                   static_cast<size_t>(lock_end - lock_begin));
+        for (const auto& [addr, size] : ranges) {
+            UpdatePagesCachedCountNoLock(addr, size, delta);
+        }
+        return;
+    }
     // Make a local copy and sort by address
     std::vector<std::pair<DAddr, size_t>> tmp(ranges.begin(), ranges.end());
     std::sort(tmp.begin(), tmp.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -731,6 +780,14 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
         }
     }
     coalesced.emplace_back(cur_addr, cur_size);
+    if (separated) {
+        static std::atomic<u32> logged{};
+        if (!std::ranges::equal(ranges, coalesced) &&
+            logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+            LOG_ERROR(HW_GPU, "Nx2Perf texture-writes: cached page runs from {:#x} merged differently",
+                      coalesced.front().first);
+        }
+    }
 
     const DAddr lock_begin = coalesced.front().first;
     const DAddr lock_end = coalesced.back().first + coalesced.back().second;
@@ -743,6 +800,18 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
+    if (size != 0) {
+        // Before the traps: a read that sees the new read area generation also sees these bits.
+        const u64 first = addr >> page_bits;
+        const u64 last = (std::min)((addr + size - 1) >> page_bits, armed_page_count - 1);
+        for (u64 page = first; page <= last; ++page) {
+            auto& word = armed_pages[page / 64];
+            const u64 bit = u64{1} << (page % 64);
+            if ((word.load(std::memory_order_relaxed) & bit) == 0) {
+                word.fetch_or(bit, std::memory_order_release);
+            }
+        }
+    }
     const auto MarkRegionReadTrap = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionReadTrap;
     Memory::Memory* run_inter = nullptr;
     u64 run_begin = 0;

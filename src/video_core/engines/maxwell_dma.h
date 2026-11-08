@@ -8,6 +8,8 @@
 
 #include <array>
 #include <cstddef>
+#include <optional>
+#include <utility>
 #include <vector>
 
 #include "common/bit_field.h"
@@ -250,6 +252,17 @@ public:
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
 
+    /// Guest memory a launch writes: [first, second) ranges, all of it unless !bounded.
+    struct FrontLaunchWrites {
+        std::array<std::pair<GPUVAddr, GPUVAddr>, 2> ranges{};
+        u32 count{};
+        bool bounded{true}; ///< False for a block-linear destination
+    };
+    /// Split GPU thread front (GpuSplit::NarrowDrains), for each method it sends before sending
+    /// it: keeps a copy of the registers as the back will hold them (rebuilt from the back's in a
+    /// new `session`, GpuSplit::Session). Returns true for a launch, with what it writes.
+    bool FrontMethod(u32 method, u32 argument, u64 session, FrontLaunchWrites& writes);
+
 private:
     /// Performs the copy from the source buffer to the destination buffer as configured in the
     /// registers.
@@ -308,6 +321,10 @@ private:
         };
     } regs{};
     static_assert(sizeof(Regs) == NUM_REGS * 4);
+
+    /// FrontMethod's copy of the registers and the split session it belongs to.
+    std::optional<Regs> front_regs;
+    u64 front_session{};
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \
     static_assert(offsetof(MaxwellDMA::Regs, field_name) == position,                              \

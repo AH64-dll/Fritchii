@@ -73,7 +73,7 @@ TEST_CASE("Rectangle size queries use the sampled descriptor", "[shader][upstrea
             CHECK(inst.Flags<IR::TextureInstInfo>().descriptor_index == 1);
             CHECK(inst.Arg(0).U32() == 0);
         }
-        CHECK(queries == (rectangle ? 1 : 0));
+        CHECK(queries == (rectangle ? 1U : 0U));
         CHECK((sample.Inst()->Arg(1) == coords) == !rectangle);
     }
 }

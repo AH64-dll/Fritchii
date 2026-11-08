@@ -149,7 +149,7 @@ TEST_CASE("Window validation diagnostics preserve the intercepted unsigned load"
         REQUIRE(jit.GetRegister(8) == 0xFEDCBA98ULL);
         REQUIRE(jit.GetRegister(25) == 0x20000000);
         REQUIRE(jit.GetPstate() == 0x60000000);
-        REQUIRE(env.points.size() == (enabled ? 1 : 0));
+        REQUIRE(env.points.size() == (enabled ? 1U : 0U));
     }
 }
 

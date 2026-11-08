@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/bit_util.h"
 #include "common/common_types.h"
 
 namespace Tegra {
@@ -19,6 +20,18 @@ namespace Tegra {
 // Set once a Switch 2 (Ampere, NVN2) driver is talking to the GPU. Its command streams use
 // Ampere classes and the Turing+ macro ISA, which Eden's Maxwell engines don't implement.
 inline std::atomic<bool> g_nx2_ampere{false};
+
+// GPU VA that nx2:gpu GetVaRange and GetUserPartition report to NVN. The in-process
+// allocator hands out addresses in [Nx2GpuVaStart, Nx2GpuVaEnd). NvRm's AllocAsEx range
+// can be smaller; the GMMU page tables still have to cover this one.
+inline constexpr u64 Nx2GpuVaStart = 0x8000000ULL;
+inline constexpr u64 Nx2GpuVaEnd = 0xC000000000ULL;
+
+/// Bytes a Switch 2 GMMU covers when it is sized from Nx2GpuVaEnd. That end is not a
+/// power of two, so the page tables round up (Log2Ceil). NvRm's va_range_end can only
+/// make this larger. A range past it is left mapped, and its backing must stay.
+inline constexpr u64 Nx2GpuAddressSpaceSize = 1ULL << Common::Log2Ceil(Nx2GpuVaEnd);
+static_assert(Nx2GpuAddressSpaceSize == (1ULL << 40));
 
 // Device pages the GPU has written through the buffer cache (shader stores, copies), ever. Title 1
 // runs command lists the GPU writes each frame (20-byte entries its culling fills in); read
@@ -32,13 +45,17 @@ inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
     if (size == 0) {
         return;
     }
+    const u64 first = device_address >> Nx2WrittenPageBits;
     const u64 last = std::min<u64>((device_address + size - 1) >> Nx2WrittenPageBits,
                                    g_nx2_gpu_written_pages.size() * 64 - 1);
-    for (u64 page = device_address >> Nx2WrittenPageBits; page <= last; ++page) {
-        auto& word = g_nx2_gpu_written_pages[page / 64];
-        const u64 bit = u64{1} << (page % 64);
-        if ((word.load(std::memory_order_relaxed) & bit) == 0) {
-            word.fetch_or(bit, std::memory_order_relaxed);
+    // A word (64 pages) at a time: storage bindings span up to 64 MiB.
+    for (u64 word_index = first / 64; first <= last && word_index <= last / 64; ++word_index) {
+        const u64 low = word_index == first / 64 ? first % 64 : 0;
+        const u64 high = word_index == last / 64 ? last % 64 : 63;
+        const u64 bits = (~u64{0} >> (63 - (high - low))) << low;
+        auto& word = g_nx2_gpu_written_pages[word_index];
+        if ((word.load(std::memory_order_relaxed) & bits) != bits) {
+            word.fetch_or(bits, std::memory_order_relaxed);
         }
     }
 }
@@ -88,6 +105,26 @@ inline void Nx2ClearGpuWrittenPages() {
         return false;
     }
     return (g_nx2_gpu_written_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
+}
+
+/// False only when no page of [device_address, device_address + size) has been GPU-written.
+/// Every range the buffer cache records as GPU-modified also marks its pages here, under its
+/// lock, so this answers MustFlushRegion without taking it. Ranges past the bitmap answer true.
+[[nodiscard]] inline bool Nx2MayBeGpuWritten(u64 device_address, u64 size) {
+    if (size == 0) {
+        return false;
+    }
+    const u64 first = device_address >> Nx2WrittenPageBits;
+    const u64 last = (device_address + size - 1) >> Nx2WrittenPageBits;
+    if (last < first || last >= g_nx2_gpu_written_pages.size() * 64) {
+        return true;
+    }
+    for (u64 page = first; page <= last; ++page) {
+        if ((g_nx2_gpu_written_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1) {
+            return true;
+        }
+    }
+    return false;
 }
 
 inline constexpr size_t Nx2MaxSemaphoreRegions = 32;
@@ -326,6 +363,17 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
     return true;
 }
 
+// GPU semaphore writes that landed in guest memory, counted per word by a hash (collisions only
+// add): the split's front tells a release still held back by a fence from one already written
+// (GpuSplit::PredictedSemaphore, EDEN_NX2_SEM_PREDICT_LANDED).
+inline constexpr size_t Nx2LandedSlots = 4096;
+inline std::array<std::atomic<u32>, Nx2LandedSlots> g_nx2_semaphore_landed{};
+
+[[nodiscard]] inline size_t Nx2LandedSlot(u64 device_address) {
+    return static_cast<size_t>(((device_address >> 2) * 0x9E3779B97F4A7C15ULL) >> 52) &
+           (Nx2LandedSlots - 1);
+}
+
 /// Channels suspended on a semaphore acquire. A console channel polls and sees every release;
 /// Eden writes releases in bursts when fences signal and resumes waiters only between command
 /// lists, so an acquire-equal could miss its value. Writes latch the waiters they satisfy.
@@ -368,6 +416,7 @@ public:
 
     /// A GPU write of `value` to the u32 at `device_address`.
     void OnWrite(u64 device_address, u32 value) {
+        g_nx2_semaphore_landed[Nx2LandedSlot(device_address)].fetch_add(1, std::memory_order_release);
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }

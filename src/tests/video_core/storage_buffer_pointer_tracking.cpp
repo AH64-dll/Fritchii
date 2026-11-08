@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <optional>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
-#include "shader_recompiler/environment.h"
 #include "shader_recompiler/backend/nvn_storage_descriptor.h"
+#include "shader_recompiler/environment.h"
+#include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
@@ -50,6 +53,9 @@ struct KernelProgram {
     IR::Block loop{pool};
     IR::Program program;
     TestEnvironment env;
+    bool int64{true};
+    u32 storage_buffer_limit{};     ///< The stage's storage buffer limit, none when 0
+    u32 set_storage_buffer_limit{}; ///< The descriptor set's storage buffer limit, none when 0
 
     KernelProgram() {
         program.stage = Shader::Stage::Compute;
@@ -60,6 +66,9 @@ struct KernelProgram {
     std::vector<u32> TrackedOffsets() {
         Shader::HostTranslateInfo host{};
         host.min_ssbo_alignment = 16;
+        host.support_int64 = int64;
+        host.max_per_stage_descriptor_storage_buffers = storage_buffer_limit;
+        host.max_descriptor_set_storage_buffers = set_storage_buffer_limit;
         Shader::Optimization::GlobalMemoryToStorageBufferPass(env, program, host);
         std::vector<u32> offsets;
         for (const auto& descriptor : program.info.storage_buffers_descriptors) {
@@ -297,7 +306,7 @@ TEST_CASE("Loaded global pointers do not inherit the source buffer descriptor",
         ir.WriteGlobal32(Address(ir, add_offset ? IR::U32{ir.IAdd(low, ir.Imm32(16))} : low, high),
                          ir.Imm32(1));
 
-        CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x110});
+        const std::vector<u32> offsets{fixture.TrackedOffsets()};
         const auto has = [&](IR::Opcode opcode) {
             return std::ranges::any_of(fixture.entry.Instructions(), [=](const IR::Inst& inst) {
                 return inst.GetOpcode() == opcode;
@@ -306,9 +315,287 @@ TEST_CASE("Loaded global pointers do not inherit the source buffer descriptor",
         CHECK(has(IR::Opcode::LoadStorage64));
         CHECK(has(IR::Opcode::WriteGlobal32));
         CHECK_FALSE(has(IR::Opcode::WriteStorage32));
-        REQUIRE(fixture.program.info.storage_buffers_descriptors.size() == 1);
-        CHECK_FALSE(fixture.program.info.storage_buffers_descriptors.front().is_written);
+        const auto& descriptors{fixture.program.info.storage_buffers_descriptors};
+        if (!native) {
+            CHECK(offsets == std::vector<u32>{0x110});
+            REQUIRE(descriptors.size() == 1);
+            CHECK_FALSE(descriptors.front().is_written);
+            continue;
+        }
+        // A native program also binds the buffer the loaded pointer points to, as its own
+        // descriptor read through the source: the write stays global and the source unwritten.
+        CHECK(offsets == std::vector<u32>{0x110, 0x110});
+        REQUIRE(descriptors.size() == 2);
+        const auto source_descriptor{std::ranges::find_if(
+            descriptors, [](const auto& desc) { return desc.indirect_offset == ~0U; })};
+        REQUIRE(source_descriptor != descriptors.end());
+        CHECK(source_descriptor->cbuf_index == 0);
+        CHECK(source_descriptor->cbuf_offset == 0x110);
+        CHECK_FALSE(source_descriptor->is_written);
+        CHECK(std::ranges::count_if(descriptors,
+                                    [](const auto& desc) { return desc.is_written; }) == 1);
+        const auto loaded_descriptor{std::ranges::find_if(
+            descriptors, [](const auto& desc) { return desc.is_written; })};
+        REQUIRE(loaded_descriptor != descriptors.end());
+        CHECK(loaded_descriptor->cbuf_index == 0);
+        CHECK(loaded_descriptor->cbuf_offset == 0x110);
+        CHECK(loaded_descriptor->indirect_offset == 0);
     }
+}
+
+/// A native record address that is c0[0x30] or the pointer loaded from *c0[0x30], through a
+/// select or a phi, plus a lane offset. Ocarina of Time's near-leaf pass 539ffb3f650a34ac reads
+/// its foliage unit placement records this way, from c0[12] or from *c0[12].
+struct DirectOrLoadedPointer {
+    KernelProgram fixture;
+    IR::Block taken{fixture.pool};
+    IR::Block merge{fixture.pool};
+
+    IR::U64 RecordAddress(bool phi) {
+        fixture.env.native = true;
+        IR::IREmitter ir{fixture.entry};
+        const IR::Value loaded{ir.LoadGlobal64(Address(ir, Word(ir, 0x30), Word(ir, 0x34)))};
+        const IR::U32 loaded_low{ir.CompositeExtract(loaded, 0)};
+        const IR::U32 loaded_high{ir.CompositeExtract(loaded, 1)};
+        IR::U32 low;
+        IR::U32 high;
+        IR::Block* access{&fixture.entry};
+        if (phi) {
+            fixture.entry.AddBranch(&taken);
+            fixture.entry.AddBranch(&merge);
+            taken.AddBranch(&merge);
+            fixture.program.blocks = {&fixture.entry, &taken, &merge};
+            fixture.program.post_order_blocks = {&merge, &taken, &fixture.entry};
+            for (u32 index = 0; index < fixture.program.blocks.size(); ++index) {
+                fixture.program.blocks[index]->SetOrder(index);
+            }
+            IR::IREmitter direct{taken};
+            const IR::U32 direct_low{Word(direct, 0x30)};
+            const IR::U32 direct_high{Word(direct, 0x34)};
+            merge.AppendNewInst(IR::Opcode::Phi, {});
+            IR::Inst* const low_phi{&merge.back()};
+            low_phi->SetFlags(IR::Type::U32);
+            merge.AppendNewInst(IR::Opcode::Phi, {});
+            IR::Inst* const high_phi{&merge.back()};
+            high_phi->SetFlags(IR::Type::U32);
+            low_phi->AddPhiOperand(&fixture.entry, loaded_low);
+            low_phi->AddPhiOperand(&taken, direct_low);
+            high_phi->AddPhiOperand(&fixture.entry, loaded_high);
+            high_phi->AddPhiOperand(&taken, direct_high);
+            low = IR::U32{IR::Value{low_phi}};
+            high = IR::U32{IR::Value{high_phi}};
+            access = &merge;
+        } else {
+            const IR::U1 direct{ir.ILessThan(ir.LocalInvocationIdX(), ir.Imm32(16), false)};
+            low = IR::U32{ir.Select(direct, Word(ir, 0x30), loaded_low)};
+            high = IR::U32{ir.Select(direct, Word(ir, 0x34), loaded_high)};
+        }
+        record.emplace(*access);
+        const IR::U32 offset{
+            record->ShiftLeftLogical(record->LocalInvocationIdX(), record->Imm32(4))};
+        return Address(*record, record->IAdd(low, offset), high);
+    }
+
+    std::ptrdiff_t Count(IR::Opcode opcode) const {
+        std::ptrdiff_t total{};
+        for (const IR::Block* const block : fixture.program.blocks) {
+            total += std::ranges::count_if(block->Instructions(), [=](const IR::Inst& inst) {
+                return inst.GetOpcode() == opcode;
+            });
+        }
+        return total;
+    }
+
+    std::size_t LoadedDescriptors() const {
+        return std::ranges::count_if(fixture.program.info.storage_buffers_descriptors,
+                                     [](const auto& desc) { return desc.indirect_offset == 0; });
+    }
+
+    std::optional<IR::IREmitter> record;
+};
+
+TEST_CASE("Native accesses through a cbuf pointer or a pointer loaded from it bind both",
+          "[shader][storage_buffer]") {
+    // Pairing the address with c0[0x30] alone rebased the loaded path on c0[0x30]'s binding,
+    // where its records read out of bounds as zeros.
+    const bool phi = GENERATE(false, true);
+    CAPTURE(phi);
+    DirectOrLoadedPointer program;
+    static_cast<void>(program.record->LoadGlobal128(program.RecordAddress(phi)));
+
+    CHECK(program.fixture.TrackedOffsets() == std::vector<u32>{0x30, 0x30});
+    CHECK(program.fixture.program.info.native_global_bounds);
+    CHECK(program.LoadedDescriptors() == 1);
+    CHECK(program.Count(IR::Opcode::LoadStorage64) == 1);
+    CHECK(program.Count(IR::Opcode::LoadGlobal128) == 1);
+    CHECK(program.Count(IR::Opcode::LoadStorage128) == 0);
+}
+
+TEST_CASE("Native accesses the backend cannot route keep their paired cbuf pointer",
+          "[shader][storage_buffer]") {
+    // The SPIR-V backend has no global subword accesses or global exchange atomics, and routes
+    // no global access without 64-bit integers, so these accesses are rebased on the pair rather
+    // than left global.
+    const bool phi = GENERATE(false, true);
+    const int access = GENERATE(0, 1, 2);
+    const bool atomic = access == 1;
+    CAPTURE(phi, access);
+    DirectOrLoadedPointer program;
+    program.fixture.int64 = access != 2;
+    const IR::U64 address{program.RecordAddress(phi)};
+    if (access == 2) {
+        static_cast<void>(program.record->LoadGlobal128(address));
+    } else if (atomic) {
+        static_cast<void>(program.record->GlobalAtomicExchange(address, program.record->Imm32(1)));
+    } else {
+        static_cast<void>(program.record->LoadGlobalU16(address));
+    }
+
+    CHECK(program.fixture.TrackedOffsets() == std::vector<u32>{0x30});
+    CHECK_FALSE(program.fixture.program.info.native_global_bounds);
+    CHECK(program.LoadedDescriptors() == 0);
+    const std::array storage{IR::Opcode::LoadStorageU16, IR::Opcode::StorageAtomicExchange32,
+                             IR::Opcode::LoadStorage128};
+    const std::array global{IR::Opcode::LoadGlobalU16, IR::Opcode::GlobalAtomicExchange32,
+                            IR::Opcode::LoadGlobal128};
+    CHECK(program.Count(storage[access]) == 1);
+    CHECK(program.Count(global[access]) == 0);
+}
+
+TEST_CASE("Loaded pointers that compete with a pair do not take the last storage buffer",
+          "[shader][storage_buffer]") {
+    // 31 more pointers fill every binding with c0[0x30]; the loaded pointer would be the 33rd.
+    DirectOrLoadedPointer program;
+    static_cast<void>(program.record->LoadGlobal128(program.RecordAddress(false)));
+    IR::IREmitter ir{program.fixture.entry};
+    for (u32 slot = 0; slot < Shader::Info::MAX_SSBOS - 1; ++slot) {
+        const u32 offset{0x100 + slot * 8};
+        static_cast<void>(ir.LoadGlobal32(Address(ir, Word(ir, offset), Word(ir, offset + 4))));
+    }
+
+    CHECK(program.fixture.TrackedOffsets().size() == Shader::Info::MAX_SSBOS);
+    CHECK_FALSE(program.fixture.program.info.native_global_bounds);
+    CHECK(program.LoadedDescriptors() == 0);
+    CHECK(program.Count(IR::Opcode::LoadStorage128) == 1);
+    CHECK(program.Count(IR::Opcode::LoadGlobal128) == 0);
+}
+
+// The loop reads its records through the table entry at *c0[0x30] or *c0[0x38], loaded before
+// it. That load binds c0[0x30] and c0[0x38] in the first pass, with `pointers` more pointers.
+static void EmitTableLoop(KernelProgram& fixture, u32 pointers) {
+    fixture.env.native = true;
+    fixture.entry.AddBranch(&fixture.loop);
+    fixture.loop.AddBranch(&fixture.loop);
+    fixture.program.blocks = {&fixture.entry, &fixture.loop};
+    fixture.program.post_order_blocks = {&fixture.loop, &fixture.entry};
+    IR::IREmitter entry{fixture.entry};
+    const IR::U32 lane{entry.LocalInvocationIdX()};
+    const IR::U1 first{entry.ILessThan(lane, entry.Imm32(16), false)};
+    const IR::U32 holder_low{entry.Select(first, Word(entry, 0x30), Word(entry, 0x38))};
+    const IR::U32 holder_high{entry.Select(first, Word(entry, 0x34), Word(entry, 0x3c))};
+    const IR::Value table{entry.LoadGlobal64(Address(entry, holder_low, holder_high))};
+    for (u32 slot = 0; slot < pointers; ++slot) {
+        const u32 offset{0x100 + slot * 8};
+        static_cast<void>(
+            entry.LoadGlobal32(Address(entry, Word(entry, offset), Word(entry, offset + 4))));
+    }
+    IR::IREmitter body{fixture.loop};
+    const IR::U32 record{body.IAdd(IR::U32{body.CompositeExtract(table, 0)},
+                                   body.ShiftLeftLogical(lane, body.Imm32(4)))};
+    static_cast<void>(
+        body.LoadGlobal128(Address(body, record, IR::U32{body.CompositeExtract(table, 1)})));
+}
+
+TEST_CASE("Pointer table entries are charged only for bindings the first pass left free",
+          "[shader][storage_buffer]") {
+    // The first pass leaves a binding for each entry. The loop is collected first: charged for its
+    // holder as well, the first entry shut out the second, as Ocarina of Time's foliage culling
+    // compute 331e607152ce78d5 bound 4 of its 8 per-type instance tables.
+    KernelProgram fixture;
+    EmitTableLoop(fixture, Shader::Info::MAX_SSBOS - 4);
+
+    CHECK(fixture.TrackedOffsets().size() == Shader::Info::MAX_SSBOS);
+    CHECK(std::ranges::count_if(fixture.program.info.storage_buffers_descriptors,
+                                [](const auto& desc) { return desc.indirect_offset != ~0U; }) == 2);
+}
+
+TEST_CASE("Pointer table entries stay within the stage's storage buffer limit",
+          "[shader][storage_buffer]") {
+    // The stage binds 31 storage buffers: the first pass leaves one binding, for one entry.
+    KernelProgram fixture;
+    fixture.storage_buffer_limit = 31;
+    EmitTableLoop(fixture, 28);
+
+    CHECK(fixture.TrackedOffsets().size() == 31);
+    CHECK(std::ranges::count_if(fixture.program.info.storage_buffers_descriptors,
+                                [](const auto& desc) { return desc.indirect_offset != ~0U; }) == 1);
+}
+
+TEST_CASE("Programs that read more pointers than a stage binds are rejected",
+          "[shader][storage_buffer]") {
+    KernelProgram fixture;
+    fixture.env.native = true;
+    SECTION("Stage limit") {
+        fixture.storage_buffer_limit = 4;
+    }
+    SECTION("Descriptor set limit") {
+        fixture.set_storage_buffer_limit = 4;
+    }
+    IR::IREmitter ir{fixture.entry};
+    for (u32 slot = 0; slot < 5; ++slot) {
+        const u32 offset{0x100 + slot * 8};
+        static_cast<void>(ir.LoadGlobal32(Address(ir, Word(ir, offset), Word(ir, offset + 4))));
+    }
+
+    CHECK_THROWS_AS(fixture.TrackedOffsets(), Shader::NotImplementedException);
+}
+
+TEST_CASE("Dual vertex halves that bind more storage buffers than the stage are rejected",
+          "[shader][storage_buffer]") {
+    // Vertex B's buffers join Vertex A's; one they share counts once.
+    Shader::Info base;
+    base.storage_buffers_descriptors.push_back({.cbuf_index = 0, .cbuf_offset = 0x110, .count = 1});
+    Shader::Info source;
+    source.storage_buffers_descriptors.push_back(
+        {.cbuf_index = 0, .cbuf_offset = 0x110, .count = 1});
+    source.storage_buffers_descriptors.push_back(
+        {.cbuf_index = 0, .cbuf_offset = 0x120, .count = 1});
+    SECTION("Within the limit") {
+        Shader::Optimization::JoinStorageInfo(base, source, 2);
+        CHECK(base.storage_buffers_descriptors.size() == 2);
+    }
+    SECTION("Past the limit") {
+        source.storage_buffers_descriptors.push_back(
+            {.cbuf_index = 0, .cbuf_offset = 0x130, .count = 1});
+        CHECK_THROWS_AS(Shader::Optimization::JoinStorageInfo(base, source, 2),
+                        Shader::NotImplementedException);
+    }
+}
+
+TEST_CASE("Pointer table entries that would overflow the storage buffers are left out",
+          "[shader][storage_buffer]") {
+    // Records at c0[0x30] or in the table *c0[0x38], at an offset c0[0x40] the environment cannot
+    // tell from a pointer. The table entry competes with the pair, so with it the access binds
+    // every candidate, c0[0x40] too: 33 storage buffers with 29 more pointers. The program keeps
+    // the 30 of the pass without table entries.
+    KernelProgram fixture;
+    fixture.env.native = true;
+    IR::IREmitter ir{fixture.entry};
+    const IR::Value table{
+        ir.LoadGlobal64(ir.PackUint2x32(ir.GetCbuf(ir.Imm32(0), ir.Imm32(0x38), 64, false)))};
+    const IR::U1 direct{ir.ILessThan(ir.LocalInvocationIdX(), ir.Imm32(16), false)};
+    const IR::U32 low{ir.Select(direct, Word(ir, 0x30), IR::U32{ir.CompositeExtract(table, 0)})};
+    const IR::U32 high{ir.Select(direct, Word(ir, 0x34), IR::U32{ir.CompositeExtract(table, 1)})};
+    static_cast<void>(ir.LoadGlobal128(Address(ir, ir.IAdd(low, Word(ir, 0x40)), high)));
+    for (u32 slot = 0; slot < Shader::Info::MAX_SSBOS - 3; ++slot) {
+        const u32 offset{0x100 + slot * 8};
+        static_cast<void>(ir.LoadGlobal32(Address(ir, Word(ir, offset), Word(ir, offset + 4))));
+    }
+
+    CHECK(fixture.TrackedOffsets().size() == Shader::Info::MAX_SSBOS - 2);
+    CHECK_FALSE(fixture.program.info.native_global_bounds);
+    CHECK(std::ranges::none_of(fixture.program.info.storage_buffers_descriptors,
+                               [](const auto& desc) { return desc.indirect_offset != ~0U; }));
 }
 
 TEST_CASE("NVN fallback descriptors use guest slots rather than compact binding indices",

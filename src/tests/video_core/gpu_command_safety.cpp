@@ -20,7 +20,7 @@ TEST_CASE("GPU command ranges cannot walk past the address space", "[gpu_command
     Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31};
     constexpr GPUVAddr end = 1ULL << 32;
 
-    for (const auto [address, size] : std::array{
+    for (const auto& [address, size] : std::array{
              std::pair<GPUVAddr, size_t>{end, 1},
              std::pair<GPUVAddr, size_t>{end - 1, 2},
              std::pair<GPUVAddr, size_t>{std::numeric_limits<u64>::max(), 2},

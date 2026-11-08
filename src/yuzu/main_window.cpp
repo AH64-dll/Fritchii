@@ -8,6 +8,7 @@
 #undef VMA_IMPLEMENTATION
 #endif
 
+#include <QSysInfo>
 #include <boost/algorithm/string/split.hpp>
 #include "common/fs/path_util.h"
 #include "common/game_presets.h"
@@ -128,6 +129,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 
 #ifdef ENABLE_UPDATE_CHECKER
 #include "frontend_common/update_checker.h"
+#include "frontend_common/update_installer.h"
 #endif
 
 // Common //
@@ -445,8 +447,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
 #ifdef ENABLE_UPDATE_CHECKER
     if (UISettings::values.check_for_updates) {
-        update_future = QtConcurrent::run(
-            []() -> std::optional<Common::Net::Release> { return UpdateChecker::GetUpdate(); });
+        update_future = QtConcurrent::run([]() { return UpdateChecker::Check(); });
         update_watcher.connect(&update_watcher, &QFutureWatcher<QString>::finished, this,
                                &MainWindow::OnEmulatorUpdateAvailable);
         update_watcher.setFuture(update_future);
@@ -1061,6 +1062,31 @@ void MainWindow::InitializeWidgets() {
 
     statusBar()->insertPermanentWidget(0, volume_button);
 
+    frame_gen_status_button = new QPushButton();
+    frame_gen_status_button->setObjectName(QStringLiteral("TogglableStatusBarButton"));
+    frame_gen_status_button->setFocusPolicy(Qt::NoFocus);
+    frame_gen_status_button->setCheckable(true);
+    connect(frame_gen_status_button, &QPushButton::clicked, this, [this] {
+        Settings::values.frame_gen.SetValue(!Settings::values.frame_gen.GetValue());
+        UpdateFrameGenButton();
+    });
+    UpdateFrameGenButton();
+    frame_gen_status_button->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(frame_gen_status_button, &QPushButton::customContextMenuRequested,
+            [this](const QPoint& menu_location) {
+                QMenu context_menu;
+                for (auto const& [type, text] : ConfigurationShared::frame_gen_type_texts_map) {
+                    context_menu.addAction(text, [this, type] {
+                        Settings::values.frame_gen_type.SetValue(type);
+                        Settings::values.frame_gen.SetValue(true);
+                        UpdateFrameGenButton();
+                    });
+                }
+                context_menu.exec(frame_gen_status_button->mapToGlobal(menu_location));
+                frame_gen_status_button->repaint();
+            });
+    statusBar()->insertPermanentWidget(0, frame_gen_status_button);
+
 #ifdef HAS_RESHADE
     post_shader_status_button = new QPushButton();
     post_shader_status_button->setObjectName(QStringLiteral("TogglableStatusBarButton"));
@@ -1453,6 +1479,14 @@ void MainWindow::OnAppFocusStateChanged(Qt::ApplicationState state) {
 }
 
 void MainWindow::ConnectWidgetEvents() {
+    connect(game_list, &GameList::ReportCompatibilityRequested, this, [this](u64 program_id) {
+        if (!report_session || report_session->program_id != program_id || emulation_running ||
+            boot_in_progress || close_pending) {
+            return;
+        }
+        CompatibilityReporting::Dialog dialog(*report_session, this);
+        dialog.exec();
+    });
     connect(game_list, &GameList::BootGame, this, &MainWindow::BootGameFromList);
     connect(game_list, &GameList::GameChosen, this, &MainWindow::OnGameListLoadFile);
     connect(game_list, &GameList::OpenDirectory, this, &MainWindow::OnGameListOpenDirectory);
@@ -1645,6 +1679,65 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_About, &MainWindow::OnAbout);
     connect_menu(ui->action_Eden_Dependencies, &MainWindow::OnEdenDependencies);
     connect_menu(ui->action_Data_Manager, &MainWindow::OnDataDialog);
+
+#if defined(ENABLE_UPDATE_CHECKER) && (defined(__linux__) || defined(_WIN32))
+    auto* restore_action = ui->menu_Help->addAction(tr("Restore Previous Version..."));
+    restore_action->setVisible(false);
+#ifdef __linux__
+    const auto previous_version = [] {
+        const std::filesystem::path target{qEnvironmentVariable("APPIMAGE").toStdString()};
+        std::error_code ec;
+        return !target.empty() && std::filesystem::is_regular_file(
+                                      UpdateInstaller::PreviousPath(target), ec)
+                   ? target
+                   : std::filesystem::path{};
+    };
+#else
+    const auto previous_version = [] {
+        const std::filesystem::path backup =
+            std::filesystem::path{QCoreApplication::applicationDirPath().toStdWString()} /
+            UpdateInstaller::BackupName;
+        std::error_code ec;
+        return std::filesystem::is_directory(backup, ec) ? backup : std::filesystem::path{};
+    };
+#endif
+    connect(ui->menu_Help, &QMenu::aboutToShow, restore_action,
+            [restore_action, previous_version] {
+                restore_action->setVisible(!previous_version().empty());
+            });
+    connect(restore_action, &QAction::triggered, this, [this, previous_version] {
+        const auto previous = previous_version();
+        if (previous.empty()) {
+            return;
+        }
+        const auto answer = QtCommon::Frontend::Question(
+            tr("Restore Previous Version"),
+            tr("Go back to the version this one replaced? Your settings and data are not "
+               "changed."),
+            QtCommon::Frontend::Yes | QtCommon::Frontend::No);
+        if (answer != QtCommon::Frontend::Yes) {
+            return;
+        }
+#ifdef __linux__
+        const UpdateInstaller::Lock lock{UpdateInstaller::LockPath(previous)};
+        std::error_code ec;
+        if (!lock.Held()) {
+            ec = std::make_error_code(std::errc::device_or_resource_busy);
+        }
+        if (!lock.Held() || !UpdateInstaller::Rollback(previous, ec)) {
+            LOG_ERROR(Frontend, "Could not restore the previous version: {}", ec.message());
+            QtCommon::Frontend::Critical(tr("Failed to restore"),
+                                         tr("Could not restore the previous version: %1")
+                                             .arg(QString::fromStdString(ec.message())));
+            return;
+        }
+        LOG_INFO(Frontend, "Restored the previous version of {}", previous.string());
+        UpdateDialog::Restart(this, QString::fromStdString(previous.string()));
+#else
+        UpdateDialog::LaunchInstaller(this, QString::fromStdWString(previous.wstring()));
+#endif
+    });
+#endif
 }
 
 void MainWindow::UpdateMenuState() {
@@ -1843,6 +1936,13 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
 
     if (result != Core::SystemResultStatus::Success) {
         switch (result) {
+        case Core::SystemResultStatus::ErrorMemoryAllocation:
+            QMessageBox::critical(
+                this, tr("Not enough memory to start the game"),
+                tr("Lichii could not allocate the game's memory. Close other applications and "
+                   "check that your system has enough available memory and paging-file space, "
+                   "then try again."));
+            break;
         case Core::SystemResultStatus::ErrorGetLoader:
             LOG_CRITICAL(Frontend, "Failed to obtain loader for {}!", filename.toStdString());
             QMessageBox::critical(this, tr("Error while loading ROM!"),
@@ -1936,6 +2036,8 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         return;
     }
     LOG_INFO(Frontend, "Lichii starting...");
+    report_session.reset();
+    game_list->SetReportableProgramId(0);
 
     if (params.program_id == 0 ||
         params.program_id > static_cast<u64>(Service::AM::AppletProgramId::MaxProgramId)) {
@@ -2046,6 +2148,80 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     }
     LOG_INFO(Frontend, "Core load completed: elapsed_ms={}", load_timer.elapsed());
 
+    const auto report_program_id = QtCommon::system->GetApplicationProcessProgramID();
+    if (Settings::CurrentProgramIsSwitch2() && report_program_id != 0) {
+        auto& session = report_session.emplace();
+        session.program_id = report_program_id;
+        const FileSys::PatchManager pm(report_program_id,
+                                       QtCommon::system->GetFileSystemController(),
+                                       QtCommon::system->GetContentProvider());
+        if (const auto metadata = pm.GetControlMetadata(); metadata.first) {
+            session.title = QString::fromStdString(metadata.first->GetApplicationName());
+            session.game_version = QString::fromStdString(metadata.first->GetVersionString());
+        }
+        if (session.title.trimmed().isEmpty()) {
+            std::string title;
+            if (QtCommon::system->GetGameName(title) == Loader::ResultStatus::Success) {
+                session.title = QString::fromStdString(title);
+            }
+        }
+        FileSys::VirtualFile update_raw;
+        auto& report_loader = QtCommon::system->GetAppLoader();
+        report_loader.ReadUpdateRaw(update_raw);
+        QList<CompatibilityReporting::Addon> mods;
+        QList<CompatibilityReporting::Addon> updates;
+        for (const auto& patch : pm.GetPatches(update_raw)) {
+            auto* entries = patch.type == FileSys::PatchType::Mod      ? &mods
+                            : patch.type == FileSys::PatchType::Update ? &updates
+                                                                       : nullptr;
+            if (entries) {
+                entries->push_back({QString::fromStdString(patch.name),
+                                    QString::fromStdString(patch.version), patch.enabled});
+            }
+        }
+        if (report_loader.GetFileType() == Loader::FileType::NUP) {
+            std::string version;
+            if (report_loader.ReadDisplayVersion(version) == Loader::ResultStatus::Success &&
+                !version.empty()) {
+                session.game_version = QString::fromStdString(version);
+                updates.push_back(
+                    {QStringLiteral("Loaded NUP package"), session.game_version, true});
+            }
+        }
+        session.mods = CompatibilityReporting::SummarizeEnabledAddons(mods);
+        session.updates = CompatibilityReporting::SummarizeEnabledAddons(updates);
+        session.build = QStringLiteral("Lichii %1 (%2)")
+                            .arg(QString::fromUtf8(Common::g_build_version),
+                                 QString::fromUtf8(Common::g_scm_rev).left(12));
+#ifdef ARCHITECTURE_x86_64
+        session.cpu = QString::fromLatin1(Common::g_cpu_caps.cpu_string,
+                                          sizeof(Common::g_cpu_caps.cpu_string))
+                          .section(QChar{}, 0, 0)
+                          .trimmed();
+#endif
+        session.os = QSysInfo::prettyProductName();
+        const auto memory = Common::GetMemInfo().TotalPhysicalMemory;
+        if (memory != 0) {
+            session.ram =
+                QStringLiteral("%1 GiB").arg(double(memory) / (1024 * 1024 * 1024), 0, 'f', 1);
+        }
+        const auto& device_info = QtCommon::system->Renderer().GetDeviceInfo();
+        session.gpu = QString::fromStdString(device_info.model);
+        session.driver = QString::fromStdString(device_info.driver);
+        session.graphics_api = QString::fromStdString(device_info.api);
+        session.settings =
+            QStringLiteral("Launch settings: %1 mode; resolution scale %2x; "
+                           "GPU accuracy %3; asynchronous shaders %4.")
+                .arg(Settings::IsDockedMode() ? QStringLiteral("Docked")
+                                              : QStringLiteral("Handheld"))
+                .arg(Settings::values.resolution_info.up_factor)
+                .arg(Settings::values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::High
+                         ? QStringLiteral("High")
+                         : QStringLiteral("Low"))
+                .arg(Settings::values.use_asynchronous_shaders.GetValue() ? QStringLiteral("on")
+                                                                          : QStringLiteral("off"));
+    }
+
     QtCommon::system->SetShuttingDown(false);
     game_list->setDisabled(true);
 
@@ -2102,6 +2278,10 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     }
     status_bar_update_timer.start(500);
     renderer_status_button->setDisabled(true);
+    frame_gen_status_button->setDisabled(true);
+    frame_gen_state = VideoCore::FrameGenState::Pending;
+    frame_gen_frames = 0;
+    frame_gen_generating = false;
     refresh_button->setDisabled(true);
     SetFPSSuffix();
 
@@ -2149,7 +2329,8 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     emulation_running = true;
     if (ui->action_Fullscreen->isChecked()) {
         ShowFullscreen();
-    } else {
+    } else if (!(ui->action_Single_Window_Mode->isChecked() ? isMaximized()
+                                                            : render_window->isMaximized())) {
         if (Settings::IsDockedMode()) {
             ResetWindowSize1080();
         } else {
@@ -2276,6 +2457,8 @@ void MainWindow::OnEmulationStopped() {
 
     emulation_running = false;
 
+    game_list->SetReportableProgramId(report_session ? report_session->program_id : 0);
+
     discord_rpc->Update();
     Common::FeralGamemode::Stop();
 
@@ -2317,6 +2500,7 @@ void MainWindow::OnEmulationStopped() {
     game_fps_label->setVisible(false);
     emu_frametime_label->setVisible(false);
     renderer_status_button->setEnabled(!UISettings::values.has_broken_vulkan);
+    frame_gen_status_button->setEnabled(true);
     refresh_button->setEnabled(true);
 
     if (!firmware_label->text().isEmpty()) {
@@ -3462,6 +3646,17 @@ void MainWindow::ResetWindowSize(u32 width, u32 height) {
     const auto aspect_ratio = Layout::EmulationAspectRatio(Settings::values.aspect_ratio.GetValue(),
                                                            float(height) / width);
     const bool single_window = ui->action_Single_Window_Mode->isChecked();
+    // Resizing a maximized window leaves it marked as maximized at the new size, stuck in a corner.
+    if (single_window && isMaximized()) {
+        showNormal();
+    } else if (!single_window && render_window->isMaximized()) {
+        // A stopped game hides the render window; showNormal() would show it again.
+        if (render_window->isHidden()) {
+            render_window->setWindowState(render_window->windowState() & ~Qt::WindowMaximized);
+        } else {
+            render_window->showNormal();
+        }
+    }
     const bool show_status_bar = ui->action_Show_Status_Bar->isChecked();
     const auto status_bar_height = (single_window && show_status_bar) ? statusBar()->height() : 0;
     const auto menu_bar_height = single_window ? menuBar()->height() : 0;
@@ -4536,18 +4731,54 @@ void MainWindow::OnCaptureScreenshot() {
 
 #ifdef ENABLE_UPDATE_CHECKER
 void MainWindow::OnEmulatorUpdateAvailable() {
-    std::optional<Common::Net::Release> version = update_future.result();
-    if (!version)
+    const auto result = update_future.result();
+    if (result.failure == UpdateChecker::Failure::RateLimited) {
+        statusBar()->showMessage(
+            tr("Could not check for updates: GitHub rate limit reached. Lichii will try again at "
+               "the next start."),
+            15000);
         return;
+    }
+    if (result.failure == UpdateChecker::Failure::Http) {
+        statusBar()->showMessage(
+            tr("Could not check for updates: GitHub answered with HTTP %1.").arg(result.status),
+            15000);
+        return;
+    }
+    if (!result.update) {
+        return;
+    }
 
-    UpdateDialog dialog(version.value(), this);
-    dialog.exec();
+    const auto& release = *result.update;
+    const auto now = static_cast<unsigned long long>(QDateTime::currentSecsSinceEpoch());
+    if (UISettings::values.skipped_update_tag.GetValue() == release.tag ||
+        UISettings::values.update_remind_at.GetValue() > now) {
+        return;
+    }
+
+    UpdateDialog dialog(release, this);
+    switch (dialog.exec()) {
+    case UpdateDialog::SkipVersion:
+        UISettings::values.skipped_update_tag = release.tag;
+        break;
+    case QDialog::Rejected:
+        UISettings::values.update_remind_at = now + 24 * 60 * 60;
+        break;
+    default:
+        return;
+    }
+    OnSaveConfig();
 }
 #endif
 
 void MainWindow::OnApplicationChanged(u64 program_id) {
     if (!emulation_running || program_id == 0)
         return;
+
+    if (report_session && report_session->program_id != program_id) {
+        report_session.reset();
+        game_list->SetReportableProgramId(0);
+    }
 
     std::string title_name;
     std::string title_version;
@@ -4703,6 +4934,12 @@ void MainWindow::UpdateStatusBar() {
 
     emu_frametime_label->setText(tr("Frame: %1 ms").arg(results.frametime * 1000.0, 0, 'f', 2));
 
+    const auto frame_gen = QtCommon::system->GPU().Renderer().GetFrameGenStatus();
+    frame_gen_generating = frame_gen.generated_frames > frame_gen_frames;
+    frame_gen_frames = frame_gen.generated_frames;
+    frame_gen_state = frame_gen.state;
+    UpdateFrameGenButton();
+
     res_scale_label->setVisible(true);
     emu_speed_label->setVisible(!Settings::values.use_multi_core.GetValue());
     game_fps_label->setVisible(true);
@@ -4766,6 +5003,87 @@ void MainWindow::UpdatePostShaderText() {
 }
 #endif
 
+void MainWindow::UpdateFrameGenButton() {
+    const bool enabled = Settings::values.frame_gen.GetValue();
+    frame_gen_status_button->setChecked(enabled);
+    if (!enabled) {
+        frame_gen_status_button->setText(tr("NO FG"));
+        frame_gen_status_button->setToolTip(tr("Frame generation is off."));
+        return;
+    }
+
+    const QString type = ConfigurationShared::frame_gen_type_texts_map
+                             .find(Settings::values.frame_gen_type.GetValue())
+                             ->second.toUpper();
+    const u32 target_rate = Settings::values.frame_gen_target_rate.GetValue();
+    const QString mode = target_rate == 0
+                             ? tr("FG %1 %2X").arg(type).arg(Settings::FrameGenMultiplier())
+                             : tr("FG %1 AUTO").arg(type);
+    const QString target = target_rate == 0
+                               ? QString()
+                               : tr(" It adds up to %1 frames per game frame to reach %2 FPS.")
+                                     .arg(Settings::MAX_FRAME_GEN_MULTIPLIER - 1)
+                                     .arg(target_rate);
+
+    if (!emulation_running) {
+        frame_gen_status_button->setText(mode);
+        frame_gen_status_button->setToolTip(
+            tr("Frame generation is on.%1 Whether it runs shows here once a game starts.")
+                .arg(target));
+        return;
+    }
+
+    QString unavailable;
+    switch (frame_gen_state) {
+    case VideoCore::FrameGenState::Pending:
+    case VideoCore::FrameGenState::Running:
+        break;
+    case VideoCore::FrameGenState::UnsupportedRenderer:
+        unavailable = tr("Frame generation needs the Vulkan renderer.");
+        break;
+    case VideoCore::FrameGenState::UnsupportedBuild:
+        unavailable = tr("This build was compiled without frame generation.");
+        break;
+    case VideoCore::FrameGenState::UnsupportedGpu:
+        unavailable = tr("This GPU lacks Vulkan features LSFG needs (Vulkan memory model, null "
+                         "descriptors and 16-bit floats). The Optical Flow type may still work.");
+        break;
+    case VideoCore::FrameGenState::UnsupportedSurface:
+        unavailable = tr("This GPU can't write to the window's swapchain format from a shader, so "
+                         "generated frames can't be presented.");
+        break;
+    case VideoCore::FrameGenState::MissingLosslessDll:
+        unavailable = tr("LSFG needs Lossless.dll from Lossless Scaling in the \"lossless\" folder "
+                         "of the user directory. It is missing or could not be loaded.");
+        break;
+    }
+
+    if (!unavailable.isEmpty()) {
+        frame_gen_status_button->setChecked(false);
+        frame_gen_status_button->setText(tr("FG UNAVAILABLE"));
+        frame_gen_status_button->setToolTip(
+            tr("Frame generation is on but not running. %1").arg(unavailable));
+        return;
+    }
+
+    if (frame_gen_generating) {
+        frame_gen_status_button->setText(mode);
+        frame_gen_status_button->setToolTip(tr("Frame generation is running.%1").arg(target));
+        return;
+    }
+
+    const QString target_met =
+        target_rate == 0
+            ? QString()
+            : tr(" It also pauses while the game already reaches %1 FPS.").arg(target_rate);
+    frame_gen_status_button->setText(tr("%1 (IDLE)").arg(mode));
+    frame_gen_status_button->setToolTip(
+        tr("Frame generation is on but generated no frames in the last half second. It pauses "
+           "while it warms up, for a second after a frame takes longer than 100 ms, and while "
+           "frames arrive in bursts.%1")
+            .arg(target_met));
+}
+
 void MainWindow::UpdateVolumeUI() {
     const auto volume_value = static_cast<int>(Settings::values.volume.GetValue());
     volume_slider->setValue(volume_value);
@@ -4786,6 +5104,7 @@ void MainWindow::UpdateStatusButtons() {
     UpdateDockedButton();
     UpdateFilterText();
     UpdateAAText();
+    UpdateFrameGenButton();
     UpdateVolumeUI();
 }
 

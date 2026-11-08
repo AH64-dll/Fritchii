@@ -17,7 +17,7 @@ TEST_CASE("Ampere uniform vote writes mapped uniform registers", "[video_core][a
         std::pair{29U, 215U}, std::pair{62U, 214U}, std::pair{63U, 255U},
     };
 
-    for (const auto [target, mapped] : mappings) {
+    for (const auto& [target, mapped] : mappings) {
         const Instruction vote{{0x00007886U | (target << 16), 0, 0x038e0100, 0}};
         const auto lowered = LowerToMaxwell(std::array{vote, exit});
         REQUIRE(static_cast<bool>(lowered));

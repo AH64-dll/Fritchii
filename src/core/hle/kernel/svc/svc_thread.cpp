@@ -4,7 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include "common/scope_exit.h"
@@ -35,6 +37,20 @@ constexpr int32_t FoldExtraCoreId(int32_t core_id) {
 constexpr u64 FoldExtraCoreMask(u64 mask) {
     constexpr u64 low = (1ULL << Core::Hardware::NUM_CPU_CORES) - 1;
     return (mask & low) | ((mask >> Core::Hardware::NUM_CPU_CORES) & low);
+}
+
+// Ocarina of Time's two main threads (priorities 55 and 47) may only run on two of cores 3-5,
+// where the per-core job workers (priority 44) keep preempting them while cores 0-2 sit idle
+// about 30% of the time. Any mask of more than one core is widened to all of the process's cores,
+// so an idle core can take a preempted main thread. Pinned (single-core) threads are unchanged.
+// EDEN_NX2_OOT_WIDE_AFFINITY=0 turns it off.
+bool WidenAffinity(const KProcess& process, u64 affinity_mask) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_OOT_WIDE_AFFINITY");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled && std::popcount(affinity_mask) > 1 &&
+           process.GetProgramId() == 0x0400486024DEC000ULL;
 }
 
 } // Anonymous namespace
@@ -320,6 +336,9 @@ Result SetThreadCoreMask(Core::System& system, Handle thread_handle, s32 core_id
         // Validated against the real mask above; fold to the emulated cores from here on.
         affinity_mask = FoldExtraCoreMask(affinity_mask);
         core_id = FoldExtraCoreId(core_id);
+        if (WidenAffinity(GetCurrentProcess(system.Kernel()), affinity_mask)) {
+            affinity_mask = FoldExtraCoreMask(process_core_mask);
+        }
 
         // Validate the core id.
         if (IsValidVirtualCoreId(core_id)) {

@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <thread>
@@ -51,6 +52,25 @@
 #include "core/memory.h"
 
 namespace Kernel {
+
+namespace {
+
+// EDEN_NX2_FAST_TLS: plain (constinit, trivially destructible) copies of the hot fields of
+// ThreadLocalData. ThreadLocalData holds an optional KThread, so every access to it goes through
+// the TLS wrapper and its guard; SVCs, scheduler locks and memory traps read the current thread
+// and the host thread ID many times each.
+constinit thread_local KThread* t_nx2_current_thread = nullptr;
+constinit thread_local u8 t_nx2_host_thread_id = UINT8_MAX;
+
+bool FastTlsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_FAST_TLS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+} // Anonymous namespace
 
 // Can only be used by a single implementation PER THREAD
 struct ThreadLocalData {
@@ -386,11 +406,15 @@ struct KernelCore::Impl {
         // The first four slots are reserved for CPU core threads
         ASSERT(core_id < Core::Hardware::NUM_CPU_CORES);
         tls_data.host_thread_id = u8(core_id);
+        t_nx2_host_thread_id = u8(core_id);
         return tls_data.host_thread_id;
     }
 
     /// Gets the host thread ID for the caller
     u32 GetHostThreadId() const {
+        if (fast_tls) {
+            return t_nx2_host_thread_id;
+        }
         return tls_data.host_thread_id;
     }
 
@@ -442,11 +466,22 @@ struct KernelCore::Impl {
     }
 
     KThread* GetCurrentEmuThread(ThreadLocalData& t) {
+        if (fast_tls) {
+            if (KThread* const cached = t_nx2_current_thread; cached != nullptr) [[likely]] {
+                return cached;
+            }
+            if (t.current_thread == nullptr) {
+                t.current_thread = GetHostDummyThread(t, nullptr);
+            }
+            t_nx2_current_thread = t.current_thread;
+            return t.current_thread;
+        }
         return t.current_thread ? t.current_thread : (t.current_thread = GetHostDummyThread(t, nullptr));
     }
 
     void SetCurrentEmuThread(KThread* thread) {
         tls_data.current_thread = thread;
+        t_nx2_current_thread = thread;
     }
 
     void DeriveInitialMemoryLayout() {
@@ -817,6 +852,7 @@ struct KernelCore::Impl {
 
     // Next host thead ID to use, 0-3 IDs represent core threads, >3 represent others
     std::atomic<u32> next_host_thread_id{Core::Hardware::NUM_CPU_CORES};
+    const bool fast_tls{FastTlsEnabled()};
 
     // Kernel memory management
     std::optional<KMemoryManager> memory_manager;

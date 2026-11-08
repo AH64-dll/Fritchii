@@ -92,10 +92,10 @@ TEST_CASE("Legacy and Android submission schedules remain unchanged",
 
 TEST_CASE("Submission budget parsing accepts only positive complete u32 decimals",
           "[video_core][submission_policy]") {
-    REQUIRE(ParseBudget("1") == 1);
-    REQUIRE(ParseBudget("31") == 31);
-    REQUIRE(ParseBudget("128") == 128);
-    REQUIRE(ParseBudget("000129") == 129);
+    REQUIRE(ParseBudget("1") == 1U);
+    REQUIRE(ParseBudget("31") == 31U);
+    REQUIRE(ParseBudget("128") == 128U);
+    REQUIRE(ParseBudget("000129") == 129U);
     REQUIRE(ParseBudget("4294967295") == std::numeric_limits<u32>::max());
     for (const auto value : {"", "0", "00", "-1", "+128", " 128", "128 ", "128\n", "1.5", "1e2",
                              "0x80", "128garbage", "4294967296", "999999999999999999999999999"}) {

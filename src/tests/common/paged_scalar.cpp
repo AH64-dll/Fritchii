@@ -25,7 +25,7 @@ TEST_CASE("Scalar reads translate both sides of a fragmented page boundary", "[m
         for (size_t i = 0; i < bytes.size(); ++i) *translate(offset + i) = bytes[i];
         translations.clear();
         CHECK(Common::ReadPagedScalar<u64>(offset, translate) == expected);
-        REQUIRE(translations.size() == (offset == 0xff8 ? 1 : 2));
+        REQUIRE(translations.size() == (offset == 0xff8 ? 1U : 2U));
         CHECK(translations.front() == offset);
         if (translations.size() == 2) CHECK(translations.back() == 0x1000);
     }

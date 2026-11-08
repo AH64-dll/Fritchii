@@ -332,7 +332,7 @@ TEST_CASE("Image backends preserve raw B32 storage and add one conditional image
                     for (const auto& op : Instructions(spirv, 71)) {
                         if (op.size() >= 2 && op[1] == 23) coherent_variables.insert(op[0]);
                     }
-                    CHECK(coherent_variables.size() == (image_coherent ? 1 : 0));
+                    CHECK(coherent_variables.size() == (image_coherent ? 1U : 0U));
                     REQUIRE(Instructions(spirv, 99).size() == 1);
                     std::map<u32, u32> constants;
                     for (const auto& op : Instructions(spirv, 43)) {

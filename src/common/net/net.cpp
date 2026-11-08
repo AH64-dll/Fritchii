@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <optional>
 #include <boost/algorithm/string/replace.hpp>
 
@@ -18,17 +21,35 @@
 
 namespace Common::Net {
 
-std::vector<Asset> Release::GetPlatformAssets() const {
-    return GetPlatformAssets(Common::g_build_release_platform);
+LinuxPackage CurrentLinuxPackage() {
+#ifdef __linux__
+    const char* appimage = std::getenv("APPIMAGE");
+    return appimage && *appimage ? LinuxPackage::AppImage : LinuxPackage::Archive;
+#else
+    return LinuxPackage::Any;
+#endif
 }
 
-std::vector<Asset> Release::GetPlatformAssets(std::string_view platform) const {
+std::vector<Asset> Release::GetPlatformAssets() const {
+    return GetPlatformAssets(Common::g_build_release_platform, CurrentLinuxPackage());
+}
+
+std::vector<Asset> Release::GetPlatformAssets(std::string_view platform,
+                                              LinuxPackage package) const {
+    const bool pgo = platform.ends_with("-pgo");
+    if (pgo) {
+        platform.remove_suffix(4);
+    }
+
     std::vector<std::string_view> extensions;
-    if (platform == "linux-x86_64" || platform == "linux-x86_64-pgo" ||
-        platform == "linux-aarch64" || platform == "linux-aarch64-pgo") {
-        extensions = {".AppImage", ".tar.gz"};
-    } else if (platform == "windows-x86_64" || platform == "windows-x86_64-pgo" ||
-               platform == "macos-arm64") {
+    if (platform == "linux-x86_64" || platform == "linux-aarch64") {
+        if (package != LinuxPackage::Archive) {
+            extensions.push_back(".AppImage");
+        }
+        if (package != LinuxPackage::AppImage) {
+            extensions.push_back(".tar.gz");
+        }
+    } else if (platform == "windows-x86_64" || (platform == "macos-arm64" && !pgo)) {
         extensions = {".zip"};
     } else {
         return {};
@@ -36,15 +57,23 @@ std::vector<Asset> Release::GetPlatformAssets(std::string_view platform) const {
 
     const std::string host_url = "https://github.com";
     const auto path = fmt::format("/{}/releases/download/{}/", Common::g_build_auto_update_repo, tag);
-    for (const auto extension : extensions) {
-        const auto filename = fmt::format("lichii-{}{}", platform, extension);
-        for (const auto& asset : assets) {
-            if (asset == host_url + path + filename) {
-                return {{.name = platform.ends_with("-pgo") ? "PGO" : "Standard",
-                         .url = host_url,
-                         .path = path + filename,
-                         .filename = filename}};
+    for (const std::string_view variant : pgo ? std::vector<std::string_view>{"-pgo", ""}
+                                              : std::vector<std::string_view>{""}) {
+        for (const auto extension : extensions) {
+            const auto filename = fmt::format("lichii-{}{}{}", platform, variant, extension);
+            const auto url = host_url + path + filename;
+            if (std::ranges::find(assets, url) == assets.end()) {
+                continue;
             }
+            Asset asset{.name = variant.empty() ? "Standard" : "PGO",
+                        .url = host_url,
+                        .path = path + filename,
+                        .filename = filename};
+            if (const auto info = asset_info.find(url); info != asset_info.end()) {
+                asset.sha256 = info->second.sha256;
+                asset.size = info->second.size;
+            }
+            return {std::move(asset)};
         }
     }
     return {};
@@ -109,7 +138,29 @@ std::optional<Release> Release::FromJson(const nlohmann::json& json, const std::
         return std::nullopt;
     }
     for (const auto& asset : assets) {
-        rel.assets.emplace_back(asset.value("browser_download_url", std::string{}));
+        const auto url = asset.value("browser_download_url", std::string{});
+        rel.assets.emplace_back(url);
+
+        AssetInfo info;
+        if (asset.contains("size") && asset["size"].is_number_unsigned()) {
+            info.size = asset["size"].get<u64>();
+        }
+        constexpr std::string_view digest_prefix = "sha256:";
+        if (asset.contains("digest") && asset["digest"].is_string()) {
+            const auto digest = asset["digest"].get<std::string>();
+            const std::string_view hex =
+                digest.starts_with(digest_prefix)
+                    ? std::string_view{digest}.substr(digest_prefix.size())
+                    : std::string_view{};
+            if (hex.size() == 64 &&
+                std::ranges::all_of(hex, [](unsigned char c) { return std::isxdigit(c); })) {
+                info.sha256 = std::string{hex};
+                std::ranges::transform(info.sha256, info.sha256.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+            }
+        }
+        rel.asset_info.emplace(url, std::move(info));
     }
 
     return rel;
@@ -151,7 +202,7 @@ std::vector<Release> Release::ListFromJson(const std::string_view& json, const s
     return {};
 }
 
-std::optional<std::string> MakeRequest(const std::string& url, const std::string& path) {
+RequestResult Fetch(const std::string& url, const std::string& path) {
     try {
         constexpr std::size_t timeout_seconds = 15;
 
@@ -187,31 +238,37 @@ std::optional<std::string> MakeRequest(const std::string& url, const std::string
         if (response.status >= 400) {
             LOG_ERROR(Common, "GET to {}{} returned error status code: {}", url, path,
                       response.status);
-            return {};
+            return {.status = response.status};
         }
         if (!response.has_header("content-type")) {
             LOG_ERROR(Common, "GET to {}{} returned no content", url, path);
-            return {};
+            return {.status = response.status};
         }
 
-        return response.body;
+        return {.body = response.body, .status = response.status};
     } catch (std::exception& e) {
         LOG_ERROR(Common, "GET to {}{} failed during update check: {}", url, path, e.what());
-        return std::nullopt;
+        return {};
     }
 }
 
-std::vector<Release> GetReleases() {
-    const auto body = GetReleasesBody();
+std::optional<std::string> MakeRequest(const std::string& url, const std::string& path) {
+    return Fetch(url, path).body;
+}
 
-    if (!body) {
+ReleaseList GetReleases() {
+    const auto url = fmt::format("https://{}", Common::g_build_auto_update_stable_api);
+    const auto response = Fetch(url, Common::g_build_auto_update_api_path);
+
+    if (!response.body) {
         LOG_WARNING(Common, "Failed to get Lichii releases");
-        return {};
+        return {.status = response.status};
     }
 
-    const std::string_view body_str = body.value();
-    const auto url = fmt::format("https://{}", Common::g_build_auto_update_stable_api);
-    return Release::ListFromJson(body_str, url, Common::g_build_auto_update_stable_repo);
+    return {.releases = Release::ListFromJson(std::string_view{*response.body}, url,
+                                              Common::g_build_auto_update_stable_repo),
+            .ok = true,
+            .status = response.status};
 }
 
 std::optional<std::string> GetReleasesBody() {

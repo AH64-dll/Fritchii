@@ -34,6 +34,34 @@ dispatches, capped at one million. Logs include exact shader identity, QMD launc
 bounded constant-buffer words and raw texture descriptors. They contain guest addresses
 and should remain private. No shaders are skipped or game files changed by this capture.
 
+## Ocarina of Time
+
+The Legend of Zelda: Ocarina of Time (`0400486024DEC000`) has no DLSS of its own. Its
+end-of-frame upscale pass is replaced with NVIDIA DLSS when the setting is on and Streamline
+has DLSS for the device. FSR is not used for this game, and no environment override is needed.
+
+- Max Resolution add-on off: the 3/4-scale pass (`e40f5efb5480e692`) is replaced and DLSS
+  writes the game's output size (1080p to 1440p docked, 810p to 1080p handheld).
+- Max Resolution add-on on, docked: the full-size pass (`6bd913e1f34e83eb`) at 2560x1440 is
+  replaced by a 3840x2160 DLSS image. The game still finishes its 1440p frame. At presentation,
+  the HUD is taken from the difference between that frame and a 1440p copy of the DLSS scene,
+  and composited over the 4K scene. The 4K image skips the presentation's post-processing and
+  upscale filters.
+- The game has no motion vectors or jitter. Motion comes from the scene depth reprojected
+  through this and the previous frame's camera (vertex constant buffer 3). Link's recognized
+  skinned draw is replayed with both poses where his depth matches. Without his pose the frame
+  keeps the camera motion. The input is tonemapped, so DLSS runs in LDR without auto exposure.
+- FXAA and SMAA are skipped on frames DLSS drew.
+- Any unexpected input, a busy frame slot, a rescaled image (resolution scale other than 1x) or
+  a failed evaluation leaves the game's pass to run. The log names the reason as
+  `Ocarina DLSS: the game's upscale draws frame N (reason)`.
+
+Shader hashes, buffer offsets and Link's mesh shape are taken from the game's current build.
+A game update that changes them disables the replacement and leaves the game's pass in place.
+The "Ocarina of Time anti-aliasing" option (No sharpening, docs/nx2/oot-network-bypass.md)
+bypasses the same network on other GPUs. It does nothing while this replacement is enabled:
+NVIDIA DLSS takes precedence because it replaces the same output pass.
+
 ## Settings and comparison runs
 
 "Use NVIDIA DLSS in place of a game's DLSS" defaults to off and takes effect when the game

@@ -300,7 +300,7 @@ TEST_CASE("Star Fox ULDC U16 preserves halfword offsets uniform destinations and
                     const bool taken = guard == 7 || enabled != (guard == 8);
                     const u32 target = dest < 22 ? dest + 216 : dest + 218;
                     const u32 expected = offset & 2 ? 0x8001U : 0xfedcU;
-                    CHECK(translated.constant_reads == (taken ? 1 : 0));
+                    CHECK(translated.constant_reads == (taken ? 1U : 0U));
                     CHECK(translated.predicates == predicates);
                     for (u32 reg = 0; reg < 246; ++reg)
                         CHECK(translated.registers[reg] ==
@@ -330,6 +330,11 @@ TEST_CASE("Star Fox ULDC U16 rejects unrepresentable offsets and unsupported mod
     auto indexed = CapturedUniformLoad;
     SetBits(indexed, 0, 12, 0xabb);
     SetBits(indexed, 91, 1, 1);
+    // Ocarina of Time loads U8 and U16 values through an index register.
+    const auto indexed_load = LowerToMaxwell(std::array{indexed, Exit});
+    INFO(indexed_load.error);
+    CHECK(indexed_load);
+    SetBits(indexed, 73, 3, 1);
     CHECK_FALSE(LowerToMaxwell(std::array{indexed, Exit}));
 }
 

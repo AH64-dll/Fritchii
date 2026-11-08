@@ -720,6 +720,17 @@ A64OPC(ExclusiveWriteMemory16,                              U32,            U64,
 A64OPC(ExclusiveWriteMemory32,                              U32,            U64,            U64,            U32,            AccType         )
 A64OPC(ExclusiveWriteMemory64,                              U32,            U64,            U64,            U64,            AccType         )
 A64OPC(ExclusiveWriteMemory128,                             U32,            U64,            U64,            U128,           AccType         )
+#if defined(ARCHITECTURE_x86_64)
+// LSE atomics done by one host atomic (x64 only): return the old value.
+A64OPC(AtomicRmwMemory8,                                    U8,             U64,            U64,            U8,             U8              )
+A64OPC(AtomicRmwMemory16,                                   U16,            U64,            U64,            U16,            U8              )
+A64OPC(AtomicRmwMemory32,                                   U32,            U64,            U64,            U32,            U8              )
+A64OPC(AtomicRmwMemory64,                                   U64,            U64,            U64,            U64,            U8              )
+A64OPC(AtomicCasMemory8,                                    U8,             U64,            U64,            U8,             U8              )
+A64OPC(AtomicCasMemory16,                                   U16,            U64,            U64,            U16,            U16             )
+A64OPC(AtomicCasMemory32,                                   U32,            U64,            U64,            U32,            U32             )
+A64OPC(AtomicCasMemory64,                                   U64,            U64,            U64,            U64,            U64             )
+#endif
 
 // Remember to update:
 // - a32_emit_x64.cpp

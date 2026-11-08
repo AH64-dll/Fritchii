@@ -81,7 +81,10 @@ public:
                     ++work_done;
                 }
             }
-            ++workers_stopped;
+            {
+                std::scoped_lock lock{queue_mutex};
+                ++workers_stopped;
+            }
             wait_condition.notify_all();
         };
         threads.reserve(num_workers);
@@ -103,6 +106,19 @@ public:
             ++work_scheduled;
         }
         condition.notify_one();
+    }
+
+    bool TryQueueWork(Task work) {
+        {
+            std::unique_lock lock{queue_mutex};
+            if (work_scheduled - work_done >= workers_queued) {
+                return false;
+            }
+            requests.emplace(std::move(work));
+            ++work_scheduled;
+        }
+        condition.notify_one();
+        return true;
     }
 
     void WaitForRequests(std::stop_token stop_token = {}) {

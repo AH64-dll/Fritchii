@@ -94,7 +94,7 @@ void CpuManager::MultiCoreRunIdleThread(Kernel::KernelCore& kernel) {
     while (true) {
         auto& physical_core = kernel.CurrentPhysicalCore();
         if (!physical_core.IsInterrupted()) {
-            physical_core.Idle();
+            physical_core.Idle(kernel);
         }
         HandleInterrupt(kernel);
     }
@@ -180,6 +180,11 @@ void CpuManager::RunThread(std::stop_token token, std::size_t core) {
     Common::SetCurrentThreadName(name.c_str());
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
+    if (Settings::values.pin_gpu_threads.GetValue()) {
+        Common::PinCurrentThread(Common::PinnedRole::GuestCore);
+    } else {
+        Common::PinHostThread(Common::HostThreadRole::GuestCore, core);
+    }
     auto& data = core_data[core];
     data.host_context = Common::Fiber::ThreadToFiber();
 

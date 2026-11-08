@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
@@ -27,6 +28,17 @@
 
 namespace Vulkan {
 namespace {
+void HostReadBarrier(vk::CommandBuffer cmdbuf) {
+    const VkMemoryBarrier barrier{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+    };
+    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                           barrier);
+}
+
 VkBufferCopy MakeBufferCopy(const VideoCommon::BufferCopy& copy) {
     return VkBufferCopy{
         .srcOffset = copy.src_offset,
@@ -170,13 +182,21 @@ public:
     virtual ~QuadIndexBuffer() = default;
 
     void UpdateBuffer(u32 num_indices_) {
+        while (!retired_buffers.empty() && scheduler.IsFree(retired_buffers.front().first)) {
+            retired_buffers.erase(retired_buffers.begin());
+        }
         if (num_indices_ <= num_indices) {
             return;
         }
 
-        scheduler.Finish();
+        // Commands recorded so far may still use the old buffer: it stays until the GPU is past
+        // them. Waiting for the GPU here stalled the thread ~150 ms in the middle of a load.
+        if (buffer) {
+            retired_buffers.emplace_back(scheduler.CurrentTick(), std::move(buffer));
+        }
 
-        num_indices = num_indices_;
+        // Grown by at least half, so that a draw count creeping up doesn't redo this every time.
+        num_indices = (std::max)(num_indices_, num_indices + num_indices / 2);
         index_type = IndexTypeFromNumElements(device, num_indices);
 
         const u32 num_quads = GetQuadsNum(num_indices);
@@ -267,6 +287,7 @@ protected:
     StagingBufferPool& staging_pool;
 
     vk::Buffer buffer{};
+    std::vector<std::pair<u64, vk::Buffer>> retired_buffers; ///< GPU tick that frees each one
     MemoryCommit memory_commit{};
     VkIndexType index_type{};
     u32 num_indices = 0;
@@ -362,6 +383,8 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
       quad_index_pass(device, scheduler, descriptor_pool, staging_pool,
                       compute_pass_descriptor_queue),
       multi_range_buffers(device_) {
+    uniform_buffer_alignment = static_cast<u32>(device.GetUniformBufferAlignment());
+    storage_buffer_alignment = static_cast<u32>(device.GetStorageBufferAlignment());
     const VkDriverIdKHR driver_id = device.GetDriverID();
     const bool enable_vertex_repack = VertexRepackEnabled();
     LOG_INFO(Render_Vulkan, "69-byte vertex layout repacking {} ({})",
@@ -430,15 +453,12 @@ bool BufferCacheRuntime::CanReportMemoryUsage() const {
     return device.CanReportMemoryUsage();
 }
 
-u32 BufferCacheRuntime::GetUniformBufferAlignment() const {
-    return static_cast<u32>(device.GetUniformBufferAlignment());
-}
-
-u32 BufferCacheRuntime::GetStorageBufferAlignment() const {
-    return static_cast<u32>(device.GetStorageBufferAlignment());
+u64 BufferCacheRuntime::GetMaxStorageBufferRange() const {
+    return device.GetMaxStorageBufferRange();
 }
 
 void BufferCacheRuntime::TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept {
+    multi_range_buffers.TickFrame(scheduler);
     for (auto it = slot_buffers.begin(); it != slot_buffers.end(); it++) {
         if (scheduler.IsFree(it->LastUsageTick())) {
             it->ResetUsageTracking();
@@ -479,6 +499,12 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
 }
 
 void BufferCacheRuntime::Finish() {
+    scheduler.Finish();
+}
+
+void BufferCacheRuntime::FinishForHostRead() {
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record(HostReadBarrier);
     scheduler.Finish();
 }
 
@@ -650,12 +676,27 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
         ReserveNullBuffer();
         vk_buffer = *null_buffer;
     }
+    // The same index buffer is still bound in this command buffer (PR #161): skip the rebind.
+    if (!VideoCommon::Nx2Perf::Verify()) {
+        const u64 epoch = scheduler.RecordingEpoch();
+        if (bound_index_valid && vk_buffer == bound_index_buffer &&
+            vk_offset == bound_index_offset && vk_index_type == bound_index_type &&
+            epoch == bound_index_epoch) {
+            return;
+        }
+        bound_index_valid = true;
+        bound_index_buffer = vk_buffer;
+        bound_index_offset = vk_offset;
+        bound_index_type = vk_index_type;
+        bound_index_epoch = epoch;
+    }
     scheduler.Record([vk_buffer, vk_offset, vk_index_type](vk::CommandBuffer cmdbuf) {
         cmdbuf.BindIndexBuffer(vk_buffer, vk_offset, vk_index_type);
     });
 }
 
 void BufferCacheRuntime::BindHostUint8IndexBuffer(std::span<const u8> indices) {
+    bound_index_valid = false;
     const auto staging = staging_pool.Request(indices.size() * sizeof(u16), MemoryUsage::Upload);
     u16* const widened = reinterpret_cast<u16*>(staging.mapped_span.data());
     std::ranges::transform(indices, widened, [](u8 index) -> u16 { return index == 0xff ? 0xffff : index; });
@@ -665,6 +706,7 @@ void BufferCacheRuntime::BindHostUint8IndexBuffer(std::span<const u8> indices) {
 }
 
 void BufferCacheRuntime::BindQuadIndexBuffer(PrimitiveTopology topology, u32 first, u32 count) {
+    bound_index_valid = false;
     if (count == 0) {
         ReserveNullBuffer();
         scheduler.Record([this](vk::CommandBuffer cmdbuf) {
@@ -754,6 +796,40 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
     const u32 max_binding = (std::min)(bindings.max_index, device_max);
     const u32 binding_count = max_binding - min_binding;
     if (binding_count == 0) {
+        return;
+    }
+    // Most draws bind a few streams: record only those. The full HostBindings is ~1.3 KiB of
+    // the scheduler's 32 KiB command chunk on every draw that rebinds vertex buffers.
+    static constexpr u32 COMPACT_BINDINGS = 8;
+    if (binding_count <= COMPACT_BINDINGS) {
+        struct CompactBindings {
+            u32 first;
+            u32 count;
+            std::array<VkBuffer, COMPACT_BINDINGS> buffers;
+            std::array<VkDeviceSize, COMPACT_BINDINGS> offsets;
+            std::array<VkDeviceSize, COMPACT_BINDINGS> sizes;
+            std::array<VkDeviceSize, COMPACT_BINDINGS> strides;
+        } compact{};
+        compact.first = bindings.min_index;
+        compact.count = binding_count;
+        for (u32 i = 0; i < binding_count; ++i) {
+            compact.buffers[i] = buffer_handles[i];
+            compact.offsets[i] = bindings.offsets[i];
+            compact.sizes[i] = bindings.sizes[i];
+            compact.strides[i] = bindings.strides[i];
+        }
+        if (device.IsExtExtendedDynamicStateSupported()) {
+            scheduler.Record([compact](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindVertexBuffers2EXT(compact.first, compact.count, compact.buffers.data(),
+                                             compact.offsets.data(), compact.sizes.data(),
+                                             compact.strides.data());
+            });
+        } else {
+            scheduler.Record([compact](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindVertexBuffers(compact.first, compact.count, compact.buffers.data(),
+                                         compact.offsets.data());
+            });
+        }
         return;
     }
     if (device.IsExtExtendedDynamicStateSupported()) {

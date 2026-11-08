@@ -205,6 +205,36 @@ public:
         return Inst<IR::U32>(Opcode::A64ExclusiveWriteMemory128, ImmCurrentLocationDescriptor(), vaddr, value, IR::Value{acc_type});
     }
 
+#if defined(ARCHITECTURE_x86_64)
+    /// One atomic read-modify-write (op: the LSE opc field, 0b1000 = SWP); returns the old value.
+    IR::UAny AtomicRmwMemory(size_t bytes, const IR::U64& vaddr, const IR::UAny& operand, u8 op) noexcept {
+        switch (bytes) {
+        case 1:
+            return Inst<IR::U8>(Opcode::A64AtomicRmwMemory8, ImmCurrentLocationDescriptor(), vaddr, operand, Imm8(op));
+        case 2:
+            return Inst<IR::U16>(Opcode::A64AtomicRmwMemory16, ImmCurrentLocationDescriptor(), vaddr, operand, Imm8(op));
+        case 4:
+            return Inst<IR::U32>(Opcode::A64AtomicRmwMemory32, ImmCurrentLocationDescriptor(), vaddr, operand, Imm8(op));
+        default:
+            return Inst<IR::U64>(Opcode::A64AtomicRmwMemory64, ImmCurrentLocationDescriptor(), vaddr, operand, Imm8(op));
+        }
+    }
+
+    /// One atomic compare-and-swap; returns the old value.
+    IR::UAny AtomicCasMemory(size_t bytes, const IR::U64& vaddr, const IR::UAny& expected, const IR::UAny& desired) noexcept {
+        switch (bytes) {
+        case 1:
+            return Inst<IR::U8>(Opcode::A64AtomicCasMemory8, ImmCurrentLocationDescriptor(), vaddr, expected, desired);
+        case 2:
+            return Inst<IR::U16>(Opcode::A64AtomicCasMemory16, ImmCurrentLocationDescriptor(), vaddr, expected, desired);
+        case 4:
+            return Inst<IR::U32>(Opcode::A64AtomicCasMemory32, ImmCurrentLocationDescriptor(), vaddr, expected, desired);
+        default:
+            return Inst<IR::U64>(Opcode::A64AtomicCasMemory64, ImmCurrentLocationDescriptor(), vaddr, expected, desired);
+        }
+    }
+#endif
+
     IR::U32 GetW(Reg reg) noexcept {
         if (reg == Reg::ZR)
             return Imm32(0);

@@ -76,7 +76,7 @@ TEST_CASE("Ampere uniform immediate shifts use the uniform guard", "[video_core]
 
 TEST_CASE("Ampere uniform immediate shifts reject unsupported fields", "[video_core][ampere]") {
     for (const Instruction original : {Clamped, Wrapped}) {
-        for (const auto [word, bit] : std::array{
+        for (const auto& [word, bit] : std::array{
                  std::pair{0U, 24U}, std::pair{2U, 8U}, std::pair{2U, 9U},
                  std::pair{2U, 12U}, std::pair{2U, 16U}, std::pair{2U, 27U},
                  std::pair{3U, 0U}, std::pair{3U, 30U}}) {

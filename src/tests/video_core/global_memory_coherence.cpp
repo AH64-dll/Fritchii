@@ -222,7 +222,7 @@ TEST_CASE("Coherent storage aliases and barrier semantics are emitted in SPIR-V"
                     storage_structs.insert(pointers.at(op[0]));
                 }
             }
-            REQUIRE(storage_structs.size() == (aliasing ? 2 : 1));
+            REQUIRE(storage_structs.size() == (aliasing ? 2U : 1U));
             for (const u32 type : storage_structs) {
                 CHECK(blocks.contains(type));
                 CHECK(coherent_members.contains(type) == coherent);
@@ -455,7 +455,7 @@ TEST_CASE("Global atomic add preserves native candidate selection and atomic old
         }) == 1);
         const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
         const auto atomics = Instructions(code, 234);
-        REQUIRE(atomics.size() == (native ? 3 : 2));
+        REQUIRE(atomics.size() == (native ? 3U : 2U));
         std::map<u32, u32> constants;
         std::map<u32, u32> pointer_bases;
         std::map<u32, u32> bindings;
@@ -503,7 +503,7 @@ TEST_CASE("Global unsigned atomic max routes buffers and returns the old value",
             }
             const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
             const auto atomics = Instructions(code, 239);
-            REQUIRE(atomics.size() == (native ? 3 : 2));
+            REQUIRE(atomics.size() == (native ? 3U : 2U));
             CHECK(Instructions(code, 234).empty());
             const auto returns = Instructions(code, 254);
             for (const auto& atomic : atomics) {
@@ -523,7 +523,7 @@ TEST_CASE("Global atomic routing works without descriptor aliases",
         fixture.profile.support_descriptor_aliasing = false;
         const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
         const auto atomics = Instructions(code, 234);
-        REQUIRE(atomics.size() == (native ? 3 : 2));
+        REQUIRE(atomics.size() == (native ? 3U : 2U));
         const auto returns = Instructions(code, 254);
         for (const auto& op : atomics) {
             CHECK(std::ranges::any_of(returns, [&](const auto& returned) {

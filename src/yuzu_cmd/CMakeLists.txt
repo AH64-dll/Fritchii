@@ -27,12 +27,11 @@ endif()
 add_executable(yuzu-cmd
     emu_window/emu_window_sdl3.cpp
     emu_window/emu_window_sdl3.h
+    emu_window/sdl_window_state.h
     emu_window/emu_window_sdl3_null.cpp
     emu_window/emu_window_sdl3_null.h
     emu_window/emu_window_sdl3_vk.cpp
     emu_window/emu_window_sdl3_vk.h
-    nx2_sampler.cpp
-    nx2_sampler.h
     sdl_config.cpp
     sdl_config.h
     yuzu.cpp

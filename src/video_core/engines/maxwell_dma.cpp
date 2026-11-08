@@ -6,6 +6,7 @@
 
 #include <cstdlib>
 #include "common/algorithm.h"
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging.h"
 #include <ranges>
@@ -13,6 +14,7 @@
 #include "core/core.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
+#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_base.h"
@@ -60,6 +62,59 @@ void MaxwellDMA::CallMultiMethod(Core::System& system, u32 method, const u32* ba
     for (u32 i = 0; i < amount; ++i) {
         CallMethod(system, method, base_start[i], methods_pending - i <= 1);
     }
+}
+
+bool MaxwellDMA::FrontMethod(u32 method, u32 argument, u64 session, FrontLaunchWrites& writes) {
+    if (!front_regs || front_session != session) {
+        // Nothing of this engine is queued in this session yet: the back's registers (with the
+        // writes still in its method sink) are current.
+        front_regs = regs;
+        for (const auto& [sunk_method, value] : method_sink) {
+            front_regs->reg_array[sunk_method] = value;
+        }
+        front_session = session;
+    }
+    if (method >= NUM_REGS) {
+        return false;
+    }
+    Regs& front = *front_regs;
+    front.reg_array[method] = argument;
+    if (method != offsetof(Regs, launch_dma) / sizeof(u32)) {
+        return false;
+    }
+    // What Launch writes.
+    writes = {};
+    const auto add = [&writes](GPUVAddr begin, GPUVAddr end) {
+        if (begin < end) {
+            writes.ranges[writes.count++] = {begin, end};
+        }
+    };
+    const LaunchDMA& launch = front.launch_dma;
+    const GPUVAddr out = front.offset_out;
+    if (launch.multi_line_enable) {
+        if (launch.dst_memory_layout != LaunchDMA::MemoryLayout::PITCH) {
+            writes.bounded = false; // Swizzled into the surface dst_params describes
+        } else if (front.line_count != 0) {
+            // Lines pitch_out apart (from pitch), or |pitch_out| * line_count (from block linear).
+            const s64 pitch = front.pitch_out;
+            const s64 last = static_cast<s64>(front.line_count - 1) * pitch;
+            const s64 low = (std::min)(s64{0}, last);
+            const s64 high = (std::max)(last + s64{front.line_length_in},
+                                        (pitch < 0 ? -pitch : pitch) * s64{front.line_count});
+            add(out + static_cast<u64>(low), out + static_cast<u64>(high));
+        }
+    } else {
+        // Remapped constants (at most 4 bytes an element), or copies to pitch or block linear
+        // pages, which keep within the 512-byte blocks around the line.
+        add(Common::AlignDown(out, 512), Common::AlignUp(out + u64{front.line_length_in} * 4, 512));
+    }
+    if (launch.semaphore_type != LaunchDMA::SemaphoreType::NONE) {
+        const GPUVAddr semaphore = front.semaphore.address;
+        add(semaphore, semaphore + 16);
+        // A release or report the back may hold in its query cache (GpuSplit::MayHoldReports).
+        VideoCommon::GpuSplit::NoteGpuSemaphore(semaphore);
+    }
+    return true;
 }
 
 void MaxwellDMA::Launch() {

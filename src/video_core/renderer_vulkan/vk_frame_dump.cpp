@@ -2,18 +2,22 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <string_view>
 
 #include <fmt/format.h>
 
+#include "common/cityhash.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/stb.h"
 #include "common/zstd_compression.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -28,6 +32,8 @@ namespace {
 using VideoCore::Surface::PixelFormat;
 
 constexpr size_t SIZE_CAP = size_t{2} << 30;
+/// RecordingSampledTextures: a sampled capture is running.
+std::atomic<bool> recording_sampled{};
 constexpr size_t STAGING_BUDGET = size_t{256} << 20;
 
 template <typename T>
@@ -177,6 +183,51 @@ std::string JsonArray(std::span<T> values) {
     return out + "]";
 }
 
+std::string_view FilterName(VkFilter filter) {
+    return filter == VK_FILTER_NEAREST ? "nearest" : filter == VK_FILTER_LINEAR ? "linear" : "other";
+}
+
+std::string_view WrapName(VkSamplerAddressMode mode) {
+    switch (mode) {
+    case VK_SAMPLER_ADDRESS_MODE_REPEAT:
+        return "repeat";
+    case VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT:
+        return "mirrored_repeat";
+    case VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE:
+        return "clamp_to_edge";
+    case VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER:
+        return "clamp_to_border";
+    case VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE:
+        return "mirror_clamp_to_edge";
+    default:
+        return "other";
+    }
+}
+
+/// The host sampler state and the raw guest TSC words it came from.
+std::string SamplerJson(const Sampler* sampler) {
+    if (!sampler) {
+        return {};
+    }
+    const VkSamplerCreateInfo& ci = sampler->CreateInfo();
+    std::array<u32, 8> words;
+    static_assert(sizeof(words) == sizeof(Tegra::Texture::TSCEntry));
+    std::memcpy(words.data(), &sampler->Descriptor(), sizeof(words));
+    std::string tsc;
+    for (const u32 word : words) {
+        tsc += fmt::format("{}\"{:08x}\"", tsc.empty() ? "" : ",", word);
+    }
+    return fmt::format(
+        R"(,"sampler":{{"mag":"{}","min":"{}","mip":"{}","wrap":["{}","{}","{}"],"unnormalized":{},"compare":{},"compare_op":{},"lod_bias":{},"min_lod":{},"max_lod":{},"anisotropy":{},"tsc":[{}]}})",
+        FilterName(ci.magFilter), FilterName(ci.minFilter),
+        ci.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR ? "linear" : "nearest",
+        WrapName(ci.addressModeU), WrapName(ci.addressModeV), WrapName(ci.addressModeW),
+        ci.unnormalizedCoordinates != VK_FALSE, ci.compareEnable != VK_FALSE,
+        static_cast<u32>(ci.compareOp), JsonNumber(ci.mipLodBias), JsonNumber(ci.minLod),
+        JsonNumber(ci.maxLod), ci.anisotropyEnable != VK_FALSE ? JsonNumber(ci.maxAnisotropy) : "1",
+        tsc);
+}
+
 } // Anonymous namespace
 
 FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
@@ -186,27 +237,22 @@ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
     if (!dir || *dir == '\0') {
         return;
     }
-    enabled = true;
     const char* const sampled_value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
-    sampled = sampled_value && *sampled_value != '\0' && *sampled_value != '0';
     directory = dir;
     start = std::chrono::steady_clock::now();
     const char* const at = std::getenv("EDEN_NX2_FRAME_DUMP_AT");
     const std::string_view value = at ? at : "60";
-    if (value == "file") {
-        // Captures once <dir>/capture.now exists, so a frame can be picked while playing.
-        trigger_file = directory / "capture.now";
-        trigger_seconds = std::numeric_limits<double>::infinity();
-    } else if (value.ends_with('f')) {
-        trigger_frame = std::strtoull(value.data(), nullptr, 10);
-        trigger_seconds = std::numeric_limits<double>::infinity();
-    } else {
-        trigger_seconds = std::strtod(value.data(), nullptr);
-    }
+    // "file" captures once <dir>/capture.now exists, so a frame can be picked while playing.
+    schedule.Configure(value, directory / "capture.now",
+                       sampled_value && *sampled_value != '\0' && *sampled_value != '0');
     LOG_INFO(Render_Vulkan, "Frame dump armed: dir={} at={}", directory.string(), value);
 }
 
 FrameDump::~FrameDump() {
+    StopWriter();
+}
+
+void FrameDump::StopWriter() {
     if (!writer.joinable()) {
         return;
     }
@@ -216,6 +262,31 @@ FrameDump::~FrameDump() {
     }
     queue_ready.notify_one();
     writer.join();
+    stop_writer = false;
+}
+
+void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers, u64 id) {
+    if (!schedule.Arm(sampled, buffers, id)) {
+        VideoCore::Nx2Debug::FinishCapture(id, {.error = "another capture is in progress"});
+        return;
+    }
+    StopWriter();
+    directory = std::move(directory_);
+    truncated = false;
+    recorded_bytes = 0;
+    written_bytes = 0;
+    sequence = 0;
+    images = 0;
+    pass_framebuffer = nullptr;
+    dispatch_sampled.clear();
+    seen_buffers.clear();
+    written_buffers.clear();
+    pass_index = 0;
+    draws = 0;
+    dispatches = 0;
+    if (start == std::chrono::steady_clock::time_point{}) {
+        start = std::chrono::steady_clock::now();
+    }
 }
 
 std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot) const {
@@ -338,6 +409,7 @@ std::optional<std::pair<GPUVAddr, u32>> SampledKey(const FrameDump::Sampled& tex
 
 bool FrameDump::RecordSampled(const Sampled& texture, u32 index, std::string name,
                               std::string tags) {
+    tags += SamplerJson(texture.sampler);
     if (const auto target = MakeTarget(*texture.view, index)) {
         return Record(*target, std::move(name), std::move(tags));
     }
@@ -389,6 +461,52 @@ void FrameDump::NoteDispatchSampled(u64 shader_hash, std::span<const Sampled> te
                 R"("kind":"sampled","dispatch":{},"after_draws":{},"stage":{},"tic":{},"index":{},"shaders":["{:016x}"])",
                 dispatches, draws, texture.stage, texture.tic, index, shader_hash));
     }
+}
+
+bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
+                            std::span<BoundBuffer> buffers) {
+    bool recorded = false;
+    for (BoundBuffer& buffer : buffers) {
+        const size_t program = compute ? 0 : buffer.stage + 1;
+        const u64 shader = program < shader_hashes.size() ? shader_hashes[program] : 0;
+        const std::tuple<u64, bool, u32, u64, u32> key{shader, buffer.storage, buffer.index,
+                                                       buffer.device_addr, buffer.size};
+        if (std::ranges::find(seen_buffers, key) != seen_buffers.end()) {
+            continue;
+        }
+        seen_buffers.push_back(key);
+        const std::string owner =
+            compute ? fmt::format(R"("dispatch":{},"after_draws":{})", dispatches, draws)
+                    : fmt::format(R"("pass":{},"draw":{})", pass_index, draws - 1);
+        const bool from_host = buffer.guest.empty();
+        std::string tags = fmt::format(
+            R"("kind":"buffer",{},"stage":{},"shader":"{:016x}","type":"{}","index":{},"written":{},"gpu_addr":"{:#x}","device_addr":"{:#x}","bound_size":{},"size":{},"gpu_modified":{},"source":"{}")",
+            owner, buffer.stage, shader, buffer.storage ? "storage" : "uniform", buffer.index,
+            buffer.written, buffer.gpu_addr, buffer.device_addr, buffer.bound_size, buffer.size,
+            buffer.gpu_modified, from_host ? "host" : "guest");
+        if (!from_host) {
+            Enqueue({.tags = std::move(tags), .data = std::move(buffer.guest), .raw = true});
+            continue;
+        }
+        recorded |= RecordBuffer(buffer.host, buffer.host_offset, buffer.size, std::move(tags));
+    }
+    return recorded;
+}
+
+void FrameDump::NoteLaunch(u64 shader_hash, const std::array<u32, 3>& grid,
+                           const std::array<u32, 3>& block, std::optional<GPUVAddr> indirect,
+                           std::optional<std::array<u32, 3>> indirect_grid) {
+    std::string tags = fmt::format(
+        R"({{"kind":"launch","dispatch":{},"after_draws":{},"shaders":["{:016x}"],"grid":[{},{},{}],"block":[{},{},{}])",
+        dispatches, draws, shader_hash, grid[0], grid[1], grid[2], block[0], block[1], block[2]);
+    if (indirect) {
+        tags += fmt::format(R"(,"indirect":"{:#x}")", *indirect);
+    }
+    if (indirect_grid) {
+        tags += fmt::format(R"(,"indirect_grid_guest":[{},{},{}])", (*indirect_grid)[0],
+                            (*indirect_grid)[1], (*indirect_grid)[2]);
+    }
+    Enqueue({.tags = tags + "}"});
 }
 
 void FrameDump::NoteDraw(std::span<const u64> shader_hashes) {
@@ -509,6 +627,51 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
     return true;
 }
 
+bool FrameDump::RecordBuffer(VkBuffer source, u32 offset, u32 size, std::string tags) {
+    if (recorded_bytes + size > SIZE_CAP) {
+        truncated = true;
+        return false;
+    }
+    recorded_bytes += size;
+    vk::Buffer buffer = memory_allocator.CreateBuffer(
+        VkBufferCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = size,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        },
+        MemoryUsage::Download);
+    const VkBufferCopy copy{.srcOffset = offset, .dstOffset = 0, .size = size};
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([source, destination = *buffer, copy](vk::CommandBuffer cmdbuf) {
+        const VkMemoryBarrier before{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, before);
+        cmdbuf.CopyBuffer(source, destination, copy);
+        const VkMemoryBarrier after{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT |
+                             VK_ACCESS_MEMORY_WRITE_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0,
+                               after);
+    });
+    pending_bytes += size;
+    readbacks.push_back({.buffer = std::move(buffer),
+                         .target = {},
+                         .name = {},
+                         .tags = std::move(tags),
+                         .raw = true,
+                         .bytes = size});
+    return true;
+}
+
 void FrameDump::DrainIfFull() {
     if (pending_bytes >= STAGING_BUDGET) {
         Drain();
@@ -523,12 +686,14 @@ void FrameDump::Drain() {
     for (Readback& readback : readbacks) {
         readback.buffer.Invalidate();
         const Target& target = readback.target;
-        const auto mapped = readback.buffer.Mapped().first(size_t{target.width} * target.height *
-                                                           target.depth * TexelBytes(target));
+        const auto mapped = readback.buffer.Mapped().first(
+            readback.raw ? readback.bytes
+                         : size_t{target.width} * target.height * target.depth * TexelBytes(target));
         Enqueue({.target = target,
                  .name = std::move(readback.name),
                  .tags = std::move(readback.tags),
-                 .data = {mapped.begin(), mapped.end()}});
+                 .data = {mapped.begin(), mapped.end()},
+                 .raw = readback.raw});
     }
     readbacks.clear();
     pending_bytes = 0;
@@ -564,9 +729,14 @@ void FrameDump::WriterLoop() {
                      job.tags, written_bytes >> 20, directory.string(),
                      job.truncated ? fmt::format(" (stopped at the {} GiB cap)", SIZE_CAP >> 30)
                                    : "");
+            if (const u64 id = schedule.CaptureId(); id != 0) {
+                VideoCore::Nx2Debug::FinishCapture(id, {});
+            }
             continue;
         }
-        if (job.name.empty()) {
+        if (job.raw) {
+            WriteBuffer(job);
+        } else if (job.name.empty()) {
             manifest << job.tags << '\n';
         } else {
             Write(job);
@@ -658,6 +828,18 @@ void FrameDump::Write(const Job& job) {
              << '\n';
 }
 
+void FrameDump::WriteBuffer(const Job& job) {
+    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(job.data.data()),
+                                        job.data.size());
+    const std::string name = fmt::format("buffer_{:016x}.bin.zst", hash);
+    if (std::ranges::find(written_buffers, hash) == written_buffers.end()) {
+        written_buffers.push_back(hash);
+        WriteFile(name, Common::Compression::CompressDataZSTDDefault(job.data.data(),
+                                                                     job.data.size()));
+    }
+    manifest << fmt::format(R"({{{},"hash":"{:016x}","raw":"{}"}})", job.tags, hash, name) << '\n';
+}
+
 void FrameDump::WriteFile(const std::string& name, std::span<const u8> data) {
     std::ofstream file{directory / name, std::ios::binary};
     file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
@@ -665,42 +847,101 @@ void FrameDump::WriteFile(const std::string& name, std::span<const u8> data) {
 }
 
 void FrameDump::TickFrame() {
-    if (!enabled || done) {
+    const double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    switch (schedule.Tick(elapsed)) {
+    case FrameDumpSchedule::Step::None:
         return;
-    }
-    ++frame;
-    if (capturing) {
+    case FrameDumpSchedule::Step::Finish:
         EndPass();
         Drain();
         Enqueue({.tags = fmt::format(R"("passes":{},"draws":{},"dispatches":{})", pass_index,
                                      draws, dispatches),
                  .summary = true,
                  .truncated = truncated});
-        capturing = false;
-        done = true;
         return;
+    case FrameDumpSchedule::Step::Start:
+        break;
     }
-    const double elapsed =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     std::error_code error;
-    if (frame < trigger_frame && elapsed < trigger_seconds &&
-        (trigger_file.empty() || frame % 30 != 0 ||
-         !std::filesystem::exists(trigger_file, error))) {
-        return;
-    }
     std::filesystem::create_directories(directory, error);
     manifest.open(directory / "manifest.jsonl", std::ios::trunc);
     if (!manifest) {
         LOG_ERROR(Render_Vulkan, "Frame dump: cannot write {}", directory.string());
-        done = true;
+        if (const u64 id = schedule.CaptureId(); id != 0) {
+            VideoCore::Nx2Debug::FinishCapture(
+                id, {.error = fmt::format("cannot write {}", directory.generic_string())});
+        }
+        schedule.Abort();
         return;
     }
+    const u64 frame = schedule.Frame();
     manifest << fmt::format(R"({{"kind":"frame","frame":{},"seconds":{:.3f}}})", frame, elapsed)
              << '\n';
     writer = std::thread{[this] { WriterLoop(); }};
-    capturing = true;
-    LOG_INFO(Render_Vulkan, "Frame dump: capturing frame {} ({:.1f} s after boot) into {}", frame,
-             elapsed, directory.string());
+    LOG_INFO(Render_Vulkan, "Frame dump: capturing frame {} ({:.1f} s after boot){} into {}", frame,
+             elapsed, schedule.Sampled() ? (schedule.Buffers() ? " with sampled textures and buffers" : " with sampled textures") : (schedule.Buffers() ? " with buffers" : ""), directory.string());
+}
+
+void FrameDumpSchedule::Configure(std::string_view at, std::filesystem::path trigger_file_,
+                                  bool sampled_) {
+    enabled = true;
+    sampled = sampled_;
+    buffers = sampled_;
+    if (at == "file") {
+        trigger_file = std::move(trigger_file_);
+    } else if (at.ends_with('f')) {
+        trigger_frame = std::strtoull(std::string{at}.c_str(), nullptr, 10);
+    } else {
+        trigger_seconds = std::strtod(std::string{at}.c_str(), nullptr);
+    }
+}
+
+bool FrameDumpSchedule::Arm(bool sampled_, bool buffers_, u64 id) {
+    if (capturing) {
+        return false;
+    }
+    enabled = true;
+    done = false;
+    sampled = sampled_;
+    buffers = buffers_;
+    trigger_frame = 0;
+    capture_id = id;
+    return true;
+}
+
+FrameDumpSchedule::Step FrameDumpSchedule::Tick(double elapsed_seconds) {
+    if (!enabled || done) {
+        return Step::None;
+    }
+    ++frame;
+    if (capturing) {
+        SetCapturing(false);
+        done = true;
+        return Step::Finish;
+    }
+    std::error_code error;
+    if (frame < trigger_frame && elapsed_seconds < trigger_seconds &&
+        (trigger_file.empty() || frame % 30 != 0 ||
+         !std::filesystem::exists(trigger_file, error))) {
+        return Step::None;
+    }
+    SetCapturing(true);
+    return Step::Start;
+}
+
+void FrameDumpSchedule::Abort() {
+    SetCapturing(false);
+    done = true;
+}
+
+void FrameDumpSchedule::SetCapturing(bool value) {
+    capturing = value;
+    recording_sampled.store(value && sampled, std::memory_order_relaxed);
+}
+
+bool RecordingSampledTextures() noexcept {
+    return recording_sampled.load(std::memory_order_relaxed);
 }
 
 } // namespace Vulkan

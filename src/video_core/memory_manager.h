@@ -8,8 +8,10 @@
 
 #include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <source_location>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 
@@ -97,7 +99,8 @@ public:
      * in the Host Memory counterpart. Note: This functions cause Host GPU Memory
      * Flushes and Invalidations, respectively to each operation.
      */
-    void ReadBlock(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which = VideoCommon::CacheType::All) const;
+    void ReadBlock(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which = VideoCommon::CacheType::All,
+                   std::source_location caller = std::source_location::current()) const;
     void WriteBlock(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which = VideoCommon::CacheType::All);
     void CopyBlock(GPUVAddr gpu_dest_addr, GPUVAddr gpu_src_addr, std::size_t size, VideoCommon::CacheType which = VideoCommon::CacheType::All);
 
@@ -111,13 +114,17 @@ public:
      * WriteBlockUnsafe instead of WriteBlock since it shouldn't invalidate the texture
      * being flushed.
      */
-    void ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size) const;
+    void ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size,
+                         std::source_location caller = std::source_location::current()) const;
     void WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
 
     /// Reads `count` consecutive words as Read<u32> would (Switch 2 syncpoint shim included),
     /// without a translation per word.
-    void ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_t count) const;
+    void ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_t count,
+                         std::source_location caller = std::source_location::current()) const;
     void WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
+    /// WriteBlockCached of `count` consecutive words within one device page, in a single write.
+    void WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count);
 
     /**
      * Checks if a gpu region can be simply read with a pointer.
@@ -156,7 +163,22 @@ public:
     bool IsMemoryDirty(GPUVAddr gpu_addr, size_t size,
                        VideoCommon::CacheType which = VideoCommon::CacheType::All) const;
 
+    /// Switch 2, the split GPU thread's front (GpuSplit::NarrowDrains): whether a read of
+    /// [gpu_addr, gpu_addr + size) still needs the full drain: a page of it is unmapped, or GPU
+    /// work wrote it through the buffer cache (Nx2IsGpuWritten: newer words may be in the cache,
+    /// which only the back may ask or flush), or it reads the syncpoint shim (the back increments
+    /// syncpoints). Without any of these IsMemoryDirty(BufferCache) is false: the buffer cache
+    /// holds GPU-written data only on pages it marked.
+    [[nodiscard]] bool Nx2ReadNeedsDrain(GPUVAddr gpu_addr, std::size_t size) const;
+
     size_t MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const;
+
+    [[nodiscard]] u64 MapSerial() const {
+        return map_serial.load(std::memory_order_acquire);
+    }
+
+    /// MaxContinuousRange by walking the page tables (the answer with Nx2Perf off).
+    size_t MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const;
 
     bool IsWithinGPUAddressRange(GPUVAddr gpu_addr) const {
         return gpu_addr < address_space_size;
@@ -166,6 +188,9 @@ public:
 
     size_t GetMemoryLayoutSize(GPUVAddr gpu_addr,
                                size_t max_size = (std::numeric_limits<size_t>::max)()) const;
+
+    /// GetMemoryLayoutSize from the kind map under its lock (the answer with Nx2Perf off).
+    size_t GetMemoryLayoutSizeUncached(GPUVAddr gpu_addr) const;
 
     void FlushCaching();
 
@@ -182,7 +207,23 @@ private:
     template <typename FuncMapped, typename FuncReserved, typename FuncUnmapped>
     inline void MemoryOperation(GPUVAddr gpu_src_addr, std::size_t size, bool is_big_page, FuncMapped&& func_mapped, FuncReserved&& func_reserved, FuncUnmapped&& func_unmapped) const;
 
-    void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe) const;
+    /// Immutable copy of the device-contiguous runs and the kind map that readers query without
+    /// a lock; each thread swaps its copy when map_serial changes.
+    struct MappingSnapshot {
+        struct Run {
+            GPUVAddr begin;
+            GPUVAddr end;
+        };
+        std::vector<Run> runs;
+        std::vector<std::pair<s64, PTEKind>> kinds;
+    };
+
+    /// Rebuilds the runs through the big pages a page table operation touched.
+    void UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size);
+    const MappingSnapshot& CurrentSnapshot() const;
+
+    void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe,
+                       std::source_location caller) const;
     void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe);
 
     [[nodiscard]] std::size_t PageEntryIndex(GPUVAddr gpu_addr, bool is_big_page) const {
@@ -246,6 +287,19 @@ private:
 
     bool native_tiling{};
     mutable std::mutex guard;
+    /// Bumped after each page table change; readers keep their MappingSnapshot until then.
+    std::atomic<u64> map_serial{};
+
+    struct ContinuousRun {
+        GPUVAddr end;
+        DAddr device_addr;
+    };
+    /// Maximal GPU ranges, keyed by their start, that are mapped to one device range: what
+    /// MaxContinuousRangeUncached walks to. Kept only with Nx2Perf on.
+    std::map<GPUVAddr, ContinuousRun> continuous_runs;
+    mutable std::shared_ptr<const MappingSnapshot> snapshot;
+    mutable u64 snapshot_serial{};
+    mutable std::mutex runs_guard;
 
     static constexpr size_t continuous_bits = 64;
 

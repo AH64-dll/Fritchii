@@ -14,9 +14,29 @@
 
 namespace UpdateChecker {
 
+enum class Failure {
+    None,
+    // GitHub refused the request because of rate limiting.
+    RateLimited,
+    // GitHub answered with an HTTP error.
+    Http,
+    // No usable answer arrived, for example when offline.
+    Network,
+};
+
+struct CheckResult {
+    std::optional<Common::Net::Release> update;
+    Failure failure{Failure::None};
+    int status{};
+};
+
+// Classify a failed release request by its HTTP status, or 0 when no response arrived.
+Failure ClassifyFailure(int status);
+
+CheckResult Check();
 std::optional<Common::Net::Release> GetUpdate();
-std::optional<Common::Net::Release> SelectUpdate(std::span<const Common::Net::Release> releases,
-                                                 std::string_view build_tag,
-                                                 std::string_view platform);
+std::optional<Common::Net::Release> SelectUpdate(
+    std::span<const Common::Net::Release> releases, std::string_view build_tag,
+    std::string_view platform, Common::Net::LinuxPackage package = Common::Net::LinuxPackage::Any);
 
 } // namespace UpdateChecker

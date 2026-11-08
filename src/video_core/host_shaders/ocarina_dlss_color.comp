@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D guest_color;
+layout(binding = 1, rgba16f) uniform writeonly image2D dlss_color;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(dlss_color)))) {
+        return;
+    }
+    // The guest has already tonemapped this square-root-encoded color for LDR.
+    imageStore(dlss_color, pixel, vec4(texelFetch(guest_color, pixel, 0).rgb, 1.0));
+}

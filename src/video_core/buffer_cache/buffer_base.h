@@ -115,7 +115,14 @@ public:
 
     void setLRUID(size_t lru_id_) {
         lru_id = lru_id_;
+        lru_touched_tick = ~u64{0};
     }
+
+    /// The frame tick of the last LRU touch: touching again in the same frame changes nothing.
+    u64 lru_touched_tick = ~u64{0};
+
+    /// Bumped by every CPU-dirty mark over the buffer (BufferCache::NoteCpuDirty).
+    u64 cpu_dirty_gen = 0;
 
     size_t SizeBytes() const {
         return size_bytes;

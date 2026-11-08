@@ -295,6 +295,32 @@ TEST_CASE("Logged Kirby FMUL preserves high guest registers across uniform mirro
     }
 }
 
+TEST_CASE("Logged Ocarina uniform IMAD preserves high destinations across uniform mirrors",
+          "[video_core][ampere][logged_numeric][ocarina]") {
+    // Kakariko graveyard pixel shaders: IMAD R229 = R29 * UR10 + RZ (and R225 = R49 * UR10)
+    // were rejected with "native register shadowing mode", so the draw was skipped.
+    constexpr std::array multiplies{
+        Instruction{{0x1de57c24, 0x0000000a, 0x0f8e02ff, 0x000fe200}},
+        Instruction{{0x31e17c24, 0x0000000a, 0x0f8e02ff, 0x000fe200}},
+    };
+    const Instruction uniform_marker{{0x0000fc02, 0, 0, 0}};
+    for (const auto& multiply : multiplies) {
+        const auto pressure = Shader::Ampere::PrepareRegisterPressure(multiply, 216);
+        REQUIRE(pressure.valid);
+        CHECK(pressure.instruction.Bits(16, 8) == 212 + multiply.Bits(16, 8) % 4);
+        CHECK(pressure.instruction.Bits(24, 8) == multiply.Bits(24, 8));
+        CHECK(pressure.instruction.words[1] == multiply.words[1]);
+        CHECK(pressure.instruction.words[2] == multiply.words[2]);
+        REQUIRE(pressure.prefix.size() == 8);
+        REQUIRE(pressure.suffix.size() == 8);
+        const auto lowered = LowerToMaxwell(std::array{uniform_marker, multiply, Exit});
+        INFO(lowered.error);
+        REQUIRE(lowered);
+        CHECK(std::equal(pressure.prefix.begin(), pressure.prefix.end(),
+                         lowered.instructions.begin()));
+    }
+}
+
 TEST_CASE("Logged Kirby global loads preserve high destinations across uniform mirrors",
           "[video_core][ampere][logged_numeric][kirby]") {
     constexpr std::array loads{
@@ -439,4 +465,78 @@ TEST_CASE("Logged Pokopia masked dependency barrier fences shared memory and rej
     const auto rejected = LowerToMaxwell(std::array{invalid, Exit});
     REQUIRE_FALSE(rejected);
     CHECK(rejected.error == "native dependency barrier mode");
+}
+
+TEST_CASE("Ocarina mesh attribute stores read shadowed high registers",
+          "[video_core][ampere][logged_numeric][oot]") {
+    // Ocarina mesh 8159e91e0097876a at 0x83c0: ISBEWR.32.ATTR.SKEW.O [R197 + 0x780], R240. R240 is
+    // UR22's mirror once the uniform bank is in use, so the data must come from the shadow bank.
+    const Instruction uniform_marker{{0x0000fc02, 0, 0, 0}};
+    const Instruction store{{0xc5007927, 0x000780f0, 0x0000f800, 0x000fe200}};
+    const auto lowered = LowerToMaxwell(std::array{uniform_marker, store, Exit});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    const auto begin = lowered.instructions.begin() + lowered.source_instruction_offsets[1];
+    const auto end = lowered.instructions.begin() + lowered.source_instruction_offsets[2];
+    const auto pseudo = std::find_if(begin, end, [](u64 word) { return (word >> 52) == 0xefc; });
+    REQUIRE(pseudo != end);
+    const u32 data = static_cast<u32>(*pseudo & 0xff);
+    CHECK(data < 216);
+    CHECK(std::find(begin, pseudo, Shader::Ampere::NativeRegisterCopy(0, data, 1, 240)) != pseudo);
+}
+
+TEST_CASE("Global atomics read their data from shadowed high registers",
+          "[video_core][ampere][logged_numeric]") {
+    // ATOMG.E.ADD.STRONG.GPU R4, [UR4], R240. R240 is UR22's mirror once the uniform bank is in
+    // use, so the data word must come from the shadow bank.
+    const Instruction uniform_marker{{0x0000fc02, 0, 0, 0}};
+    const Instruction atomic{{0xff0479a8, 0x000000f0, 0x081ee144, 0x000fe200}};
+    const auto lowered = LowerToMaxwell(std::array{uniform_marker, atomic, Exit});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    const auto begin = lowered.instructions.begin() + lowered.source_instruction_offsets[1];
+    const auto end = lowered.instructions.begin() + lowered.source_instruction_offsets[2];
+    const auto native = std::find_if(begin, end, [](u64 word) { return (word >> 56) == 0xed; });
+    REQUIRE(native != end);
+    const u32 data = static_cast<u32>((*native >> 20) & 0xff);
+    CHECK(data < 216);
+    CHECK(std::find(begin, native, Shader::Ampere::NativeRegisterCopy(0, data, 1, 240)) != native);
+}
+
+TEST_CASE("Gradient texture fetches read their gradients from shadowed high registers",
+          "[video_core][ampere][logged_numeric]") {
+    // TXD.2D R4, R8, R240 with two channels. The four gradients R240-R243 alias UR22-UR25's
+    // mirrors once the uniform bank is in use, so all four must come from the shadow bank.
+    const Instruction uniform_marker{{0x0000fc02, 0, 0, 0}};
+    const Instruction gradient{{0x08047b6c, 0x200000f0, 0x001e03ff, 0x000fe200}};
+    const auto lowered = LowerToMaxwell(std::array{uniform_marker, gradient, Exit});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    const auto begin = lowered.instructions.begin() + lowered.source_instruction_offsets[1];
+    const auto end = lowered.instructions.begin() + lowered.source_instruction_offsets[2];
+    const auto native = std::find_if(begin, end, [](u64 word) { return (word >> 56) == 0xde; });
+    REQUIRE(native != end);
+    const u32 gradients = static_cast<u32>((*native >> 20) & 0xff);
+    CHECK(gradients < 216);
+    for (u32 i = 0; i < 4; ++i)
+        CHECK(std::find(begin, native,
+                        Shader::Ampere::NativeRegisterCopy(0, gradients + i, 1, 240 + i)) != native);
+}
+
+TEST_CASE("Gradient texture fetch shadows keep the array layer register",
+          "[video_core][ampere][logged_numeric]") {
+    // TXD.ARRAY_2D R4, R210, R240: the coordinates are R210, R211 and the layer in R212. The
+    // gradients' shadow must not borrow the R212-R215 quartet, or its copies overwrite the layer.
+    const Instruction uniform_marker{{0x0000fc02, 0, 0, 0}};
+    const Instruction gradient{{0xd2047b6c, 0xa00000f0, 0x001e03ff, 0x000fe200}};
+    const auto lowered = LowerToMaxwell(std::array{uniform_marker, gradient, Exit});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    const auto begin = lowered.instructions.begin() + lowered.source_instruction_offsets[1];
+    const auto end = lowered.instructions.begin() + lowered.source_instruction_offsets[2];
+    const auto native = std::find_if(begin, end, [](u64 word) { return (word >> 56) == 0xde; });
+    REQUIRE(native != end);
+    CHECK(((*native >> 8) & 0xff) == 210);
+    const u32 gradients = static_cast<u32>((*native >> 20) & 0xff);
+    CHECK((gradients + 4 <= 210 || gradients >= 213));
 }

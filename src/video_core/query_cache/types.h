@@ -58,6 +58,15 @@ enum class ComparisonMode : u32 {
     MaxComparisonMode,
 };
 
+/// EDEN_NX2_QUERY_LAZY_SYNC: a payload release already in guest memory, told to the host's
+/// buffers as a guest CPU write of [address, address + size) instead of copied into them.
+struct GuestWrittenRange {
+    u64 address;
+    u64 size;
+    bool mark;       ///< In: mark it CPU-written (else only look whether it needs a copy)
+    bool needs_copy; ///< Out: its pages hold GPU-written data, so the value is copied as before
+};
+
 // Reduction ops.
 enum class ReductionOp : u32 {
     RedAdd = 0,

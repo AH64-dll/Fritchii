@@ -220,6 +220,9 @@ struct UserConfig {
     /// callbacks.
     bool recompile_on_exclusive_fastmem_failure = true;
 
+    /// x64 only. See A64::UserConfig::tso_ordered_loads.
+    bool tso_ordered_loads = false;
+
     /// When set to true, UserCallbacks::InstructionSynchronizationBarrierRaised will be
     /// called when an ISB instruction is executed.
     /// When set to false, ISB will be treated as a NOP instruction.

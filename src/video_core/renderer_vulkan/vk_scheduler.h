@@ -25,6 +25,7 @@
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
+#include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -63,8 +64,13 @@ public:
     /// once); otherwise it goes with the next one. The back submits deferred work before it
     /// sleeps and when another thread asks (WaitSubmitted). True when the flush was deferred.
     bool DeferFlush();
-    /// Submits deferred work (the split's back, from its idle hook).
-    void FlushDeferred();
+    /// Submits deferred work (the split's back, from its idle hook). `location` is counted as
+    /// the submission's site by EDEN_NX2_GPU_PROFILE.
+    void FlushDeferred(std::source_location location = std::source_location::current());
+    /// The split's back: the work so far is submitted with the next submission, when the back
+    /// goes idle or when another thread waits for it (WaitSubmitted), with no time window. False
+    /// on other threads (the caller submits).
+    bool DeferFlushUntilWanted();
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
     /// submit deferred work (logged every 2 s while it waits). False only when the back thread
     /// is not running, so nothing will submit it: the caller then submits it itself.
@@ -97,8 +103,9 @@ public:
         cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool, query + 1);
     }
 
-    /// Sends currently recorded work to the worker thread.
-    void DispatchWork();
+    /// Sends currently recorded work to the worker thread. `lazy` (EDEN_NX2_LAZY_WAKE): a sleeping
+    /// worker is woken only once two chunks wait; submissions and WaitWorker always wake it.
+    void DispatchWork(bool lazy = false);
 
     /// Requests to begin a renderpass.
     void RequestRenderpass(const Framebuffer* framebuffer,
@@ -119,11 +126,11 @@ public:
         std::source_location location = std::source_location::current());
 
     void DeferFragmentBarrier() {
-        fragment_barrier_pending = state.renderpass != VK_NULL_HANDLE;
+        fragment_barrier.Defer(state.renderpass != VK_NULL_HANDLE);
     }
 
-    bool TakeFragmentBarrier() {
-        return std::exchange(fragment_barrier_pending, false);
+    bool HasFragmentBarrier() const {
+        return fragment_barrier.Pending();
     }
 
     void NoteRenderPassStores() {
@@ -134,13 +141,30 @@ public:
         return render_pass_has_stores;
     }
 
+    /// A dispatch was recorded: the next render pass must see what it wrote.
+    void NoteComputeWrites() {
+        compute_writes_pending = true;
+    }
+
     /// Returns true when a render pass is currently active in the scheduler state.
     bool IsRenderPassActive() const {
         return state.renderpass != VK_NULL_HANDLE;
     }
 
+    /// Whether the active render pass is the one RequestRenderpass(framebuffer) would keep.
+    bool RenderPassMatches(const Framebuffer* framebuffer) const;
+
     /// Update the pipeline to the current execution context.
     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
+
+    /// Worker thread only: whether the bound graphics pipeline failed to build, so the draws
+    /// recorded after it must be dropped instead of reaching the driver without a pipeline.
+    void SetGraphicsPipelineMissing(bool missing) {
+        graphics_pipeline_missing = missing;
+    }
+    [[nodiscard]] bool GraphicsPipelineMissing() const {
+        return graphics_pipeline_missing;
+    }
 
     /// Update the rescaling state. Returns true if the state has to be updated.
     bool UpdateRescaling(bool is_rescaling, bool mesh_layout);
@@ -171,7 +195,7 @@ public:
         if (chunk->Record(command)) {
             return;
         }
-        DispatchWork();
+        DispatchWork(true);
         (void)chunk->Record(command);
     }
 
@@ -199,6 +223,12 @@ public:
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return master_semaphore->CurrentTick();
+    }
+
+    /// Changes whenever recorded command buffer state may have been reset (InvalidateState, the
+    /// end of a render pass), so a binding recorded at the same epoch is still bound.
+    [[nodiscard]] u64 RecordingEpoch() const noexcept {
+        return recording_epoch;
     }
 
     /// Returns true when a tick has been triggered by the GPU.
@@ -425,8 +455,10 @@ private:
     StateTracker& state_tracker;
 
     std::unique_ptr<MasterSemaphore> master_semaphore;
-    bool fragment_barrier_pending{};
+    FragmentBarrierState fragment_barrier;
     bool render_pass_has_stores{};
+    bool compute_writes_pending{};
+    bool graphics_pipeline_missing{};
     std::unique_ptr<CommandPool> command_pool;
 
     vk::QueryPool trace_query_pool;
@@ -479,6 +511,7 @@ private:
     std::function<void()> on_submit;
 
     State state;
+    u64 recording_epoch = 0;
 
     u32 num_renderpass_images = 0;
     std::array<VkImage, 9> renderpass_images{};
@@ -491,6 +524,7 @@ private:
     std::mutex queue_mutex;
     std::condition_variable_any event_cv;
     bool worker_waiting{}; ///< The worker is waiting for work (guarded by queue_mutex)
+    bool lazy_queued{};    ///< A lazily queued chunk may wait for a sleeping worker (recording thread)
     std::jthread worker_thread;
 
     std::chrono::steady_clock::duration frame_interval{};
