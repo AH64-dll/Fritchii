@@ -204,6 +204,8 @@ add_executable(yuzu
     util/clickable_label.h
     util/controller_navigation.cpp
     util/controller_navigation.h
+    util/export_log.cpp
+    util/export_log.h
     util/limitable_input_dialog.cpp
     util/limitable_input_dialog.h
     util/overlay_dialog.cpp
@@ -280,10 +282,9 @@ file(GLOB_RECURSE THEMES ${PROJECT_SOURCE_DIR}/dist/qt_themes/*)
 if (ENABLE_UPDATE_CHECKER)
     target_compile_definitions(yuzu PUBLIC ENABLE_UPDATE_CHECKER)
 endif()
-if (WIN32)
-    # The updater unpacks the release zip (updater/update_dialog.cpp).
-    target_link_libraries(yuzu PRIVATE QuaZip::QuaZip)
-endif()
+# The updater unpacks the release zip (updater/update_dialog.cpp); Export Log writes one
+# (util/export_log.cpp).
+target_link_libraries(yuzu PRIVATE QuaZip::QuaZip)
 
 if (ENABLE_QT_TRANSLATION)
     set(YUZU_QT_LANGUAGES "${PROJECT_SOURCE_DIR}/dist/languages" CACHE PATH "Path to the translation bundle for the Qt frontend")

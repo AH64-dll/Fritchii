@@ -403,6 +403,9 @@ private slots:
     void OnOpenSDMCFolder();
     void OnOpenModFolder();
     void OnOpenLogFolder();
+    void OnExportLog();
+    /// A critical error box with an "Export Log..." button next to OK.
+    void ShowErrorWithExportLog(const QString& title, const QString& text);
     void OnVerifyInstalledContents();
     void OnInstallFirmware();
     void OnInstallFirmwareFromZIP();
