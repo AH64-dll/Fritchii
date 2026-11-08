@@ -13,6 +13,7 @@
 #include <optional>
 #include <functional>
 #include <memory>
+#include <span>
 #include <thread>
 #include <vector>
 #include <type_traits>
@@ -56,6 +57,7 @@ enum class DrainSite : u32 {
     MacroDmaCheck,  ///< EDEN_NX2_CMDPAGE_DIAG: a macro's memory read repeated after a full drain
     DispatchWait,   ///< EXP10: a macro memory read waits for the dispatches sent since it flushed
     FenceWriters,   ///< EXP12: a fence release waits for the writers a semaphore read can't see
+    QmdRead,        ///< EXP13=2: the front's QMD scheduler copy reads a QMD queued work writes
     Count,
 };
 
@@ -64,7 +66,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma writes",
     "macro dma flush",
     "gp sync fence", "map",           "front start", "front verify",  "macro dma check",
-    "macro dma dispatch", "fence writers",
+    "macro dma dispatch", "fence writers", "qmd read",
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -85,6 +87,10 @@ public:
     /// Whether the front sends work to the back (front thread only).
     [[nodiscard]] bool Active() const {
         return active;
+    }
+    /// Counts starts of the split (EXP13=2: the front's QMD scheduler copy starts over).
+    [[nodiscard]] u64 Session() const {
+        return session;
     }
     /// Whether the front runs the engines' macros (EDEN_NX2_SPLIT=2).
     [[nodiscard]] bool FrontMacros() const {
@@ -685,6 +691,13 @@ public:
         last_memory_write_position = write_position;
         // Engines all of whose methods write (compute, DMA, inline-to-memory, 2D) mark method 0.
         last_memory_write_method = engine->memory_write_mask[0] ? OtherEngineWrite : method;
+        // QueuedGuestWriters: per-method writers only (3D); the engines all of whose methods
+        // write note their ranges or count as unbounded or unranged writers. 3D wait_for_idle
+        // (0x44) and sync_info (0xb2) write no guest memory themselves.
+        if (!engine->memory_write_mask[0] && method != 0x44 && method != 0xb2) {
+            previous_method_write_position = last_method_write_position;
+            last_method_write_position = write_position;
+        }
     }
     /// The method just sent writes only [begin, end): a macro memory read waits for it only where
     /// they overlap. Without this call its write counts for every read. EDEN_NX2_RANGED_WAITS=0
@@ -711,6 +724,23 @@ public:
     /// A semaphore release that writes `payload` at device address `device` (from GPU address
     /// `address`) was just sent (a puller release, a 3D payload report).
     void NoteRelease(u64 device, GPUVAddr address, u32 payload);
+    /// EXP13=2 (diagnostic): the newest work sent after `done` that may write guest memory over
+    /// device bytes [device, device + size) (GPU addresses from `address`) when the back runs
+    /// it, leaving out native compute launches and inline QMDs (the front's QMD scheduler copy
+    /// keeps their words), draws and dispatches (their stores go to the host GPU's buffers; what
+    /// a download brings back lands on pages marked GPU-written, which the callers check) and
+    /// queued functions other than maps (fence releases: GPU-written pages, semaphore words and
+    /// reports). `noted`: the newest write noted over the bytes (inline uploads, reports,
+    /// semaphore releases, copies and compute releases with known ranges; those at a position in
+    /// `skip` don't count); `unbounded`: the newest that may write anything (compute and copy
+    /// writers without a range, unranged writers, 3D memory writes without a range, maps, more
+    /// writes than are remembered). 0 for none.
+    struct GuestWriters {
+        u64 noted;
+        u64 unbounded;
+    };
+    [[nodiscard]] GuestWriters QueuedGuestWriters(u64 done, GPUVAddr address, u64 device, u64 size,
+                                                  std::span<const u64> skip = {}) const;
     /// For a semaphore acquire of `device`: the payload a release still queued for the back writes
     /// there, if nothing sent after it may write the word. The back runs the acquire's channel
     /// after that release, so an acquire it meets needs no drain. EDEN_NX2_ACQUIRE_QUEUED=0 off.
@@ -915,6 +945,12 @@ private:
     u32 last_memory_write_method{DeferredWrite};
     u64 previous_memory_write_position{};
     u32 previous_memory_write_method{DeferredWrite};
+    /// The 3D memory-writing methods alone (NoteMethodWrite, RangeLastWrite), without the
+    /// deferred work, the all-writing engines and the barriers last_memory_write_position also
+    /// counts (QueuedGuestWriters).
+    u64 last_method_write_position{};
+    u64 previous_method_write_position{};
+    u64 session{};
     /// Writes with a known range (RangeLastWrite) the back may not have run yet, oldest first.
     struct RangedWrite {
         u64 position;

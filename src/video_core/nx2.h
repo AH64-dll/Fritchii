@@ -452,6 +452,22 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
     return true;
 }
 
+// GPU semaphore writes that landed in guest memory, counted per word by a hash (collisions only
+// add, so a release can look landed early, never late): EXP13 tells a release the back ran but
+// a fence still holds back from one already written (from zortos293/Lichii#717).
+inline constexpr size_t Nx2LandedSlots = 4096;
+inline std::array<std::atomic<u32>, Nx2LandedSlots> g_nx2_semaphore_landed{};
+
+[[nodiscard]] inline size_t Nx2LandedSlot(u64 device_address) {
+    return static_cast<size_t>(((device_address >> 2) * 0x9E3779B97F4A7C15ULL) >> 52) &
+           (Nx2LandedSlots - 1);
+}
+
+/// A GPU semaphore write to the u32 at `device_address` landed (counted only).
+inline void Nx2NoteLanded(u64 device_address) {
+    g_nx2_semaphore_landed[Nx2LandedSlot(device_address)].fetch_add(1, std::memory_order_release);
+}
+
 /// Channels suspended on a semaphore acquire. A console channel polls and sees every release;
 /// Eden writes releases in bursts when fences signal and resumes waiters only between command
 /// lists, so an acquire-equal could miss its value. Writes latch the waiters they satisfy.
@@ -496,6 +512,7 @@ public:
     void OnWrite(u64 device_address, u32 value) {
         // (Common::Nx2GpuWrite::Notify, for Ocarina of Time's present poll, is called by each
         // write site itself, with its path and host pointer.)
+        Nx2NoteLanded(device_address);
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
