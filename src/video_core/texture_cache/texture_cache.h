@@ -717,13 +717,15 @@ void TextureCache<P>::TickFrame() {
         LOG_INFO(HW_GPU,
                  "Churn (600 frames): images created {}, deleted {}, relocated {}, pooled {}; "
                  "image views created {}, destroyed {}; buffers created {}, deleted {}, joined {} "
-                 "({} KiB copied); staging buffers allocated {} ({} MiB); device memory "
+                 "({} KiB copied; {} skipped as CPU-modified, {} KiB not copied); staging "
+                 "buffers allocated {} ({} MiB); device memory "
                  "allocations {}, frees {}; descriptor pools created {}; {} images now",
                  churn[Churn::ImagesCreated], churn[Churn::ImagesDeleted],
                  churn[Churn::ImagesRelocated], churn[Churn::ImagesPooled],
                  churn[Churn::ImageViewsCreated], churn[Churn::ImageViewsDestroyed],
                  churn[Churn::BuffersCreated], churn[Churn::BuffersDeleted],
                  churn[Churn::BuffersJoined], churn[Churn::BufferJoinBytes] >> 10,
+                 churn[Churn::BufferJoinsSkipped], churn[Churn::BufferJoinSkippedBytes] >> 10,
                  churn[Churn::StagingBuffers], churn[Churn::StagingBytes] >> 20,
                  churn[Churn::DeviceAllocations], churn[Churn::DeviceFrees],
                  churn[Churn::DescriptorPools], slot_images.size());

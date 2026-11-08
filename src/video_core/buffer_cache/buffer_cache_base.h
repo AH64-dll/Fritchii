@@ -679,7 +679,10 @@ private:
 
     [[nodiscard]] OverlapResult ResolveOverlaps(DAddr device_addr, u32 wanted_size);
 
-    void JoinOverlap(BufferId new_buffer_id, BufferId overlap_id, bool accumulate_stream_score);
+    /// Returns whether it copied (false: skipped as wholly CPU-modified, EDEN_NX2_JOIN_SKIP_CPU).
+    bool JoinOverlap(BufferId new_buffer_id, BufferId overlap_id, bool accumulate_stream_score);
+    /// The range's host contents are all stale and nothing else reads them (JoinOverlap).
+    [[nodiscard]] bool JoinCopyIsDead(DAddr device_addr, u64 size);
 
     [[nodiscard]] BufferId CreateBuffer(DAddr device_addr, u32 wanted_size,
                                         bool sparse_compatible);
