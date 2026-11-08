@@ -1966,6 +1966,9 @@ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& f
             }
             split.NoteMemoryWrite(*device, size, "upload (not linear)");
         }
+        // Its bytes are noted (above, or by its inline_data words); an upload release is an
+        // unknown write of its own.
+        split.RangedMethodWrite();
         return;
     }
     // inline_data words of the current upload.
@@ -1978,6 +1981,7 @@ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& f
         split.NoteMemoryWrite(*device, fs.regs[base] * u64{(std::max)(fs.regs[base + 1], 1U)} +
                                            u64{fs.regs[base + 4]} * fs.regs[base + 1],
                               "upload data");
+        split.RangedMethodWrite();
         return;
     }
     const u32 remaining_bytes =
@@ -1987,6 +1991,7 @@ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& f
     if (whole < count && remaining_bytes % 4 != 0) {
         split.NoteMemoryWrite(fs.upload_device + fs.upload_offset + whole * 4, remaining_bytes % 4);
     }
+    split.RangedMethodWrite();
     fs.upload_offset += (std::min<u32>)(count * 4, remaining_bytes);
 }
 

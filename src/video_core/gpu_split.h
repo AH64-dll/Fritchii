@@ -69,6 +69,23 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "macro dma dispatch", "fence writers", "qmd read",
 };
 
+/// EXP13=2: which queued writer set GpuSplit::QueuedGuestWriters' position (a wait cause).
+enum class GuestWriterCause : u8 {
+    None,
+    Pending,          ///< A noted write over the bytes (NoteMemoryWrite, NoteMemoryWriteData)
+    WriterRange,      ///< A compute or copy range over them (NoteWriterRange, NoteReleaseWriter)
+    Ranged,           ///< A 3D ranged write over them (RangeLastWrite)
+    UnboundedWriter,  ///< Compute or copy work without a range (NoteUnboundedWriter)
+    Unranged,         ///< KeplerMemory, Fermi2D, syncpoint operations (NoteUnrangedWriter)
+    Function,         ///< A queued function (GPU memory maps)
+    MethodWrite,      ///< A 3D memory-writing method without a range (NoteMethodWrite)
+    UnknownPending,   ///< A noted write of unknown range (its `what` says which)
+    PendingScanLimit, ///< More noted writes queued than are remembered
+    WriterScanLimit,  ///< More writer ranges queued than are compared
+    OverlayEvicted,   ///< KeplerCompute's QMD copy: an evicted inline QMD may be the writer
+    Count,
+};
+
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
 // CPU's commands, parses command lists and runs the puller; engine method calls and everything
 // behind them (register state, macros, draws, the rasterizer and its caches) run in order on a
@@ -684,6 +701,14 @@ public:
         last_memory_write_position = write_position;
         last_memory_write_method = DeferredWrite;
     }
+    /// The 3D method just sent writes only the bytes its front noted (NoteMemoryWrite with a
+    /// range, NoteMemoryWriteData): QueuedGuestWriters counts those, not the method as a writer
+    /// of anything (as RangeLastWrite does for ranged writes). Only QueuedGuestWriters reads it.
+    void RangedMethodWrite() {
+        if (last_method_write_position == write_position) {
+            last_method_write_position = previous_method_write_position;
+        }
+    }
     /// A method that writes memory was just sent; the method is kept for the GPU profile.
     void NoteMethodWrite(const Tegra::Engines::EngineInterface* engine, u32 method) {
         previous_memory_write_position = last_memory_write_position;
@@ -738,6 +763,9 @@ public:
     struct GuestWriters {
         u64 noted;
         u64 unbounded;
+        GuestWriterCause noted_cause;
+        GuestWriterCause unbounded_cause;
+        const char* what; ///< UnknownPending: the noted write's `what`
     };
     [[nodiscard]] GuestWriters QueuedGuestWriters(u64 done, GPUVAddr address, u64 device, u64 size,
                                                   std::span<const u64> skip = {}) const;
