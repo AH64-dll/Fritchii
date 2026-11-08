@@ -21,7 +21,15 @@
 ///    the inline QMD words the front sent; max releases (bit 19) are lower bounds, reductions
 ///    (bit 26) and compute report reductions are recorded for the reduction lower bound
 ///    (fable_answer_6 6c), which is counted too.
-/// One log line every 5 s (HW_GPU, Info), three with 2.
+/// 3: as 2, and the predictions meet acquires (fable_answer_6 6b slice B, 6c/6e): a queued (or
+///    run but not landed) plain or max release whose value meets the acquire with nothing queued
+///    after it that may write the word, or a reduction lower bound (GEQ only). The feed turns
+///    itself off for the rest of the session (until EXP13 leaves 3) at the first bound
+///    violation, payload mismatch, unpredicted back release or reduction, phantom record or
+///    lost event, with an ERROR line saying why.
+/// The tables are the front's own (no lock): the back's releases and the landings reach them
+/// through rings the front drains.
+/// One log line every 5 s (HW_GPU, Info), three with 2, four with 3.
 namespace Tegra {
 enum class Nx2Landing : u32; // nx2.h
 }
@@ -39,9 +47,15 @@ namespace VideoCommon::QmdPrediction {
     return Mode() != 0;
 }
 
-/// EXP13=2: the front's QMD scheduler copy predicts.
+/// EXP13=2 or 3: the front's QMD scheduler copy predicts.
 [[nodiscard]] inline bool MirrorMode() {
-    return Mode() == 2;
+    const int mode = Mode();
+    return mode == 2 || mode == 3;
+}
+
+/// EXP13=3: the predictions meet acquires (while the feed has not turned itself off).
+[[nodiscard]] inline bool FeedRequested() {
+    return Mode() == 3;
 }
 
 /// EXP13=2 records only: Report, a compute report semaphore (0x6c3) or a 3D payload report;
@@ -175,6 +189,10 @@ std::optional<Bound> CheckAcquire(const AcquireCheck& check);
 /// Front: the acquire `bound` was computed for was met; `word` is its word now. Counts a bound
 /// violation (word < bound) once the records folded landed.
 void CheckBound(const Bound& bound, u32 word);
+
+/// Front, EXP13=3: whether the predictions meet the unmet acquire `check` describes (`resume`:
+/// a poll of a suspended one). The caller notes a host sync (GpuSplit::NoteSync) when met.
+[[nodiscard]] bool Feed(const AcquireCheck& check, bool resume);
 
 /// The count of releases the back made (Verify), to tell which came after a point.
 [[nodiscard]] u64 BackSequence();

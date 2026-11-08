@@ -546,6 +546,42 @@ void RecordPullerRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload) {
     }
 }
 
+// EXP13=3 (nx2_qmd_prediction.h): an acquire a queued release or the reduction bound meets goes
+// on as one a queued release meets does (MetByQueuedRelease): the back runs the channel's later
+// work behind the releases, and it counts as a host-level wait (NoteSync).
+bool MetByQmdPrediction(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
+                        bool resume) {
+    namespace Prediction = VideoCommon::QmdPrediction;
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!Prediction::FeedRequested() || !split.Active()) {
+        return false;
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+    if (!device) {
+        return false;
+    }
+    // The word first, then the back's position, then the marks (Feed drains them).
+    const u32 word = dma_pusher.memory_manager.Read<u32>(acquire.address);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const u64 done = split.ConsumedNow();
+    if (!Prediction::Feed(
+            {
+                .device = *device,
+                .address = acquire.address,
+                .operation = acquire.operation,
+                .value = acquire.value,
+                .word = word,
+                .done = done,
+                .gpu_dirty = Nx2IsGpuWritten(*device),
+                .pointer = nullptr,
+            },
+            resume)) {
+        return false;
+    }
+    split.NoteSync();
+    return true;
+}
+
 } // Anonymous namespace
 
 static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& word);
@@ -643,6 +679,8 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquirePollsFast, 1);
         return true;
     }
+    // EXP13=3: asked once per poll, before the unmet-poll throttle most polls end at.
+    bool predicted = false;
     if (u32 word{}; SemaphoreReadableNow(dma_pusher, pending_acquire->address, word)) {
         if (pending_acquire->Matches(word)) {
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquirePollsFast, 1);
@@ -652,6 +690,10 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         // was last drained for this acquire. A release the back holds as deferred work lands only
         // when the back runs, so a channel polled without ever draining again waited forever
         // (Mario Kart World hung after 63 s once the 2 s report had been made).
+        predicted = true;
+        if (MetByQmdPrediction(dma_pusher, *pending_acquire, true)) {
+            return true;
+        }
         const auto now = std::chrono::steady_clock::now();
         if (++pending_acquire->unmet_polls % 16 != 0 &&
             now - pending_acquire->last_drain < std::chrono::milliseconds{1}) {
@@ -660,6 +702,9 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         }
     }
     if (MetByQueuedRelease(dma_pusher, *pending_acquire)) {
+        return true;
+    }
+    if (!predicted && MetByQmdPrediction(dma_pusher, *pending_acquire, true)) {
         return true;
     }
     if (static_cast<GpuSemaphoreOperation>(pending_acquire->operation) ==
@@ -884,6 +929,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }
         u32 miss = 0;
         if (MetByQueuedRelease(dma_pusher, acquire, &miss)) {
+            return;
+        }
+        if (MetByQmdPrediction(dma_pusher, acquire, false)) {
             return;
         }
         if (op == GpuSemaphoreOperation::AcquireGequal &&

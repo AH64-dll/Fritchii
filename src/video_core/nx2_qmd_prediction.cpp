@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
-#include <mutex>
 #include <span>
 #include <string>
 #include <utility>
@@ -124,6 +124,104 @@ size_t Bucket(u64 device) {
     return Hash(device) % Buckets;
 }
 
+/// A single-producer single-consumer ring: the producer pushes, the front drains. A full ring
+/// drops the event and counts it (the feed then turns off: its tables may be wrong).
+template <typename T, size_t N>
+struct SpscRing {
+    static_assert((N & (N - 1)) == 0);
+    std::array<T, N> slots{};
+    alignas(64) std::atomic<u64> head{};
+    alignas(64) std::atomic<u64> tail{};
+    std::atomic<u64> lost{};
+
+    void Push(const T& value) {
+        const u64 at = head.load(std::memory_order_relaxed);
+        if (at - tail.load(std::memory_order_acquire) >= N) {
+            lost.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        slots[at % N] = value;
+        head.store(at + 1, std::memory_order_release);
+    }
+
+    template <typename Func>
+    void Drain(Func&& func) {
+        u64 at = tail.load(std::memory_order_relaxed);
+        const u64 end = head.load(std::memory_order_acquire);
+        if (at == end) {
+            return;
+        }
+        for (; at != end; ++at) {
+            func(slots[at % N]);
+        }
+        tail.store(at, std::memory_order_release);
+    }
+};
+
+/// A release the back made (Verify), checked on the front when it drains.
+struct VerifyEvent {
+    u64 device;
+    u64 qmd;
+    u64 entry_position;
+    u32 payload;
+    Writer writer;
+    bool reduction;
+};
+/// A GPU semaphore write about to land (NoteLanded), attributed on the front when it drains.
+struct LandingEvent {
+    u64 device;
+    u32 value;
+    Tegra::Nx2Landing site;
+};
+
+/// Verify runs on the back only. Landings come from the back and the fence thread(s): one ring
+/// per producing thread.
+constexpr size_t LandingRings = 8;
+struct Rings {
+    SpscRing<VerifyEvent, 8192> verify;
+    std::array<SpscRing<LandingEvent, 4096>, LandingRings> landings;
+    std::atomic<u32> landing_threads{};
+    std::atomic<u64> landing_no_ring{};
+
+    SpscRing<LandingEvent, 4096>* ThreadLandings() {
+        thread_local SpscRing<LandingEvent, 4096>* ring = nullptr;
+        thread_local bool assigned = false;
+        if (!assigned) {
+            assigned = true;
+            const u32 index = landing_threads.fetch_add(1, std::memory_order_acq_rel);
+            ring = index < LandingRings ? &landings[index] : nullptr;
+        }
+        return ring;
+    }
+
+    [[nodiscard]] u64 Lost() const {
+        u64 lost = verify.lost.load(std::memory_order_relaxed) +
+                   landing_no_ring.load(std::memory_order_relaxed);
+        for (const auto& ring : landings) {
+            lost += ring.lost.load(std::memory_order_relaxed);
+        }
+        return lost;
+    }
+};
+
+Rings& GetRings() {
+    static Rings rings;
+    return rings;
+}
+
+/// Why the EXP13=3 feed turned itself off.
+enum class FeedOff : u32 {
+    None,
+    BoundViolated,   ///< A word below a bound (at its newest folded landing, or once met)
+    PayloadMismatch, ///< A predicted release or reduction with another payload
+    Unpredicted,     ///< A back release or reduction no record predicted
+    Phantom,         ///< A record the back never made
+    LostEvents,      ///< A full ring dropped back releases or landings
+    Count,
+};
+/// What met an acquire in the feed.
+enum class Fed : u32 { QueuedPlain, LandedPending, Bound, Count };
+
 template <typename Array>
 std::string Rates(const Array& counts, double window) {
     std::string text;
@@ -134,8 +232,9 @@ std::string Rates(const Array& counts, double window) {
     return text;
 }
 
+/// Front-owned: only the front thread touches it (the back and fence threads only push to the
+/// rings).
 struct State {
-    std::mutex mutex;
     std::array<std::array<Prediction, Ways>, Buckets> predictions{};
     std::array<u32, Buckets> next{};
     /// The newest position of a record evicted from each bucket (EXP13=2's bound).
@@ -224,6 +323,26 @@ struct State {
     size_t pending_count{};
     Clock::time_point since{};
 
+    /// EXP13=3: the feed's state, what it met, and the bounds it met with waiting for the
+    /// landing of their newest folded record (checked against its value then).
+    FeedOff feed_off{FeedOff::None};
+    std::string feed_off_detail;
+    int last_mode{};
+    u64 lost_seen{};
+    std::array<std::array<u64, 2>, static_cast<size_t>(Fed::Count)> fed{};
+    u64 fed_checks_passed{};
+    u64 fed_checks_violated{};
+    u64 fed_checks_unverified{};
+    u64 fed_checks_full{};
+    struct FeedCheck {
+        u64 device;
+        u64 sequence; ///< The newest folded record
+        u32 bound;
+        Clock::time_point since;
+    };
+    std::array<FeedCheck, 256> feed_checks{};
+    size_t feed_check_count{};
+
     /// Re-reads the pending violations (of `device` only, if given): recovered once the word
     /// reached the bound, never recovered after 100 ms.
     void ReRead(Clock::time_point now, const u64* device) {
@@ -253,6 +372,15 @@ struct State {
         if (pending_count != 0) {
             ReRead(now, nullptr);
         }
+        const int mode = Mode();
+        if (mode != last_mode) {
+            // Leaving 3 re-arms the feed; entering it starts with what was lost so far.
+            last_mode = mode;
+            feed_off = FeedOff::None;
+            feed_off_detail.clear();
+            feed_check_count = 0;
+            lost_seen = GetRings().Lost();
+        }
         if (since == Clock::time_point{}) {
             since = now;
             return;
@@ -260,6 +388,16 @@ struct State {
         const double window = std::chrono::duration<double>(now - since).count();
         if (window < 5.0) {
             return;
+        }
+        CheckLost();
+        // Bounds whose newest folded record never landed (dropped from the table, or far late).
+        for (size_t i = 0; i < feed_check_count;) {
+            if (now - feed_checks[i].since >= std::chrono::seconds{2}) {
+                ++fed_checks_unverified;
+                feed_checks[i] = feed_checks[--feed_check_count];
+            } else {
+                ++i;
+            }
         }
         const auto rate = [window](u64 count) { return static_cast<double>(count) / window; };
         const auto signal = [&](Signal s) { return rate(signals[static_cast<size_t>(s)]); };
@@ -315,7 +453,31 @@ struct State {
                  mirrored(Mirror::Resync), mirrored(Mirror::SessionStart),
                  mirrored(Mirror::AutoOff), outcome(Outcome::GeqMet), outcome(Outcome::EqMet),
                  outcome(Outcome::MaskMet));
-        if (Mode() == 2) {
+        if (mode == 3) {
+            const auto fed_rate = [&](Fed kind, size_t resume) {
+                return rate(fed[static_cast<size_t>(kind)][resume]);
+            };
+            constexpr std::array<const char*, static_cast<size_t>(FeedOff::Count)> off_names{
+                "on",
+                "off: a bound violated",
+                "off: a payload mismatch",
+                "off: an unpredicted back release",
+                "off: a phantom record",
+                "off: lost events"};
+            LOG_INFO(HW_GPU,
+                     "QMD release prediction feed (EXP13=3): acquires/s met by a queued plain "
+                     "release {:.0f} (+{:.0f} at resume polls), by a run but unlanded one {:.0f} "
+                     "(+{:.0f}), by the reduction bound {:.0f} (+{:.0f}); bounds checked at their "
+                     "newest landing: {} passed, {} violated, {} unverified after 2 s, {} not fed "
+                     "(check table full), {} waiting; feed {}{}",
+                     fed_rate(Fed::QueuedPlain, 0), fed_rate(Fed::QueuedPlain, 1),
+                     fed_rate(Fed::LandedPending, 0), fed_rate(Fed::LandedPending, 1),
+                     fed_rate(Fed::Bound, 0), fed_rate(Fed::Bound, 1), fed_checks_passed,
+                     fed_checks_violated, fed_checks_unverified, fed_checks_full,
+                     feed_check_count, off_names[static_cast<size_t>(feed_off)],
+                     feed_off_detail.empty() ? std::string{} : " (" + feed_off_detail + ")");
+        }
+        if (MirrorMode()) {
             LOG_INFO(HW_GPU,
                      "QMD release prediction (EXP13=2) reduction bound: acquires on reduction "
                      "words {:.0f} GEQ, {:.0f} EQ, {:.0f} MASK, {:.0f} other; GEQ {:.0f} met, "
@@ -426,6 +588,8 @@ struct State {
         wait_whats = {};
         wait_whats_other = 0;
         violations = recovered = never_recovered = {};
+        fed = {};
+        fed_checks_passed = fed_checks_violated = fed_checks_unverified = fed_checks_full = 0;
         since = now;
     }
 
@@ -496,6 +660,9 @@ struct State {
                 }
                 ++phantoms;
                 ++session_phantoms;
+                TurnFeedOff(FeedOff::Phantom,
+                            fmt::format("QMD {:#x}, device {:#x}, payload {:#x}", way.qmd,
+                                        way.device, way.payload));
                 if (phantoms_logged < 16) {
                     ++phantoms_logged;
                     LOG_WARNING(HW_GPU,
@@ -517,6 +684,206 @@ struct State {
         evicted = {};
         evicted_plain = {};
         pending_count = 0;
+        feed_check_count = 0;
+    }
+
+    /// EXP13=3: the feed stops for the rest of the session (until EXP13 leaves 3).
+    void TurnFeedOff(FeedOff reason, std::string detail) {
+        if (last_mode != 3 || feed_off != FeedOff::None) {
+            return;
+        }
+        feed_off = reason;
+        feed_off_detail = std::move(detail);
+        constexpr std::array<const char*, static_cast<size_t>(FeedOff::Count)> reasons{
+            "", "a reduction bound was violated", "a predicted release's payload differs",
+            "the back made a release or reduction nothing predicted",
+            "a record the back never made", "a full ring dropped events"};
+        LOG_ERROR(HW_GPU,
+                  "QMD release prediction feed (EXP13=3) off for the rest of the session: {} "
+                  "({})",
+                  reasons[static_cast<size_t>(reason)], feed_off_detail);
+    }
+
+    /// EXP13=3: events lost to full rings make the marks and matches unreliable.
+    void CheckLost() {
+        const u64 lost = GetRings().Lost();
+        if (lost != lost_seen) {
+            TurnFeedOff(FeedOff::LostEvents, fmt::format("{} events", lost - lost_seen));
+            lost_seen = lost;
+        }
+    }
+
+    /// EXP13=3: `record` just landed with `value`: a bound it was the newest folded record of
+    /// must hold.
+    void ResolveFeedChecks(const Prediction& record, u32 value) {
+        for (size_t i = 0; i < feed_check_count;) {
+            FeedCheck& check = feed_checks[i];
+            if (check.sequence != record.sequence || check.device != record.device) {
+                ++i;
+                continue;
+            }
+            if (value >= check.bound) {
+                ++fed_checks_passed;
+            } else {
+                ++fed_checks_violated;
+                TurnFeedOff(FeedOff::BoundViolated,
+                            fmt::format("device {:#x}: bound {:#x}, landed {:#x}", check.device,
+                                        check.bound, value));
+            }
+            check = feed_checks[--feed_check_count];
+        }
+    }
+
+    /// The records of `device`, in send order.
+    size_t Gather(u64 device, std::array<const Prediction*, Ways>& records) const {
+        size_t count = 0;
+        for (const Prediction& way : predictions[Bucket(device)]) {
+            if (way.position != 0 && way.device == device) {
+                records[count++] = &way;
+            }
+        }
+        std::sort(records.begin(), records.begin() + static_cast<std::ptrdiff_t>(count),
+                  [](const Prediction* a, const Prediction* b) {
+                      return a->sequence < b->sequence;
+                  });
+        return count;
+    }
+
+    /// The reduction lower bound (6c section 3, 6e) of the word `check` reads.
+    struct Folded {
+        bool ok;
+        Bail bail;
+        bool reduction_word; ///< Unlanded reductions or max releases wait on the word
+        bool all_or;
+        u64 newest;          ///< The newest folded record
+        Bound bound;
+    };
+    Folded Fold(const AcquireCheck& check, const std::array<const Prediction*, Ways>& records,
+                size_t count) const {
+        Folded folded{};
+        const auto bail = [&folded](Bail reason) {
+            folded.ok = false;
+            folded.bail = reason;
+            return folded;
+        };
+        // The word only grows under the records that have not landed, whatever their position
+        // (`done` trails the back: a record past it may be inside the word already, and its
+        // mark says so; the back marks before it writes).
+        bool any_monotonic_record = false;
+        bool plain_queued = false;
+        bool plain_unlanded = false;
+        for (size_t i = 0; i < count; ++i) {
+            if (Landed(*records[i])) {
+                continue;
+            }
+            any_monotonic_record |= records[i]->kind != Kind::Plain;
+            if (records[i]->kind == Kind::Plain) {
+                (records[i]->position > check.done ? plain_queued : plain_unlanded) = true;
+            }
+        }
+        if (!any_monotonic_record) {
+            return bail(Bail::NoRecords);
+        }
+        folded.reduction_word = true;
+        const size_t bucket = Bucket(check.device);
+        if (check.gpu_dirty) {
+            return bail(Bail::GpuDirty);
+        }
+        if (!records_valid || records_valid_from > check.done) {
+            return bail(Bail::MirrorOff);
+        }
+        if (evicted[bucket] > check.done || evicted_plain[bucket] == check.device) {
+            return bail(Bail::Evicted);
+        }
+        if (plain_queued) {
+            return bail(Bail::PlainQueued);
+        }
+        if (plain_unlanded) {
+            // It lands later and sets the word, maybe below the bound.
+            return bail(Bail::PlainUnlanded);
+        }
+        // Other writers of the word sent after `done`; this table's report releases are noted
+        // as writer ranges at their own positions.
+        std::array<u64, Ways> own{};
+        size_t own_count = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (records[i]->writer == Writer::Report && records[i]->position > check.done) {
+                own[own_count++] = records[i]->position;
+            }
+        }
+        const auto writers = GpuSplit::Get().QueuedGuestWriters(
+            check.done, check.address, check.device, sizeof(u32),
+            std::span<const u64>{own.data(), own_count});
+        if (writers.noted != 0) {
+            return bail(Bail::OtherWriter);
+        }
+        if (writers.unbounded != 0) {
+            return bail(Bail::Unbounded);
+        }
+        // Fold the unlanded records in send order from the word read before the marks were
+        // drained (a record marked after the read is folded, one marked before is in the
+        // word). The 2^31 guard keeps the sum from wrapping.
+        constexpr u64 Guard = 0x7fffffff;
+        u64 bound = check.word;
+        folded.all_or = true;
+        if (bound > Guard) {
+            return bail(Bail::Wrap);
+        }
+        Bound& result = folded.bound;
+        for (size_t i = 0; i < count; ++i) {
+            const Prediction& r = *records[i];
+            if (Landed(r)) {
+                continue;
+            }
+            folded.newest = r.sequence;
+            result.sequences[result.folded] = r.sequence;
+            result.payloads[result.folded++] = r.payload;
+            result.payload_sum += r.payload;
+            if (r.kind == Kind::AtLeast) {
+                bound = (std::max)(bound, u64{r.payload});
+                folded.all_or = false;
+            } else {
+                switch (r.op) {
+                case 0: // ADD
+                    bound += r.payload;
+                    folded.all_or = false;
+                    break;
+                case 2: // MAX
+                    if (r.is_signed) {
+                        return bail(Bail::SignedMax);
+                    }
+                    bound = (std::max)(bound, u64{r.payload});
+                    folded.all_or = false;
+                    break;
+                case 3: // INC: value >= payload ? 0 : value + 1
+                    if (r.payload != 0xffffffff) {
+                        return bail(Bail::IncPayload);
+                    }
+                    bound += 1;
+                    folded.all_or = false;
+                    break;
+                case 6: // OR
+                    bound |= r.payload;
+                    break;
+                default: // MIN, DEC, AND, XOR
+                    return bail(Bail::NonMonotonic);
+                }
+            }
+            if (bound > Guard) {
+                return bail(Bail::Wrap);
+            }
+        }
+        folded.ok = true;
+        result.value = static_cast<u32>(bound);
+        result.word = check.word;
+        result.device = check.device;
+        result.address = check.address;
+        result.done = check.done;
+        result.since = Clock::now();
+        result.pointer = check.pointer;
+        result.operation = check.operation;
+        result.acquire_value = check.value;
+        return folded;
     }
 };
 
@@ -525,147 +892,12 @@ State& Get() {
     return state;
 }
 
-} // Anonymous namespace
-
-void NoteSignal(Signal signal) {
-    auto& state = Get();
-    std::scoped_lock lock{state.mutex};
-    ++state.signals[static_cast<size_t>(signal)];
-    state.Tick();
-}
-
-void NoteReduction() {
-    auto& state = Get();
-    std::scoped_lock lock{state.mutex};
-    ++state.reductions;
-}
-
-void NoteUnmappedRelease() {
-    auto& state = Get();
-    std::scoped_lock lock{state.mutex};
-    ++state.unmapped_releases;
-}
-
-void Predict(Writer writer, u64 device, u32 payload, u64 position, u64 qmd, bool stale) {
-    auto& state = Get();
-    std::scoped_lock lock{state.mutex};
-    Prediction record{};
-    record.device = device;
-    record.position = position;
-    record.qmd = qmd;
-    record.payload = payload;
-    record.writer = writer;
-    record.kind = Kind::Plain;
-    record.stale = stale;
-    state.Insert(record);
-    ++state.predicted[static_cast<size_t>(writer)];
-    state.predicted_stale += stale ? 1 : 0;
-    state.Tick();
-}
-
-void Note(u64 device, const Record& record, u32 before, u64 position, u64 qmd) {
-    auto& state = Get();
-    std::scoped_lock lock{state.mutex};
-    Prediction stored{};
-    stored.device = device;
-    stored.position = position;
-    stored.qmd = qmd;
-    stored.payload = record.payload;
-    stored.before = before;
-    stored.writer = record.writer;
-    stored.kind = record.kind;
-    stored.op = static_cast<u8>(record.op & 7);
-    stored.is_signed = record.is_signed;
-    static const bool hooked = [] {
-        Tegra::g_nx2_landed_hook.store(&NoteLanded, std::memory_order_release);
-        return true;
-    }();
-    (void)hooked;
-    state.Insert(stored);
-    state.Sweep(GpuSplit::Get().ConsumedNow());
-    switch (record.kind) {
-    case Kind::Reduction:
-        if (record.writer == Writer::Report) {
-            ++state.reduction_ops[2][record.op & 7];
-        } else {
-            ++state.reductions;
-            ++state.reduction_ops[record.is_signed ? 1 : 0][record.op & 7];
-        }
-        break;
-    case Kind::AtLeast:
-        ++state.predicted_at_least;
-        [[fallthrough]];
-    case Kind::Plain:
-        ++state.predicted[static_cast<size_t>(record.writer)];
-        break;
-    }
-    state.Tick();
-}
-
-void NoteMirror(Mirror event) {
-    auto& state = Get();
-    std::scoped_lock lock{state.mutex};
-    ++state.mirror[static_cast<size_t>(event)];
-}
-
-void SetRecordsValid(bool valid, u64 position) {
-    auto& state = Get();
-    std::scoped_lock lock{state.mutex};
-    state.records_valid = valid;
-    state.records_valid_from = position;
-    if (!valid) {
-        // The copy stopped: its records and their landed counts start over with it.
-        state.Clear();
-    }
-}
-
-void NoteWait(GuestWriterCause cause, const char* what) {
-    auto& state = Get();
-    std::scoped_lock lock{state.mutex};
-    ++state.wait_causes[static_cast<size_t>(cause)];
-    if (cause != GuestWriterCause::UnknownPending) {
-        return;
-    }
-    for (auto& [name, count] : state.wait_whats) {
-        if (name == nullptr || name == what ||
-            (what != nullptr && std::strcmp(name, what) == 0)) {
-            name = what != nullptr ? what : "unknown";
-            ++count;
-            return;
-        }
-    }
-    ++state.wait_whats_other;
-}
-
-void NoteRangeWait(u32 kind, s64 offset, u64 size) {
-    auto& state = Get();
-    std::scoped_lock lock{state.mutex};
-    const s64 word = offset >= 0 ? offset / 4 : -((-offset + 3) / 4);
-    for (size_t i = 0; i < state.range_wait_count; ++i) {
-        State::RangeWait& entry = state.range_waits[i];
-        if (entry.kind == kind && entry.word == word && entry.size == size) {
-            ++entry.count;
-            return;
-        }
-    }
-    if (state.range_wait_count < state.range_waits.size()) {
-        state.range_waits[state.range_wait_count++] = {kind, word, size, 1};
-    } else {
-        ++state.range_waits_other;
-    }
-}
-
-void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing site) {
-    if (!MirrorMode()) {
-        return;
-    }
+void ApplyLanded(State& state, u64 device, u32 value, Tegra::Nx2Landing site) {
     using Site = Tegra::Nx2Landing;
     const Kind kind = site == Site::QmdMax ? Kind::AtLeast
                       : site == Site::QmdReduction || site == Site::ReportReduction
                           ? Kind::Reduction
                           : Kind::Plain;
-    auto& state = Get();
-    std::scoped_lock lock{state.mutex};
     // The record it belongs to: reductions land in send order among themselves (synchronously,
     // in back order), a plain write is known by its payload, a max by a payload up to it. Kinds
     // land out of order with each other (query completions run on the fencing thread).
@@ -696,6 +928,9 @@ void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing site) {
     }
     if (oldest != nullptr) {
         oldest->landed = true;
+        if (state.feed_check_count != 0) {
+            state.ResolveFeedChecks(*oldest, value);
+        }
         return;
     }
     if (kind == Kind::Plain && state.evicted_plain[bucket] == device) {
@@ -745,9 +980,16 @@ void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing site) {
     }
 }
 
-void Verify(Writer writer, u64 device, u32 payload, u64 qmd, u64 entry_position, bool reduction) {
-    auto& state = Get();
-    std::scoped_lock lock{state.mutex};
+void ApplyVerify(State& state, const VerifyEvent& event) {
+    const Writer writer = event.writer;
+    const u64 device = event.device;
+    const u32 payload = event.payload;
+    const u64 qmd = event.qmd;
+    const u64 entry_position = event.entry_position;
+    const bool reduction = event.reduction;
+    // Made by an entry sent after the records were complete: nothing predicted it is a
+    // divergence (EXP13=3 turns the feed off).
+    const bool covered = state.records_valid && entry_position >= state.records_valid_from;
     state.releases[Hash(device) % Releases] = {device, ++state.sequence, payload, writer,
                                                  reduction};
     const bool mirror = MirrorMode();
@@ -782,6 +1024,11 @@ void Verify(Writer writer, u64 device, u32 payload, u64 qmd, u64 entry_position,
     if (reduction) {
         if (!found) {
             ++state.unpredicted_reductions;
+            if (covered) {
+                state.TurnFeedOff(FeedOff::Unpredicted,
+                                  fmt::format("reduction of QMD {:#x}, device {:#x}, payload {:#x}",
+                                              qmd, device, payload));
+            }
             if (state.unpredicted_reductions_logged < 8) {
                 ++state.unpredicted_reductions_logged;
                 LOG_INFO(HW_GPU,
@@ -793,6 +1040,12 @@ void Verify(Writer writer, u64 device, u32 payload, u64 qmd, u64 entry_position,
         } else {
             found->matched = true;
             ++(found->payload == payload ? state.matched_reductions : state.differs_reductions);
+            if (found->payload != payload) {
+                state.TurnFeedOff(FeedOff::PayloadMismatch,
+                                  fmt::format("reduction of QMD {:#x}, device {:#x}: predicted "
+                                              "{:#x}, made {:#x}",
+                                              qmd, device, found->payload, payload));
+            }
         }
         return;
     }
@@ -801,6 +1054,12 @@ void Verify(Writer writer, u64 device, u32 payload, u64 qmd, u64 entry_position,
     }
     if (!found) {
         ++state.unpredicted[index];
+        if (covered && (writer == Writer::Qmd || writer == Writer::Dma)) {
+            state.TurnFeedOff(FeedOff::Unpredicted,
+                              fmt::format("{} release, QMD {:#x}, device {:#x} = {:#x}",
+                                          writer == Writer::Qmd ? "QMD" : "copy", qmd, device,
+                                          payload));
+        }
         // Every way was predicted after this entry: the prediction may have been evicted.
         state.unpredicted_full += oldest > entry_position && writer == Writer::Qmd ? 1 : 0;
         if (state.unpredicted_logged < 8) {
@@ -819,6 +1078,11 @@ void Verify(Writer writer, u64 device, u32 payload, u64 qmd, u64 entry_position,
     }
     ++state.differs[index];
     state.differs_stale += found->stale ? 1 : 0;
+    state.TurnFeedOff(FeedOff::PayloadMismatch,
+                      fmt::format("{} release, QMD {:#x}, device {:#x}: predicted {:#x}, made "
+                                  "{:#x}",
+                                  writer == Writer::Qmd ? "QMD" : "copy", qmd, device,
+                                  found->payload, payload));
     if (state.differs_logged < 16) {
         ++state.differs_logged;
         LOG_INFO(HW_GPU,
@@ -829,9 +1093,169 @@ void Verify(Writer writer, u64 device, u32 payload, u64 qmd, u64 entry_position,
     }
 }
 
-Queued QueuedPayloads(u64 device, u64 consumed) {
+/// The back's releases and the landings pushed since the last drain, applied in order.
+void Drain(State& state) {
+    auto& rings = GetRings();
+    rings.verify.Drain([&state](const VerifyEvent& event) { ApplyVerify(state, event); });
+    const u32 threads =
+        (std::min)(rings.landing_threads.load(std::memory_order_acquire), u32{LandingRings});
+    for (u32 i = 0; i < threads; ++i) {
+        rings.landings[i].Drain([&state](const LandingEvent& event) {
+            ApplyLanded(state, event.device, event.value, event.site);
+        });
+    }
+}
+
+/// The front's state, with what the other threads pushed applied.
+State& Front() {
+    State& state = Get();
+    Drain(state);
+    return state;
+}
+
+} // Anonymous namespace
+
+void NoteSignal(Signal signal) {
+    auto& state = Front();
+    ++state.signals[static_cast<size_t>(signal)];
+    state.Tick();
+}
+
+void NoteReduction() {
     auto& state = Get();
-    std::scoped_lock lock{state.mutex};
+    ++state.reductions;
+}
+
+void NoteUnmappedRelease() {
+    auto& state = Get();
+    ++state.unmapped_releases;
+}
+
+void Predict(Writer writer, u64 device, u32 payload, u64 position, u64 qmd, bool stale) {
+    auto& state = Front();
+    Prediction record{};
+    record.device = device;
+    record.position = position;
+    record.qmd = qmd;
+    record.payload = payload;
+    record.writer = writer;
+    record.kind = Kind::Plain;
+    record.stale = stale;
+    state.Insert(record);
+    ++state.predicted[static_cast<size_t>(writer)];
+    state.predicted_stale += stale ? 1 : 0;
+    state.Tick();
+}
+
+void Note(u64 device, const Record& record, u32 before, u64 position, u64 qmd) {
+    // The back's position first: every release of the entries it ran is in the rings then.
+    const u64 consumed = GpuSplit::Get().ConsumedNow();
+    auto& state = Front();
+    Prediction stored{};
+    stored.device = device;
+    stored.position = position;
+    stored.qmd = qmd;
+    stored.payload = record.payload;
+    stored.before = before;
+    stored.writer = record.writer;
+    stored.kind = record.kind;
+    stored.op = static_cast<u8>(record.op & 7);
+    stored.is_signed = record.is_signed;
+    static const bool hooked = [] {
+        Tegra::g_nx2_landed_hook.store(&NoteLanded, std::memory_order_release);
+        return true;
+    }();
+    (void)hooked;
+    state.Insert(stored);
+    state.Sweep(consumed);
+    switch (record.kind) {
+    case Kind::Reduction:
+        if (record.writer == Writer::Report) {
+            ++state.reduction_ops[2][record.op & 7];
+        } else {
+            ++state.reductions;
+            ++state.reduction_ops[record.is_signed ? 1 : 0][record.op & 7];
+        }
+        break;
+    case Kind::AtLeast:
+        ++state.predicted_at_least;
+        [[fallthrough]];
+    case Kind::Plain:
+        ++state.predicted[static_cast<size_t>(record.writer)];
+        break;
+    }
+    state.Tick();
+}
+
+void NoteMirror(Mirror event) {
+    auto& state = Get();
+    ++state.mirror[static_cast<size_t>(event)];
+}
+
+void SetRecordsValid(bool valid, u64 position) {
+    auto& state = Front();
+    state.records_valid = valid;
+    state.records_valid_from = position;
+    if (!valid) {
+        // The copy stopped: its records and their landed counts start over with it.
+        state.Clear();
+    }
+}
+
+void NoteWait(GuestWriterCause cause, const char* what) {
+    auto& state = Get();
+    ++state.wait_causes[static_cast<size_t>(cause)];
+    if (cause != GuestWriterCause::UnknownPending) {
+        return;
+    }
+    for (auto& [name, count] : state.wait_whats) {
+        if (name == nullptr || name == what ||
+            (what != nullptr && std::strcmp(name, what) == 0)) {
+            name = what != nullptr ? what : "unknown";
+            ++count;
+            return;
+        }
+    }
+    ++state.wait_whats_other;
+}
+
+void NoteRangeWait(u32 kind, s64 offset, u64 size) {
+    auto& state = Get();
+    const s64 word = offset >= 0 ? offset / 4 : -((-offset + 3) / 4);
+    for (size_t i = 0; i < state.range_wait_count; ++i) {
+        State::RangeWait& entry = state.range_waits[i];
+        if (entry.kind == kind && entry.word == word && entry.size == size) {
+            ++entry.count;
+            return;
+        }
+    }
+    if (state.range_wait_count < state.range_waits.size()) {
+        state.range_waits[state.range_wait_count++] = {kind, word, size, 1};
+    } else {
+        ++state.range_waits_other;
+    }
+}
+
+void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing site) {
+    if (!MirrorMode()) {
+        return;
+    }
+    auto& rings = GetRings();
+    if (auto* const ring = rings.ThreadLandings()) {
+        ring->Push({device, value, site});
+    } else {
+        rings.landing_no_ring.fetch_add(1, std::memory_order_relaxed);
+    }
+    // The caller writes the word next: a front that reads the new word must find the event.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+void Verify(Writer writer, u64 device, u32 payload, u64 qmd, u64 entry_position, bool reduction) {
+    GetRings().verify.Push({device, qmd, entry_position, payload, writer, reduction});
+}
+
+Queued QueuedPayloads(u64 device, u64 consumed) {
+    auto& state = Front();
     Queued queued{};
     for (const Prediction& way : state.predictions[Bucket(device)]) {
         if (way.position == 0 || way.device != device || way.kind == Kind::Reduction) {
@@ -846,15 +1270,13 @@ Queued QueuedPayloads(u64 device, u64 consumed) {
 }
 
 void NoteAcquire(Coverage coverage) {
-    auto& state = Get();
-    std::scoped_lock lock{state.mutex};
+    auto& state = Front();
     ++state.coverage[static_cast<size_t>(coverage)];
     state.Tick();
 }
 
 std::optional<Bound> CheckAcquire(const AcquireCheck& check) {
-    auto& state = Get();
-    std::scoped_lock lock{state.mutex};
+    auto& state = Front();
     const Compare compare = CompareOf(check.operation);
     const size_t bucket = Bucket(check.device);
     // The word's records, in send order.
@@ -896,116 +1318,18 @@ std::optional<Bound> CheckAcquire(const AcquireCheck& check) {
     }
     state.Tick();
 
-    // The reduction lower bound (6c section 3, 6e): the word only grows under the records that
-    // have not landed, whatever their position (`done` trails the back: a record past it may
-    // be inside the word already, and its mark says so; the back marks before it writes).
-    const auto bail = [&](Bail reason) -> std::optional<Bound> {
-        ++state.bails[static_cast<size_t>(reason)];
+    // The reduction lower bound (6c section 3, 6e).
+    const State::Folded folded = state.Fold(check, records, count);
+    if (folded.reduction_word) {
+        ++state.on_reduction_words[static_cast<size_t>(compare)];
+    }
+    if (!folded.ok) {
+        ++state.bails[static_cast<size_t>(folded.bail)];
         return std::nullopt;
-    };
-    bool any_monotonic_record = false;
-    bool plain_queued = false;
-    bool plain_unlanded = false;
-    for (size_t i = 0; i < count; ++i) {
-        if (State::Landed(*records[i])) {
-            continue;
-        }
-        any_monotonic_record |= records[i]->kind != Kind::Plain;
-        if (records[i]->kind == Kind::Plain) {
-            (records[i]->position > check.done ? plain_queued : plain_unlanded) = true;
-        }
     }
-    if (!any_monotonic_record) {
-        return bail(Bail::NoRecords);
-    }
-    ++state.on_reduction_words[static_cast<size_t>(compare)];
-    if (check.gpu_dirty) {
-        return bail(Bail::GpuDirty);
-    }
-    if (!state.records_valid || state.records_valid_from > check.done) {
-        return bail(Bail::MirrorOff);
-    }
-    if (state.evicted[bucket] > check.done || state.evicted_plain[bucket] == check.device) {
-        return bail(Bail::Evicted);
-    }
-    if (plain_queued) {
-        return bail(Bail::PlainQueued);
-    }
-    if (plain_unlanded) {
-        // It lands later and sets the word, maybe below the bound.
-        return bail(Bail::PlainUnlanded);
-    }
-    // Other writers of the word sent after `done`; this table's report releases are noted as
-    // writer ranges at their own positions.
-    std::array<u64, Ways> own{};
-    size_t own_count = 0;
-    for (size_t i = 0; i < count; ++i) {
-        if (records[i]->writer == Writer::Report && records[i]->position > check.done) {
-            own[own_count++] = records[i]->position;
-        }
-    }
-    const auto writers = GpuSplit::Get().QueuedGuestWriters(
-        check.done, check.address, check.device, sizeof(u32),
-        std::span<const u64>{own.data(), own_count});
-    if (writers.noted != 0) {
-        return bail(Bail::OtherWriter);
-    }
-    if (writers.unbounded != 0) {
-        return bail(Bail::Unbounded);
-    }
-    // Fold the unlanded records in send order from the word read before the marks (outside the
-    // lock: a record marked after the read is folded, one marked before is in the word). The
-    // 2^31 guard keeps the sum from wrapping.
-    constexpr u64 Guard = 0x7fffffff;
-    u64 bound = check.word;
-    bool all_or = true;
-    if (bound > Guard) {
-        return bail(Bail::Wrap);
-    }
-    Bound result{};
-    for (size_t i = 0; i < count; ++i) {
-        const Prediction& r = *records[i];
-        if (State::Landed(r)) {
-            continue;
-        }
-        result.sequences[result.folded] = r.sequence;
-        result.payloads[result.folded++] = r.payload;
-        result.payload_sum += r.payload;
-        if (r.kind == Kind::AtLeast) {
-            bound = (std::max)(bound, u64{r.payload});
-            all_or = false;
-        } else {
-            switch (r.op) {
-            case 0: // ADD
-                bound += r.payload;
-                all_or = false;
-                break;
-            case 2: // MAX
-                if (r.is_signed) {
-                    return bail(Bail::SignedMax);
-                }
-                bound = (std::max)(bound, u64{r.payload});
-                all_or = false;
-                break;
-            case 3: // INC: value >= payload ? 0 : value + 1
-                if (r.payload != 0xffffffff) {
-                    return bail(Bail::IncPayload);
-                }
-                bound += 1;
-                all_or = false;
-                break;
-            case 6: // OR
-                bound |= r.payload;
-                break;
-            default: // MIN, DEC, AND, XOR
-                return bail(Bail::NonMonotonic);
-            }
-        }
-        if (bound > Guard) {
-            return bail(Bail::Wrap);
-        }
-    }
-    const u32 value = static_cast<u32>(bound);
+    const bool all_or = folded.all_or;
+    Bound result = folded.bound;
+    const u32 value = result.value;
     Outcome outcome = Outcome::OtherOp;
     switch (compare) {
     case Compare::Gequal:
@@ -1026,21 +1350,70 @@ std::optional<Bound> CheckAcquire(const AcquireCheck& check) {
         break;
     }
     ++state.outcomes[static_cast<size_t>(outcome)];
-    result.value = value;
-    result.word = check.word;
-    result.device = check.device;
-    result.address = check.address;
-    result.done = check.done;
-    result.since = Clock::now();
-    result.pointer = check.pointer;
-    result.operation = check.operation;
-    result.acquire_value = check.value;
     return result;
 }
 
+bool Feed(const AcquireCheck& check, bool resume) {
+    auto& state = Front();
+    state.Tick();
+    state.CheckLost();
+    if (state.last_mode != 3 || state.feed_off != FeedOff::None || !state.records_valid ||
+        state.records_valid_from > check.done || check.gpu_dirty) {
+        return false;
+    }
+    std::array<const Prediction*, Ways> records{};
+    const size_t count = state.Gather(check.device, records);
+    if (count == 0) {
+        return false;
+    }
+    const Compare compare = CompareOf(check.operation);
+    const size_t resumed = resume ? 1 : 0;
+    // A plain or max release, the word's newest record: queued, or run with its landing still to
+    // come (the word holds what it held when it was sent), with no reduction or max release
+    // still to land before it and nothing queued after it that may write the word (6b slice B,
+    // QueuedReleasePayload's miss 3).
+    const Prediction& newest = *records[count - 1];
+    if (newest.kind != Kind::Reduction && !newest.landed) {
+        bool earlier_monotonic = false;
+        for (size_t i = 0; i + 1 < count; ++i) {
+            earlier_monotonic |= !records[i]->landed && records[i]->kind != Kind::Plain;
+        }
+        const bool queued = newest.position > check.done;
+        const bool pending = !queued && check.word == newest.before;
+        const bool meets = newest.kind == Kind::AtLeast
+                               ? compare == Compare::Gequal && check.value <= newest.payload
+                               : Meets(compare, check.value, newest.payload);
+        if (!earlier_monotonic && (queued || pending) && meets) {
+            const auto writers = GpuSplit::Get().QueuedGuestWriters(
+                check.done, check.address, check.device, sizeof(u32));
+            if ((std::max)(writers.noted, writers.unbounded) <= newest.position) {
+                ++state.fed[static_cast<size_t>(queued ? Fed::QueuedPlain : Fed::LandedPending)]
+                           [resumed];
+                return true;
+            }
+        }
+    }
+    // The reduction lower bound, GEQ only (6c section 4), checked when its newest folded record
+    // lands (6c section 6).
+    if (compare != Compare::Gequal) {
+        return false;
+    }
+    const State::Folded folded = state.Fold(check, records, count);
+    if (!folded.ok || folded.bound.value < check.value) {
+        return false;
+    }
+    if (state.feed_check_count == state.feed_checks.size()) {
+        ++state.fed_checks_full;
+        return false;
+    }
+    state.feed_checks[state.feed_check_count++] = {check.device, folded.newest,
+                                                   folded.bound.value, Clock::now()};
+    ++state.fed[static_cast<size_t>(Fed::Bound)][resumed];
+    return true;
+}
+
 void CheckBound(const Bound& bound, u32 word) {
-    auto& state = Get();
-    std::scoped_lock lock{state.mutex};
+    auto& state = Front();
     const auto now = Clock::now();
     if (state.pending_count != 0) {
         state.ReRead(now, &bound.device);
@@ -1067,6 +1440,9 @@ void CheckBound(const Bound& bound, u32 word) {
     }
     ++state.bound_violated;
     ++state.session_violated;
+    state.TurnFeedOff(FeedOff::BoundViolated,
+                      fmt::format("device {:#x}: bound {:#x}, word {:#x} once met", bound.device,
+                                  bound.value, word));
     const auto [word_records, word_landed] = state.Counts(bound.device);
     const u32 deficit = bound.value - word;
     Violation kind = Violation::Other;
@@ -1106,14 +1482,12 @@ void CheckBound(const Bound& bound, u32 word) {
 }
 
 u64 BackSequence() {
-    auto& state = Get();
-    std::scoped_lock lock{state.mutex};
+    auto& state = Front();
     return state.sequence;
 }
 
 std::optional<BackRelease> BackReleaseSince(u64 device, u64 since) {
-    auto& state = Get();
-    std::scoped_lock lock{state.mutex};
+    auto& state = Front();
     const Release& release = state.releases[Hash(device) % Releases];
     if (release.device != device || release.sequence <= since) {
         return std::nullopt;
@@ -1122,8 +1496,7 @@ std::optional<BackRelease> BackReleaseSince(u64 device, u64 since) {
 }
 
 std::optional<BackRelease> BackReleaseLatest(u64 device) {
-    auto& state = Get();
-    std::scoped_lock lock{state.mutex};
+    auto& state = Front();
     const Release& release = state.releases[Hash(device) % Releases];
     if (release.device != device || release.sequence == 0) {
         return std::nullopt;
@@ -1133,7 +1506,6 @@ std::optional<BackRelease> BackReleaseLatest(u64 device) {
 
 void NoteMetBy(MetBy met_by) {
     auto& state = Get();
-    std::scoped_lock lock{state.mutex};
     ++state.met_by[static_cast<size_t>(met_by)];
 }
 
