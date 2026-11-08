@@ -3831,7 +3831,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
     bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools,
-    std::unique_ptr<EmissionBudget::Reservation> reservation, bool libraries_only) try {
+    std::unique_ptr<EmissionBudget::Reservation> reservation, bool libraries_only,
+    TranslationRecord* record) try {
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
     size_t env_index{0};
@@ -4029,6 +4030,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
         ConvertLegacyToGeneric(program, runtime_info);
         PrepareStageBindings(binding, stage_index, use_libraries);
+        if (record) {
+            // EDEN_NX2_ASYNC_TRANSLATE=2: this stage's SPIR-V with the bindings the pipeline's
+            // own emission uses (from a copy, so they advance once).
+            Shader::Backend::Bindings record_binding = binding;
+            record->spirv[stage_index] = EmitSPIRV(profile, runtime_info, program, record_binding);
+            if (record->translate_only || (emit_pools && !VideoCommon::Nx2Perf::Verify())) {
+                // Nothing below advances them: the next stage starts where this one ended.
+                binding = record_binding;
+            }
+            if (record->translate_only) {
+                previous_stage = &program;
+                continue;
+            }
+        }
         if (emit_pools) {
             deferred_runtime_infos[stage_index] = runtime_info;
             if (VideoCommon::Nx2Perf::Verify()) {
@@ -4044,6 +4059,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
         }
         previous_stage = &program;
+    }
+    if (record) {
+        record->complete = true;
+        if (record->translate_only) {
+            return nullptr;
+        }
     }
     GraphicsPipeline::EmitStagesFunc emit_stages;
     if (emit_pools) {
@@ -4106,6 +4127,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         // A warm-up guess the translation rejects: no dump and no error per entry (the warm-up
         // counts them and logs the total when it ends).
         LOG_DEBUG(Render_Vulkan, "Warm graphics pipeline {}: {}", PipelineShaders(key),
+                  exception.what());
+        return nullptr;
+    }
+    if (record != nullptr && record->translate_only) {
+        // The verify mode's GPU-thread translation: the worker's logs and dumps this failure.
+        LOG_DEBUG(Render_Vulkan, "Verify translation of {}: {}", PipelineShaders(key),
                   exception.what());
         return nullptr;
     }
@@ -4319,6 +4346,48 @@ void PipelineCache::StoreRuntimeGraphicsPipeline(
     QueueVulkanPipelineCacheFlush();
 }
 
+namespace {
+// EDEN_NX2_ASYNC_TRANSLATE=2: translations compared and how many differed, logged every 10 s by
+// TickTranslations; the first 8 differences are logged by the translation thread that found them.
+std::atomic<u64> verify_compared{};
+std::atomic<u64> verify_differing{};
+std::atomic<u32> verify_logged{};
+
+/// The worker's translation against the GPU thread's: the SPIR-V of each stage word for word,
+/// then the reads each environment recorded. Empty when they match.
+std::string CompareTranslations(const TranslationJob& job) {
+    const TranslationRecord& reference = *job.reference;
+    const TranslationRecord& record = *job.record;
+    if (reference.complete != record.complete) {
+        return fmt::format("the translation {} on the GPU thread and {} on its thread",
+                           reference.complete ? "completed" : "failed",
+                           record.complete ? "completed" : "failed");
+    }
+    for (size_t stage = 0; stage < record.spirv.size(); ++stage) {
+        const auto& expected = reference.spirv[stage];
+        const auto& got = record.spirv[stage];
+        if (expected == got) {
+            continue;
+        }
+        const auto [mismatch, unused] = std::ranges::mismatch(expected, got);
+        return fmt::format("stage {} SPIR-V: {} words on the GPU thread, {} on its thread, first "
+                           "difference at word {}",
+                           stage, expected.size(), got.size(),
+                           std::distance(expected.begin(), mismatch));
+    }
+    for (size_t index = 0; index < job.envs.size(); ++index) {
+        if (job.key.unique_hashes[index] == 0) {
+            continue;
+        }
+        if (std::string difference = job.envs[index].FirstReadDifference(job.reference_envs[index]);
+            !difference.empty()) {
+            return fmt::format("program {} reads: {}", index, difference);
+        }
+    }
+    return {};
+}
+} // Anonymous namespace
+
 bool PipelineCache::EnqueueTranslation() {
     if (!DrawMayBeSkipped() || translate_sync_only.contains(graphics_key)) {
         return false;
@@ -4337,6 +4406,20 @@ bool PipelineCache::EnqueueTranslation() {
         GetGraphicsEnvironments(environments, graphics_key.unique_hashes, true);
     // A copy (environments declare a destructor, so they have no moves); the snapshot is shared.
     job->envs = environments.envs;
+    if (VideoCommon::AsyncTranslateMode() == 2) {
+        // Verify mode: the same draw translated here from the live state too, as the GPU thread
+        // would have, for the translation thread to compare with its own (SPIR-V and reads).
+        GraphicsEnvironments live;
+        GetGraphicsEnvironments(live, graphics_key.unique_hashes);
+        job->reference = std::make_unique<TranslationRecord>();
+        job->reference->translate_only = true;
+        main_pools.ReleaseContents();
+        [[maybe_unused]] const auto none =
+            CreateGraphicsPipeline(main_pools, graphics_key, live.Span(), nullptr, true, nullptr,
+                                   nullptr, false, job->reference.get());
+        job->reference_envs = live.envs;
+        job->record = std::make_unique<TranslationRecord>();
+    }
     const auto elapsed = std::chrono::steady_clock::now() - begin;
     translate_stats.enqueue_time += elapsed;
     frame_tally.queued_time += elapsed;
@@ -4418,6 +4501,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::AdoptJob(std::unique_ptr<Transl
     case TranslationJob::Outcome::Retry:
         ++translate_stats.gave_up;
         break;
+    case TranslationJob::Outcome::Differs:
+        // Verify mode: a snapshot gap (logged by the translation thread). Built on the GPU
+        // thread from the live state, now and from then on.
+        ++translate_stats.differs;
+        translate_sync_only.insert(job->key);
+        break;
     case TranslationJob::Outcome::NoPipeline:
     case TranslationJob::Outcome::Pending:
         ++translate_stats.no_pipeline;
@@ -4465,7 +4554,8 @@ void PipelineCache::TranslateOnWorker(TranslationJob& job) {
         t_translate_worker = false;
     };
     job.pipeline = CreateGraphicsPipeline(pools, job.key, MakeSpan(env_ptrs), nullptr, true,
-                                          std::move(emit_pools), std::move(reservation));
+                                          std::move(emit_pools), std::move(reservation), false,
+                                          job.record.get());
     if (std::ranges::any_of(job.envs, [](const GraphicsEnvironment& env) {
             return env.GuardedReadFailed();
         })) {
@@ -4473,6 +4563,24 @@ void PipelineCache::TranslateOnWorker(TranslationJob& job) {
         // the driver compile), translated again from a fresh snapshot.
         job.pipeline.reset();
         job.outcome = TranslationJob::Outcome::Retry;
+    } else if (job.reference && job.record) {
+        verify_compared.fetch_add(1, std::memory_order_relaxed);
+        if (const std::string difference = CompareTranslations(job); !difference.empty()) {
+            verify_differing.fetch_add(1, std::memory_order_relaxed);
+            if (verify_logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_WARNING(Render_Vulkan, "Async translate verify: {} differs: {}",
+                            PipelineShaders(job.key), difference);
+            }
+            // Never used: dropped here, built on the GPU thread from the live state.
+            job.pipeline.reset();
+            job.outcome = TranslationJob::Outcome::Differs;
+        }
+    }
+    // The comparison is done; the copies go with the job's snapshot bytes.
+    job.reference.reset();
+    job.record.reset();
+    for (GraphicsEnvironment& env : job.reference_envs) {
+        env = GraphicsEnvironment{};
     }
     for (GraphicsEnvironment& env : job.envs) {
         env.ReleaseSnapshotBytes();
@@ -4536,6 +4644,12 @@ void PipelineCache::TickTranslations() {
              ms(stats.translation_time), stats.skipped, stats.waits, ms(stats.wait_time),
              stats.fallbacks, stats.requeued, stats.stale, stats.gave_up, stats.no_pipeline,
              stats.swept, translate_queue->InFlight());
+    if (VideoCommon::AsyncTranslateMode() == 2) {
+        LOG_INFO(Render_Vulkan,
+                 "Async translate verify: {} compared, {} differ ({} rejected at adoption)",
+                 verify_compared.exchange(0, std::memory_order_relaxed),
+                 verify_differing.exchange(0, std::memory_order_relaxed), stats.differs);
+    }
     stats = {};
     stats.window = now;
 }

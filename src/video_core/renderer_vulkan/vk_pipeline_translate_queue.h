@@ -22,6 +22,15 @@
 
 namespace Vulkan {
 
+/// EDEN_NX2_ASYNC_TRANSLATE=2: what a graphics translation produced (CreateGraphicsPipeline's
+/// `record`), to compare the worker's with the GPU thread's.
+struct TranslationRecord {
+    /// SPIR-V of each stage, as emitted with the pipeline's bindings.
+    std::array<std::vector<u32>, 5> spirv;
+    bool complete{};       ///< The translation got as far as the SPIR-V of every stage
+    bool translate_only{}; ///< Stop there: no shader modules, no pipeline
+};
+
 /// One graphics pipeline translated off the GPU thread (EDEN_NX2_ASYNC_TRANSLATE).
 struct TranslationJob {
     enum class Outcome {
@@ -29,6 +38,7 @@ struct TranslationJob {
         Built,      ///< `pipeline` is the translated pipeline (its driver compile may still run)
         NoPipeline, ///< The translation made none (as the GPU thread's would have): left empty
         Retry,      ///< A guarded read gave up: translate again from a fresh snapshot
+        Differs,    ///< Verify mode: not what the GPU thread made from the live state; unused
     };
 
     GraphicsPipelineCacheKey key{};
@@ -38,6 +48,13 @@ struct TranslationJob {
     bool native{};  ///< A native draw asked for it (the emission budget's question)
     u32 attempt{};  ///< Translations of this key before this one (re-queues)
     std::chrono::steady_clock::time_point enqueued{};
+
+    /// Verify mode (EDEN_NX2_ASYNC_TRANSLATE=2): the GPU thread's translation of the same draw
+    /// from the live state, with the environments holding its recorded reads, and the record the
+    /// translation thread fills to compare with it.
+    std::unique_ptr<TranslationRecord> reference;
+    std::array<VideoCommon::GraphicsEnvironment, 6> reference_envs;
+    std::unique_ptr<TranslationRecord> record;
 
     // Written by the translation thread.
     Outcome outcome{Outcome::Pending};

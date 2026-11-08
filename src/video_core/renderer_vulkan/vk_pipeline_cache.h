@@ -97,6 +97,7 @@ class RenderPassCache;
 class Scheduler;
 class TranslateQueue;
 struct TranslationJob;
+struct TranslationRecord;
 
 using VideoCommon::ShaderInfo;
 
@@ -236,7 +237,7 @@ private:
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
         bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
         std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr,
-        bool libraries_only = false);
+        bool libraries_only = false, TranslationRecord* record = nullptr);
 
     /// Builds a disk-cached graphics pipeline from the first of its records (newest first) that
     /// loads. When none does, the GPU thread's build of it is stored again.
@@ -420,6 +421,7 @@ private:
         u32 no_pipeline{};
         u32 stale{};       ///< A texture descriptor changed before adoption
         u32 gave_up{};     ///< A guarded read gave up
+        u32 differs{};     ///< Verify mode: not what the GPU thread made
         u32 requeued{};
         u32 waits{};
         u32 fallbacks{};   ///< Built on the GPU thread after all
