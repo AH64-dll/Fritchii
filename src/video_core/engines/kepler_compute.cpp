@@ -61,10 +61,29 @@ struct FrontQmdMirror {
     struct Overlay {
         const void* space;
         GPUVAddr address;
-        u64 position; ///< The end of the 0x107 that writes it; 0 = empty
+        u64 position; ///< The end of the newest write it holds (0x107, upload); 0 = empty
+        /// Made by a 0x107 (which QueuedGuestWriters doesn't see), not from guest memory and a
+        /// patch: replacing it raises `evicted`.
+        bool inline_qmd;
         NativeQmdScheduler::Descriptor words;
     };
     static constexpr size_t MaxOverlays = 256; ///< #717 has 64; OoT keeps more in flight
+
+    /// A known linear compute inline upload's bytes (Ocarina uploads a 4 KB page of 16 QMDs with
+    /// one and patches their release words with small ones): a QMD read inside its filled bytes
+    /// takes them as an overlay's. Uploads are writer ranges, so a dropped one needs no floor.
+    struct Shadow {
+        const void* space;
+        GPUVAddr address;
+        u64 size;     ///< The upload's bytes
+        u64 filled;   ///< Of them, those its data words gave so far
+        u64 position; ///< The end of the newest write it holds (its upload, a patch); 0 = empty
+        u64 id;       ///< Which upload made it (FrontState::upload_shadow)
+        u64 last_use;
+        std::array<u8, 4096> bytes;
+    };
+    static constexpr size_t MaxShadows = 64;
+    static constexpr u64 ShadowBytes = 4096;
 
     FrontQmdMirror() {
         scheduler.table = &table;
@@ -76,8 +95,11 @@ struct FrontQmdMirror {
     bool synced{};   ///< The table matches the back's for the work sent
     bool disabled{}; ///< Auto-off, until EXP13 leaves 2
     std::array<Overlay, MaxOverlays> overlays{};
-    /// The newest position of an overlay replaced by another QMD's: reads of a QMD without an
-    /// overlay wait for it while it is queued.
+    std::array<Shadow, MaxShadows> shadows{};
+    u64 shadow_ids{};
+    u64 use_clock{};
+    /// The newest position of an inline QMD overlay replaced by another QMD's: reads of a QMD
+    /// without an overlay wait for it while it is queued.
     u64 evicted{};
     /// Reads in the current window, those that waited for queued writes, and resyncs; the
     /// reads of the session and the windows in a row over the auto-off limit.
@@ -96,7 +118,8 @@ struct FrontQmdMirror {
         return nullptr;
     }
 
-    void AddOverlay(const void* space, GPUVAddr address, u64 position, const u32* words) {
+    void AddOverlay(const void* space, GPUVAddr address, u64 position, const u32* words,
+                    bool inline_qmd) {
         Overlay* slot = nullptr;
         for (Overlay& overlay : overlays) {
             if (overlay.position != 0 && overlay.address == address && overlay.space == space) {
@@ -112,16 +135,83 @@ struct FrontQmdMirror {
                     slot = &overlay;
                 }
             }
-            evicted = (std::max)(evicted, slot->position);
+            if (slot->position != 0 && slot->inline_qmd) {
+                evicted = (std::max)(evicted, slot->position);
+            }
         }
         slot->space = space;
         slot->address = address;
         slot->position = position;
+        slot->inline_qmd = inline_qmd;
         std::memcpy(slot->words.data(), words, sizeof(slot->words));
     }
 
+    /// A shadow for the upload of `size` bytes at `address` (older ones it overlaps go).
+    /// `evicted_used`: an LRU shadow in use was replaced.
+    Shadow& NewShadow(const void* space, GPUVAddr address, u64 size, bool& evicted_used) {
+        for (Shadow& shadow : shadows) {
+            if (shadow.id != 0 && shadow.space == space && shadow.address < address + size &&
+                address < shadow.address + shadow.size) {
+                shadow.id = 0; // Its bytes are this upload's from here on
+                shadow.position = 0;
+            }
+        }
+        // A free slot, else the least recently used.
+        Shadow* slot = &shadows[0];
+        for (Shadow& shadow : shadows) {
+            if (shadow.id == 0) {
+                slot = &shadow;
+                break;
+            }
+            if (shadow.last_use < slot->last_use) {
+                slot = &shadow;
+            }
+        }
+        evicted_used = slot->id != 0;
+        slot->space = space;
+        slot->address = address;
+        slot->size = size;
+        slot->filled = 0;
+        slot->position = 0;
+        slot->id = ++shadow_ids;
+        slot->last_use = ++use_clock;
+        return *slot;
+    }
+
+    Shadow* FindShadowById(u64 id) {
+        if (id == 0) {
+            return nullptr;
+        }
+        for (Shadow& shadow : shadows) {
+            if (shadow.id == id) {
+                return &shadow;
+            }
+        }
+        return nullptr;
+    }
+
+    /// The newest shadow whose filled bytes hold all of [address, address + bytes).
+    Shadow* FindShadow(const void* space, GPUVAddr address, u64 bytes) {
+        Shadow* found = nullptr;
+        for (Shadow& shadow : shadows) {
+            if (shadow.id != 0 && shadow.position != 0 && shadow.space == space &&
+                shadow.address <= address && address + bytes <= shadow.address + shadow.filled &&
+                (found == nullptr || shadow.position > found->position)) {
+                found = &shadow;
+            }
+        }
+        return found;
+    }
+
     void Clear() {
-        overlays = {};
+        // In place: the tables are large (a temporary would be on the stack).
+        for (Overlay& overlay : overlays) {
+            overlay.position = 0;
+        }
+        for (Shadow& shadow : shadows) {
+            shadow.id = 0;
+            shadow.position = 0;
+        }
         evicted = 0;
     }
 
@@ -1517,6 +1607,8 @@ struct KeplerCompute::FrontState {
     /// whether it is linear and one line (its bytes land at upload_address as they are).
     u64 upload_offset{};
     bool upload_contiguous{};
+    /// EXP13=2: the shadow of the upload (FrontQmdMirror::Shadow::id), 0 for none.
+    u64 upload_shadow{};
 };
 
 namespace {
@@ -1891,7 +1983,7 @@ void KeplerCompute::FrontMirrorQmd(VideoCommon::GpuSplit& split, const FrontStat
     }
     if (g_front_qmd.synced) {
         g_front_qmd.AddOverlay(&memory_manager, address, split.SentPosition(),
-                               fs.registers.data() + 0xc8);
+                               fs.registers.data() + 0xc8, true);
     }
     if ((fs.registers[0xa7] & (1U << 24)) == 0 && (fs.registers[0xcc] & (1U << 12)) != 0) {
         return; // Launched later, by 0xaf or 0xb0
@@ -2004,16 +2096,32 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
     const auto writers = split.QueuedGuestWriters(done, address, *device, size);
     u64 target = (std::max)(writers.noted, writers.unbounded);
     const FrontQmdMirror::Overlay* const overlay = mirror.FindOverlay(&memory_manager, address);
-    if (overlay != nullptr && overlay->position > done) {
-        if (target <= overlay->position) {
-            // The inline QMD written last over it, nothing queued after it that may write there:
-            // the back finds exactly its words (0x107 writes all 256 bytes).
-            descriptor = overlay->words;
-            Prediction::NoteMirror(Prediction::Mirror::Overlay);
-            return true;
-        }
-    } else if (overlay == nullptr && mirror.evicted > done) {
+    // The inline QMD or upload written last over it, nothing queued after it that may write
+    // there: the back finds exactly its words (0x107 writes all 256 bytes, the shadow's upload
+    // all of its filled bytes; the patches since are applied to both).
+    const bool overlay_ok =
+        overlay != nullptr && overlay->position > done && target <= overlay->position;
+    if (overlay == nullptr && mirror.evicted > done) {
         target = (std::max)(target, mirror.evicted); // Its inline QMD may have been evicted
+    }
+    // An inline QMD queued over it is no writer QueuedGuestWriters sees: newer than the shadow,
+    // it wins (or, if its overlay can't serve the read, the read waits).
+    const u64 inline_position =
+        overlay != nullptr && overlay->inline_qmd && overlay->position > done ? overlay->position
+                                                                              : 0;
+    FrontQmdMirror::Shadow* const shadow = mirror.FindShadow(&memory_manager, address, size);
+    const bool shadow_ok = shadow != nullptr && shadow->position > done &&
+                           (std::max)(target, inline_position) <= shadow->position;
+    if (overlay_ok && (!shadow_ok || overlay->position >= shadow->position)) {
+        descriptor = overlay->words;
+        Prediction::NoteMirror(Prediction::Mirror::Overlay);
+        return true;
+    }
+    if (shadow_ok) {
+        std::memcpy(descriptor.data(), shadow->bytes.data() + (address - shadow->address), size);
+        shadow->last_use = ++mirror.use_clock;
+        Prediction::NoteMirror(Prediction::Mirror::Shadow);
+        return true;
     }
     if (target > done) {
         // What set the target, for the wait cause histogram.
@@ -2038,12 +2146,15 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
                 LOG_INFO(HW_GPU,
                          "QMD release prediction (EXP13=2): QMD {:#x} read waits on a writer "
                          "range: {} at byte {} of the QMD, {} bytes, {} ring words ahead of the "
-                         "back; overlay {}",
+                         "back; overlay {}, upload shadow {}",
                          address, kind < kinds.size() ? kinds[kind] : "?", offset, range_size,
                          target - done,
                          overlay == nullptr               ? "none"
                          : overlay->position > done       ? "queued"
-                                                          : "already run");
+                                                          : "already run",
+                         shadow == nullptr          ? "none"
+                         : shadow->position > done  ? "queued, older than the writer"
+                                                    : "already run");
             }
         }
         ++mirror.window_waits;
@@ -2066,22 +2177,87 @@ void KeplerCompute::FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState&
                                        const u32* words, u32 count) const {
     // As Upload::State::ProcessData: the data words fill the upload's bytes in order, four each
     // (the last one partly); a linear one-line upload writes them at its destination as they are.
+    namespace Prediction = VideoCommon::QmdPrediction;
     const u64 begin = fs.upload_offset;
     const u64 end = (std::min)(fs.upload_size, begin + u64{count} * sizeof(u32));
     fs.upload_offset = (std::max)(begin, end);
     auto& mirror = g_front_qmd;
-    if (!fs.upload_known || !fs.upload_contiguous || begin >= end || !mirror.synced) {
+    if (!fs.upload_known || begin >= end || !mirror.synced) {
         return;
     }
-    // The game patches the release words of QMDs a 0x107 already wrote (native_qmd.h: "The SDK
-    // patches release payloads while a scheduled QMD is waiting"): an overlay that still holds
-    // its QMD (its 0x107 queued, nothing else queued writing it) takes the words, and counts as
-    // written by this upload, so a read takes it instead of waiting.
+    constexpr u64 size = sizeof(NativeQmdScheduler::Descriptor);
+    if (begin == 0 && fs.upload_size >= size) {
+        // An upload that may hold QMDs: shadowed when its bytes land as they are.
+        if (!fs.upload_contiguous) {
+            Prediction::NoteMirror(Prediction::Mirror::ShadowNotLinear);
+        } else if (fs.upload_size > FrontQmdMirror::ShadowBytes) {
+            Prediction::NoteMirror(Prediction::Mirror::ShadowTooBig);
+        } else {
+            bool evicted_used = false;
+            fs.upload_shadow =
+                mirror.NewShadow(&memory_manager, fs.upload_address, fs.upload_size, evicted_used)
+                    .id;
+            Prediction::NoteMirror(Prediction::Mirror::ShadowCreated);
+            if (evicted_used) {
+                Prediction::NoteMirror(Prediction::Mirror::ShadowEvicted);
+            }
+        }
+    }
+    if (!fs.upload_contiguous) {
+        return;
+    }
     const GPUVAddr first = fs.upload_address + begin;
     const GPUVAddr last = fs.upload_address + end;
     const u64 done = split.ConsumedNow();
     const u64 position = split.SentPosition();
-    constexpr u64 size = sizeof(NativeQmdScheduler::Descriptor);
+    const u8* const data = reinterpret_cast<const u8*>(words);
+    // Its own shadow takes its words.
+    FrontQmdMirror::Shadow* const own = mirror.FindShadowById(fs.upload_shadow);
+    if (own != nullptr) {
+        std::memcpy(own->bytes.data() + begin, data, end - begin);
+        own->filled = end;
+        own->position = position;
+        own->last_use = ++mirror.use_clock;
+    }
+    // The game patches the release words of QMDs already written (native_qmd.h: "The SDK
+    // patches release payloads while a scheduled QMD is waiting"): an overlay or shadow that
+    // still holds its bytes (its write queued, nothing else queued writing them) takes the
+    // words, and counts as written by this upload, so a read takes it instead of waiting.
+    const auto still_holds = [&](GPUVAddr address, u64 bytes, u64 held_position) {
+        const auto device = memory_manager.GpuToCpuAddress(address);
+        if (!device || held_position <= done) {
+            return false;
+        }
+        const auto writers = split.QueuedGuestWriters(done, address, *device, bytes,
+                                                      std::span<const u64>{&position, 1});
+        return (std::max)(writers.noted, writers.unbounded) <= held_position;
+    };
+    std::array<bool, 2> block_patched{}; // The (at most two) QMD blocks of a small patch
+    const GPUVAddr first_block = first & ~GPUVAddr{size - 1};
+    const auto note_patched = [&](GPUVAddr address, u64 bytes) {
+        for (u64 block = 0; block < block_patched.size(); ++block) {
+            const GPUVAddr block_address = first_block + block * size;
+            if (address <= block_address && block_address + size <= address + bytes) {
+                block_patched[block] = true;
+            }
+        }
+    };
+    for (FrontQmdMirror::Shadow& shadow : mirror.shadows) {
+        if (&shadow == own || shadow.id == 0 || shadow.position == 0 ||
+            shadow.space != &memory_manager || last <= shadow.address ||
+            shadow.address + shadow.filled <= first ||
+            !still_holds(shadow.address, shadow.filled, shadow.position)) {
+            continue;
+        }
+        const GPUVAddr from = (std::max)(first, shadow.address);
+        const GPUVAddr to = (std::min)(last, shadow.address + shadow.filled);
+        std::memcpy(shadow.bytes.data() + (from - shadow.address), data + (from - first),
+                    to - from);
+        shadow.position = position;
+        shadow.last_use = ++mirror.use_clock;
+        note_patched(shadow.address, shadow.filled);
+        Prediction::NoteMirror(Prediction::Mirror::ShadowPatched);
+    }
     for (FrontQmdMirror::Overlay& overlay : mirror.overlays) {
         if (overlay.position == 0 || overlay.space != &memory_manager ||
             last <= overlay.address || overlay.address + size <= first ||
@@ -2100,9 +2276,46 @@ void KeplerCompute::FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState&
         const GPUVAddr from = (std::max)(first, overlay.address);
         const GPUVAddr to = (std::min)(last, overlay.address + size);
         std::memcpy(reinterpret_cast<u8*>(overlay.words.data()) + (from - overlay.address),
-                    reinterpret_cast<const u8*>(words) + (from - first), to - from);
+                    data + (from - first), to - from);
         overlay.position = position;
-        VideoCommon::QmdPrediction::NoteMirror(VideoCommon::QmdPrediction::Mirror::Patched);
+        note_patched(overlay.address, size);
+        Prediction::NoteMirror(Prediction::Mirror::Patched);
+    }
+    // A small patch of a QMD nothing above holds: when guest memory holds the QMD now (nothing
+    // else queued writes it, not GPU-written, no inline QMD of it queued or evicted), an overlay
+    // from memory with the patch over it.
+    if (own != nullptr || fs.upload_size >= size) {
+        return;
+    }
+    for (u64 block = 0; block < block_patched.size(); ++block) {
+        const GPUVAddr block_address = first_block + block * size;
+        if (block_patched[block] || last <= block_address) {
+            continue;
+        }
+        const auto device = memory_manager.GpuToCpuAddress(block_address);
+        if (!device || !memory_manager.IsFullyMappedRange(block_address, size) ||
+            Nx2MayBeGpuWritten(*device, size)) {
+            continue;
+        }
+        const FrontQmdMirror::Overlay* const existing =
+            mirror.FindOverlay(&memory_manager, block_address);
+        if ((existing != nullptr && existing->position > done) ||
+            (existing == nullptr && mirror.evicted > done)) {
+            continue; // Its inline QMD may still be queued
+        }
+        const auto writers = split.QueuedGuestWriters(done, block_address, *device, size,
+                                                      std::span<const u64>{&position, 1});
+        if (writers.noted != 0 || writers.unbounded != 0) {
+            continue;
+        }
+        NativeQmdScheduler::Descriptor qmd{};
+        memory_manager.ReadBlockUnsafe(block_address, qmd.data(), size);
+        const GPUVAddr from = (std::max)(first, block_address);
+        const GPUVAddr to = (std::min)(last, block_address + size);
+        std::memcpy(reinterpret_cast<u8*>(qmd.data()) + (from - block_address),
+                    data + (from - first), to - from);
+        mirror.AddOverlay(&memory_manager, block_address, position, qmd.data(), false);
+        Prediction::NoteMirror(Prediction::Mirror::OverlayFromMemory);
     }
 }
 
@@ -2117,7 +2330,9 @@ void KeplerCompute::FrontNoteUpload(FrontState& fs, u32 exec) {
     fs.upload_size = 0;
     fs.upload_known = true;
     fs.upload_offset = 0;
-    fs.upload_contiguous = (exec & 1) != 0 && lines == 1;
+    fs.upload_shadow = 0;
+    // Linear, one line or lines back to back: its bytes land at upload_address as they come.
+    fs.upload_contiguous = (exec & 1) != 0 && (lines == 1 || reg(4) == line_length);
     if (line_length == 0 || lines == 0) {
         return; // Writes nothing (copy_size 0)
     }
