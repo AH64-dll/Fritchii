@@ -405,6 +405,43 @@ public:
         return frame_tick;
     }
 
+    /// What a clear's render target lookups did (RasterizerVulkan::Clear's "Slow clear" line):
+    /// ResetRenderTargetStats before UpdateRenderTargets, TakeRenderTargetStats after
+    /// GetFramebuffer. Counts and times of JoinImages, RemoveFramebuffers and GetFramebufferId.
+    struct RenderTargetStats {
+        u64 images_created{};
+        u64 images_deleted{};
+        u64 uploaded_bytes{};
+        u32 joins{};
+        u32 overlaps_walked{};      ///< Images region_check looked at
+        u32 bad_overlaps{};
+        u32 framebuffers_removed{};
+        u32 framebuffers_scanned{}; ///< Framebuffer map entries RemoveFramebuffers looked at
+        u32 framebuffers_created{};
+        u32 pooled_images{};        ///< New images that took a pooled VkImage (EXP42)
+        u64 walk_ns{};              ///< JoinImages' overlap walk
+        u64 create_ns{};            ///< Making the new image (vkCreateImage, memory)
+        u64 refresh_ns{};           ///< Its upload (RefreshContents) or layout transition
+        u64 delete_ns{};            ///< Deleting the images it replaced
+        u64 framebuffer_ns{};       ///< New framebuffers
+        u64 framebuffer_map_size{}; ///< At TakeRenderTargetStats
+        u64 image_count{};
+    };
+    void ResetRenderTargetStats() noexcept {
+        rt_stats = {};
+        rt_stats_base = {images_created, images_deleted, uploaded_bytes};
+    }
+    [[nodiscard]] RenderTargetStats TakeRenderTargetStats() const noexcept {
+        RenderTargetStats stats = rt_stats;
+        const auto delta = [](u64 now, u64 base) { return now >= base ? now - base : now; };
+        stats.images_created = delta(images_created, rt_stats_base[0]);
+        stats.images_deleted = delta(images_deleted, rt_stats_base[1]);
+        stats.uploaded_bytes = delta(uploaded_bytes, rt_stats_base[2]);
+        stats.framebuffer_map_size = framebuffers.size();
+        stats.image_count = slot_images.size();
+        return stats;
+    }
+
     Common::SpinRecursiveMutex mutex;
 
 private:
@@ -768,6 +805,9 @@ private:
     };
     boost::container::small_vector<JoinCopy, 4> join_copies_to_do;
     ::Common::unordered_map<ImageId, size_t> join_alias_indices;
+
+    RenderTargetStats rt_stats;
+    std::array<u64, 3> rt_stats_base{}; ///< images_created, images_deleted, uploaded_bytes
 };
 
 } // namespace VideoCommon

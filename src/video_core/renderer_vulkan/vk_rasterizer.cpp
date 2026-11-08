@@ -1400,6 +1400,8 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     gpu_memory->FlushCaching();
     const auto clear_flushed = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point clear_targets_ready{};
+    // What the texture cache did for this clear's targets (JoinImages, framebuffers).
+    std::optional<TextureCache::RenderTargetStats> clear_tc_stats;
     SCOPE_EXIT {
         const auto end = std::chrono::steady_clock::now();
         const auto us = [](auto d) {
@@ -1430,6 +1432,21 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                  r.rt[0].Address(), r.rt[0].width, r.rt[0].height, static_cast<u32>(r.rt[0].format),
                  r.zeta.Address(), r.zeta_enable ? "on" : "off", static_cast<u32>(r.zeta.format),
                  r.clear_surface.raw, layer_count);
+        if (clear_tc_stats) {
+            const auto& s = *clear_tc_stats;
+            const auto ns_us = [](u64 ns) { return ns / 1000; };
+            LOG_INFO(Render_Vulkan,
+                     "Slow clear texture cache: {} joins, {} created ({} pooled), {} deleted, {} "
+                     "overlaps walked ({} bad), {} KiB uploaded; framebuffers {} created, {} "
+                     "removed, {} scanned, {} in the map; {} images; walk {} us, create {} us, "
+                     "upload {} us, delete {} us, framebuffers {} us",
+                     s.joins, s.images_created, s.pooled_images, s.images_deleted,
+                     s.overlaps_walked, s.bad_overlaps, s.uploaded_bytes >> 10,
+                     s.framebuffers_created, s.framebuffers_removed, s.framebuffers_scanned,
+                     s.framebuffer_map_size, s.image_count,
+                     ns_us(s.walk_ns), ns_us(s.create_ns), ns_us(s.refresh_ns),
+                     ns_us(s.delete_ns), ns_us(s.framebuffer_ns));
+        }
     };
 
     auto& regs = maxwell3d->regs;
@@ -1442,9 +1459,11 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     }
 
     std::scoped_lock lock{texture_cache.mutex};
+    texture_cache.ResetRenderTargetStats();
     texture_cache.UpdateRenderTargets(true);
     clear_targets_ready = std::chrono::steady_clock::now();
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
+    clear_tc_stats = texture_cache.TakeRenderTargetStats();
     if (frame_dump.Capturing() || flash_watch.WatchesPasses()) {
         FrameDumpPass(framebuffer);
     }

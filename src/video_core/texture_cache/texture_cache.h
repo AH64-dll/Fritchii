@@ -57,6 +57,13 @@ using VideoCore::Surface::PixelFormat;
 using VideoCore::Surface::SurfaceType;
 using namespace Common::Literals;
 
+/// Nanoseconds since `start` (the render target statistics of the slow clear log).
+[[nodiscard]] inline u64 NsSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count());
+}
+
 template <class P>
 TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManager& device_memory_)
     : runtime{runtime_}, device_memory{device_memory_} {
@@ -508,14 +515,21 @@ void TextureCache<P>::TickFrame() {
                     critical_memory =
                         budget - (std::min)(margin + pressure_margin + slack_margin, budget / 2);
                     expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
+                    ApplyThresholdOverrides(false);
                     // Log the first values and real changes (the budget moves by a few MiB all
-                    // the time).
+                    // the time). Compared after the overrides: the value before them is above
+                    // the 5/8-of-budget cap on large cards, so every check looked like a change
+                    // and logged the same thresholds every 30 frames.
                     const u64 change = critical_memory > old_critical
                                            ? critical_memory - old_critical
                                            : old_critical - critical_memory;
                     const bool log = budget_check_frames == 1 || change >= 256_MiB;
-                    ApplyThresholdOverrides(log);
                     if (log) {
+                        LOG_INFO(HW_GPU,
+                                 "Texture cache thresholds: expected {} MiB, critical {} MiB, "
+                                 "minimum {} MiB",
+                                 expected_memory >> 20, critical_memory >> 20,
+                                 minimum_memory >> 20);
                         LOG_INFO(HW_GPU,
                                  "Memory margins: base {} MiB, out of memory {} MiB, block slack {} MiB",
                                  margin >> 20, pressure_margin >> 20, slack_margin >> 20);
@@ -1371,8 +1385,11 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
         return id ? &slot_image_views[id] : nullptr;
     });
     ImageView* const depth_buffer = key.depth_buffer_id ? &slot_image_views[key.depth_buffer_id] : nullptr;
+    const auto framebuffer_start = std::chrono::steady_clock::now();
     runtime.FlushDeferredClear();
     framebuffer_id = slot_framebuffers.insert(runtime, color_buffers, depth_buffer, key);
+    ++rt_stats.framebuffers_created;
+    rt_stats.framebuffer_ns += NsSince(framebuffer_start);
     return framebuffer_id;
 }
 
@@ -3091,8 +3108,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     join_bad_overlap_ids.clear();
     join_copies_to_do.clear();
     join_alias_indices.clear();
+    ++rt_stats.joins;
+    const auto walk_start = std::chrono::steady_clock::now();
     const bool this_is_linear = info.type == ImageType::Linear;
     const auto region_check = [&](ImageId overlap_id, ImageBase& overlap) {
+        ++rt_stats.overlaps_walked;
         if (True(overlap.flags & ImageFlagBits::Remapped)) {
             join_ignore_textures.insert(overlap_id);
             return;
@@ -3148,6 +3168,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     };
     ForEachSparseImageInRegion(channel_state->gpu_memory.GetID(), gpu_addr, size_bytes,
                                region_check_gpu);
+    rt_stats.walk_ns += NsSince(walk_start);
+    rt_stats.bad_overlaps += static_cast<u32>(join_bad_overlap_ids.size());
 
     bool can_rescale = info.rescaleable;
     bool any_rescaled = false;
@@ -3188,7 +3210,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
+    const auto create_start = std::chrono::steady_clock::now();
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
+    rt_stats.create_ns += NsSince(create_start);
     if constexpr (requires(const Image& image) { image.OutOfMemory(); }) {
         if (slot_images[new_image_id].OutOfMemory()) {
             // Left out of the cache: lookups see no image (a null view) and make it again once
@@ -3227,6 +3251,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         new_image.flags |= ImageFlagBits::Sparse;
     }
 
+    const auto ignored_delete_start = std::chrono::steady_clock::now();
     for (const ImageId overlap_id : join_ignore_textures) {
         Image& overlap = slot_images[overlap_id];
         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
@@ -3238,6 +3263,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         UnregisterImage(overlap_id);
         DeleteImage(overlap_id);
     }
+    rt_stats.delete_ns += NsSince(ignored_delete_start);
 
     // A new render target that the clear binding it overwrites whole (every channel, the whole
     // image) needs no upload from guest memory first: Ocarina of Time creates ~4 such targets a
@@ -3388,6 +3414,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                                     : "done");
         }
     }
+    const auto refresh_start = std::chrono::steady_clock::now();
     if (clear_skip) {
         // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when
         // IsFullClear agrees the clear covers the whole image, and uploads it otherwise.
@@ -3401,6 +3428,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         // TODO: Only upload what we need
         RefreshContents(new_image, new_image_id);
     }
+    rt_stats.refresh_ns += NsSince(refresh_start);
 
     if (can_rescale) {
         ScaleUp(new_image);
@@ -3447,6 +3475,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     }
 
+    const auto joined_delete_start = std::chrono::steady_clock::now();
     for (const auto& copy_object : join_copies_to_do) {
         Image& overlap = slot_images[copy_object.id];
         if (copy_object.is_alias) {
@@ -3485,6 +3514,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         UnregisterImage(copy_object.id);
         DeleteImage(copy_object.id);
     }
+    rt_stats.delete_ns += NsSince(joined_delete_start);
 
     RegisterImage(new_image_id);
     return new_image_id;
@@ -4244,9 +4274,11 @@ void TextureCache<P>::RemoveImageViewReferences(std::span<const ImageViewId> rem
 template <class P>
 void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_views) {
     runtime.FlushDeferredClear();
+    rt_stats.framebuffers_scanned += static_cast<u32>(framebuffers.size());
     auto it = framebuffers.begin();
     while (it != framebuffers.end()) {
         if (it->first.Contains(removed_views)) {
+            ++rt_stats.framebuffers_removed;
             auto framebuffer_id = it->second;
             ASSERT(framebuffer_id);
             if (framebuffer_id == last_framebuffer_id) {
