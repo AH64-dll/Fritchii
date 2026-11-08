@@ -7,6 +7,12 @@
 #include <chrono>
 #include <cstdlib>
 #include <thread>
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define NX2_IDLE_HAS_PAUSE 1
+#elif defined(__aarch64__)
+#define NX2_IDLE_HAS_PAUSE 1
+#endif
 #include "common/nx2_timeline.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -17,8 +23,37 @@
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/physical_core.h"
 #include "core/hle/kernel/svc.h"
+#include "video_core/nx2_debug_control.h"
 
 namespace Kernel {
+
+namespace {
+
+/// EDEN_NX2_IDLE_PAUSE=1 (live, VideoCore::Nx2Debug::g_idle_pause, off by default; from
+/// zortos293/Lichii#641, where it is on): Idle's poll runs PAUSE instead of SwitchToThread, so
+/// there is no syscall per iteration (10-16% of each guest core in Castle Town), and reads the
+/// clock only every 16 pauses instead of every iteration. The poll stays bounded by time: 16
+/// pauses are ~2,200 cycles on Intel Skylake and later (~140 each) and far fewer on AMD (~10-60
+/// each), so the deadline overshoots by well under a microsecond. Hosts without a pause hint keep
+/// the yield loop.
+bool IdlePauseOn() {
+#if defined(NX2_IDLE_HAS_PAUSE)
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_idle_pause,
+                                            "EDEN_NX2_IDLE_PAUSE", 0) > 0;
+#else
+    return false;
+#endif
+}
+
+void IdlePause() {
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+    _mm_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield");
+#endif
+}
+
+} // Anonymous namespace
 
 PhysicalCore::PhysicalCore(KernelCore& kernel, std::size_t core_index)
     : m_core_index{core_index}
@@ -247,9 +282,19 @@ void PhysicalCore::Idle(KernelCore& kernel) {
     const auto spin = std::chrono::microseconds{spin_us};
     if (spin.count() > 0) {
         const auto deadline = std::chrono::steady_clock::now() + spin;
-        while (!m_is_interrupted.load(std::memory_order_acquire) &&
-               std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::yield();
+        if (IdlePauseOn()) {
+            // EDEN_NX2_IDLE_PAUSE: the interrupt flag after every pause, the clock every 16.
+            for (u32 n = 1; !m_is_interrupted.load(std::memory_order_acquire); ++n) {
+                IdlePause();
+                if ((n & 15) == 0 && std::chrono::steady_clock::now() >= deadline) {
+                    break;
+                }
+            }
+        } else {
+            while (!m_is_interrupted.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
         }
     }
     std::unique_lock lk{m_guard};
