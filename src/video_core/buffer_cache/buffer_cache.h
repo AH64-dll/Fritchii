@@ -2432,7 +2432,7 @@ void BufferCache<P>::UpdateComputeUniformBuffers() {
         const auto& launch_desc = kepler_compute->launch_description;
         const bool enabled = ((launch_desc.const_buffer_enable_mask >> index) & 1) != 0;
         const GPUVAddr cbuf_addr = enabled ? launch_desc.const_buffer_config[index].Address() : 0;
-        const u32 cbuf_size = enabled ? launch_desc.const_buffer_config[index].size : 0;
+        const u32 cbuf_size = enabled ? launch_desc.const_buffer_config[index].size.Value() : 0;
         // The same constant buffer as this slot's previous dispatch (EDEN_NX2_COMPUTE_BINDCACHE).
         GeometryMemo& memo = compute_uniform_memo[index];
         if (Nx2BufCache::g_compute_bindcache && enabled &&
