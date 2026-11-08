@@ -125,6 +125,10 @@ inline std::atomic<int> g_host_pace{-1};
 /// EXP23 = 1: trim unused pipeline libraries every 600 frames past 4096 (#579 stage B;
 /// PipelineCache::TickFrame, GraphicsPipelineLibraryCache::TrimUnused). Off by default, not
 /// measured yet.
+/// EXP24 = 1: Ocarina of Time's present poll (`while (nvnEventGetValue(e) != 1) SleepThread(1 ms)`
+/// at main+0x590500, from Hookshot) sleeps until the GPU's next write of a 1 instead, at most
+/// 1 ms (core/hle/kernel/svc/svc_nx2_oot_present.cpp; build E0F3CCFA... only). Logs "OoT present
+/// poll (EXP24)" counts every 10 s. Off by default, not measured yet.
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 

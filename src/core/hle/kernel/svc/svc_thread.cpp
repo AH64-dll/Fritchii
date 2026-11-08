@@ -16,6 +16,7 @@
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/svc/svc_nx2_oot_present.h"
 #include "core/hle/kernel/thread_startup_policy.h"
 
 namespace Kernel::Svc {
@@ -169,6 +170,11 @@ void SleepThread(Core::System& system, s64 ns) {
 
     // When the input tick is positive, sleep.
     if (ns > 0) {
+        // Ocarina of Time's present poll waits for the GPU's write instead (EXP24, off by default).
+        if (SleepNx2OotPresentPoll(system, ns)) {
+            return;
+        }
+
         // Convert the timeout from nanoseconds to ticks.
         // NOTE: Nintendo does not use this conversion logic in WaitSynchronization...
         s64 timeout;
