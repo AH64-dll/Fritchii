@@ -252,13 +252,13 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
         rasterizer->SignalFence([this, address, payload, reduction] {
             const u32 value = ReduceSemaphore(reduction, false, memory_manager.Read<u32>(address),
                                               payload);
-            memory_manager.Write<u32>(address, value);
-            // EXP13=2: counted as landed for the reduction bound's records (nothing else).
-            if (VideoCommon::QmdPrediction::MirrorMode()) {
+            // EXP13=2: marked before the word is written (nx2.h); counting only.
+            if (Tegra::Nx2LandedHooked()) [[unlikely]] {
                 if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                    Tegra::Nx2NoteLanded(*device, value);
+                    Tegra::Nx2NoteLanded(*device, value, Tegra::Nx2Landing::Reduction);
                 }
             }
+            memory_manager.Write<u32>(address, value);
             if (Common::Nx2GpuWrite::g_listener.load(std::memory_order_relaxed) != nullptr) {
                 Common::Nx2GpuWrite::Notify(Common::Nx2GpuWrite::Path::ComputeReduce,
                                             memory_manager.GpuToCpuAddress(address).value_or(0),
@@ -544,6 +544,12 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     rasterizer->SignalFence([this, address, payload, flags] {
                         const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
                                                           memory_manager.Read<u32>(address), payload);
+                        // EXP13=2: marked before the word is written (nx2.h); counting only.
+                        if (Tegra::Nx2LandedHooked()) [[unlikely]] {
+                            if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                                Tegra::Nx2NoteLanded(*device, value, Tegra::Nx2Landing::Reduction);
+                            }
+                        }
                         memory_manager.Write<u32>(address, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
@@ -571,6 +577,12 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // GEQ acquires waiting forever.
                     rasterizer->SignalFence([this, address, payload] {
                         const u32 value = (std::max)(memory_manager.Read<u32>(address), payload);
+                        // EXP13=2: marked before the word is written (nx2.h); counting only.
+                        if (Tegra::Nx2LandedHooked()) [[unlikely]] {
+                            if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                                Tegra::Nx2NoteLanded(*device, value, Tegra::Nx2Landing::Max);
+                            }
+                        }
                         memory_manager.Write<u32>(address, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);

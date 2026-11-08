@@ -8,7 +8,6 @@
 #include <mutex>
 #include <span>
 #include <string>
-#include <unordered_map>
 #include <utility>
 
 #include <fmt/format.h>
@@ -30,14 +29,13 @@ struct Prediction {
     u64 sequence; ///< Order of the records (positions repeat within one entry)
     u32 payload;
     u32 before;   ///< EXP13=2: the word in guest memory when it was sent
-    /// EXP13=2: its place among the records of its word (State::words): landed once that many
-    /// of the word's records landed.
-    u64 nth;
     Writer writer;
     Kind kind;
     u8 op;
     bool is_signed;
     bool stale;
+    bool landed;  ///< EXP13=2: its write landed (NoteLanded, marked before the word is written)
+    bool matched; ///< EXP13=2: the back made it (Verify)
 };
 
 struct Release {
@@ -174,13 +172,37 @@ struct State {
     u32 differs_logged{};
     u32 unpredicted_logged{};
     u32 violated_logged{};
-    /// Exact landed tracking: the records sent and landed per word (NoteLanded), by device.
-    struct Landings {
-        u64 sent;
-        u64 landed;
-    };
-    std::unordered_map<u64, Landings> words;
     u64 foreign_landings{};
+    u32 foreign_logged{};
+    /// The newest plain record evicted before it landed, per bucket (its device; 0 for none):
+    /// the word gets no bound until a plain landing there is attributed to it.
+    std::array<u64, Buckets> evicted_plain{};
+    u64 evicted_unlanded{};
+    /// Back: reductions the copy predicted (Verify matches them too).
+    u64 matched_reductions{};
+    u64 differs_reductions{};
+    u64 unpredicted_reductions{};
+    u32 unpredicted_reductions_logged{};
+    /// Records the back never made, swept once it ran well past them (Note).
+    u64 phantoms{};
+    u32 phantoms_logged{};
+    size_t sweep_bucket{};
+    /// Whole-session totals of the safety check (never reset by the 5 s report).
+    u64 session_checked{};
+    u64 session_violated{};
+    u64 session_unlanded{};
+    u64 session_foreign{};
+    u64 session_phantoms{};
+    /// Waits on writer ranges, by (kind, word offset in the QMD, size).
+    struct RangeWait {
+        u32 kind;
+        s64 word;
+        u64 size;
+        u64 count;
+    };
+    std::array<RangeWait, 24> range_waits{};
+    size_t range_wait_count{};
+    u64 range_waits_other{};
     std::array<u64, static_cast<size_t>(GuestWriterCause::Count)> wait_causes{};
     std::array<std::pair<const char*, u64>, 8> wait_whats{};
     u64 wait_whats_other{};
@@ -254,7 +276,8 @@ struct State {
                  "({:.0f} max releases as lower bounds, {:.0f} maybe stale QMD; not predicted: "
                  "{:.0f} reductions, {:.0f} unmapped), {:.0f} copy semaphores predicted/s; back "
                  "QMD: {:.0f} matched, {:.0f} payload differs ({:.0f} maybe stale QMD), {:.0f} "
-                 "unpredicted ({:.0f} table full), {:.0f} reductions; back copies: {:.0f} "
+                 "unpredicted ({:.0f} table full), {:.0f} reductions ({:.0f} matched, {:.0f} "
+                 "payload differs, {:.0f} unpredicted); back copies: {:.0f} "
                  "matched, {:.0f} payload differs, {:.0f} unpredicted; unmet acquires: {:.0f} "
                  "would be met by a predicted queued release, {:.0f} wrong value, {:.0f} already "
                  "ran ({:.0f} landed pending, {:.0f} really wrong), {:.0f} no prediction, {:.0f} "
@@ -263,14 +286,16 @@ struct State {
                  "({:.0f} of the met by a release run before the check), {:.0f} still unmet; "
                  "QMD copy: QMD reads/s "
                  "{:.0f} from inline QMDs, {:.0f} from memory, {:.0f} after a wait; {:.0f} "
-                 "resyncs/s, {:.0f} starts, {:.0f} auto-off; reduction bound would meet: {:.0f} "
+                 "inline QMDs patched by uploads/s; {:.0f} resyncs/s, {:.0f} starts, {:.0f} "
+                 "auto-off; reduction bound would meet: {:.0f} "
                  "GEQ, {:.0f} EQ, {:.0f} MASK",
                  Mode(), signal(Signal::Read), signal(Signal::Waiting), signal(Signal::Chained),
                  signal(Signal::Unmapped), rate(predicted[qmd]), rate(predicted_at_least),
                  rate(predicted_stale), rate(reductions), rate(unmapped_releases),
                  rate(predicted[dma]), rate(matched[qmd]), rate(differs[qmd]),
                  rate(differs_stale), rate(unpredicted[qmd]), rate(unpredicted_full),
-                 rate(back_reductions), rate(matched[dma]), rate(differs[dma]),
+                 rate(back_reductions), rate(matched_reductions), rate(differs_reductions),
+                 rate(unpredicted_reductions), rate(matched[dma]), rate(differs[dma]),
                  rate(unpredicted[dma]), covered(Coverage::WouldMeet),
                  covered(Coverage::WrongValue), covered(Coverage::AlreadyRan),
                  covered(Coverage::LandedPending), covered(Coverage::ReallyWrong),
@@ -278,7 +303,7 @@ struct State {
                  met(MetBy::QmdRelease), met(MetBy::QmdReduction), met(MetBy::DmaRelease),
                  met(MetBy::Other), met(MetBy::BeforeCheck), met(MetBy::Unmet),
                  mirrored(Mirror::Overlay), mirrored(Mirror::Memory), mirrored(Mirror::Waited),
-                 mirrored(Mirror::Resync), mirrored(Mirror::SessionStart),
+                 mirrored(Mirror::Patched), mirrored(Mirror::Resync), mirrored(Mirror::SessionStart),
                  mirrored(Mirror::AutoOff), outcome(Outcome::GeqMet), outcome(Outcome::EqMet),
                  outcome(Outcome::MaskMet));
         if (Mode() == 2) {
@@ -293,7 +318,10 @@ struct State {
                      "payload, {:.0f} wrap guard; safety: {} checked, {} bound violated, {} not "
                      "landed yet; violations: {} went down, {} landings missing, {} other; "
                      "re-read later: {}/{}/{} recovered, {}/{}/{} never recovered in 100 ms (went "
-                     "down/landings missing/other); {} landings of unrecorded writes; records/s "
+                     "down/landings missing/other); {} landings of unrecorded writes, {} "
+                     "phantom records swept, {} records evicted before landing; session totals: "
+                     "{} checked, {} violated, {} not landed yet, {} landings of unrecorded "
+                     "writes, {} phantoms; records/s "
                      "by op add/min/max/inc/dec/and/or/xor: QMD {}, QMD signed {}, compute report "
                      "{}",
                      on_words(Compare::Gequal), on_words(Compare::Equal), on_words(Compare::Mask),
@@ -310,7 +338,9 @@ struct State {
                      bound_checked, bound_violated, bound_unlanded, violations[0],
                      violations[1], violations[2], recovered[0], recovered[1], recovered[2],
                      never_recovered[0], never_recovered[1], never_recovered[2],
-                     foreign_landings, Rates(reduction_ops[0], window),
+                     foreign_landings, phantoms, evicted_unlanded, session_checked,
+                     session_violated, session_unlanded, session_foreign, session_phantoms,
+                     Rates(reduction_ops[0], window),
                      Rates(reduction_ops[1], window), Rates(reduction_ops[2], window));
             const auto waited = [&](GuestWriterCause c) {
                 return rate(wait_causes[static_cast<size_t>(c)]);
@@ -326,13 +356,29 @@ struct State {
                 whats += fmt::format("{}others {:.0f}", whats.empty() ? "" : ", ",
                                      rate(wait_whats_other));
             }
+            // GpuSplit::WriterKind's order.
+            constexpr std::array<const char*, 5> range_kinds{"upload", "release", "compute",
+                                                             "copy", "other"};
+            std::string ranges;
+            for (size_t i = 0; i < range_wait_count; ++i) {
+                const RangeWait& entry = range_waits[i];
+                ranges += fmt::format("{}{} @{} x{} {:.0f}", ranges.empty() ? "" : ", ",
+                                      entry.kind < range_kinds.size() ? range_kinds[entry.kind]
+                                                                      : "?",
+                                      entry.word, entry.size, rate(entry.count));
+            }
+            if (range_waits_other != 0) {
+                ranges += fmt::format("{}others {:.0f}", ranges.empty() ? "" : ", ",
+                                      rate(range_waits_other));
+            }
             LOG_INFO(HW_GPU,
                      "QMD release prediction (EXP13=2) QMD reads that waited, by what set the "
                      "target (/s): {:.0f} noted write, {:.0f} writer range, {:.0f} 3D ranged "
                      "write, {:.0f} unbounded compute/copy writer, {:.0f} unranged writer, {:.0f} "
                      "queued function, {:.0f} 3D method write, {:.0f} unknown noted write ({}), "
                      "{:.0f} noted-write scan limit, {:.0f} writer-range scan limit, {:.0f} "
-                     "evicted inline QMD, {:.0f} none",
+                     "evicted inline QMD, {:.0f} none; writer ranges waited on by (kind, word "
+                     "in the QMD, bytes): {}",
                      waited(GuestWriterCause::Pending), waited(GuestWriterCause::WriterRange),
                      waited(GuestWriterCause::Ranged), waited(GuestWriterCause::UnboundedWriter),
                      waited(GuestWriterCause::Unranged), waited(GuestWriterCause::Function),
@@ -340,7 +386,8 @@ struct State {
                      waited(GuestWriterCause::UnknownPending), whats,
                      waited(GuestWriterCause::PendingScanLimit),
                      waited(GuestWriterCause::WriterScanLimit),
-                     waited(GuestWriterCause::OverlayEvicted), waited(GuestWriterCause::None));
+                     waited(GuestWriterCause::OverlayEvicted), waited(GuestWriterCause::None),
+                     ranges);
         }
         signals = {};
         reductions = unmapped_releases = predicted_stale = predicted_at_least = 0;
@@ -356,6 +403,11 @@ struct State {
         reduction_ops = {};
         bound_checked = bound_violated = bound_unlanded = 0;
         foreign_landings = 0;
+        evicted_unlanded = 0;
+        matched_reductions = differs_reductions = unpredicted_reductions = 0;
+        phantoms = 0;
+        range_wait_count = 0;
+        range_waits_other = 0;
         wait_causes = {};
         wait_whats = {};
         wait_whats_other = 0;
@@ -363,44 +415,93 @@ struct State {
         since = now;
     }
 
-    /// Stores a record, counting it among its word's records.
+    /// Stores a record (not landed, not matched yet).
     void Insert(const Prediction& record) {
-        if (words.size() >= 65536 && !words.contains(record.device)) [[unlikely]] {
-            // Records would outlive their counts: start over (nothing then looks landed).
-            LOG_WARNING(HW_GPU, "QMD release prediction (EXP13): landed tracking starts over");
-            Clear();
-        }
         const size_t bucket = Bucket(record.device);
         auto& ways = predictions[bucket];
         Prediction stored = record;
         stored.sequence = ++record_sequence;
-        stored.nth = ++words[record.device].sent;
+        stored.landed = false;
+        stored.matched = false;
         Prediction& slot = ways[next[bucket]++ % Ways];
         if (slot.position != 0) {
             evicted[bucket] = (std::max)(evicted[bucket], slot.position);
+            if (!slot.landed) {
+                ++evicted_unlanded;
+                if (slot.kind == Kind::Plain) {
+                    evicted_plain[bucket] = slot.device;
+                }
+            }
         }
         slot = stored;
     }
 
-    /// The records of `device` that landed (0 when it has none).
-    [[nodiscard]] u64 LandedCount(u64 device) const {
-        const auto it = words.find(device);
-        return it != words.end() ? it->second.landed : 0;
-    }
-    [[nodiscard]] u64 SentCount(u64 device) const {
-        const auto it = words.find(device);
-        return it != words.end() ? it->second.sent : 0;
-    }
-    [[nodiscard]] bool Landed(const Prediction& record) const {
-        return LandedCount(record.device) >= record.nth;
+    [[nodiscard]] static bool Landed(const Prediction& record) {
+        return record.landed;
     }
 
-    /// Drops the records and their counts.
+    /// The records of `device` in the table and how many of them landed.
+    [[nodiscard]] std::pair<u32, u32> Counts(u64 device) const {
+        std::pair<u32, u32> counts{};
+        for (const Prediction& way : predictions[Bucket(device)]) {
+            if (way.position != 0 && way.device == device) {
+                ++counts.first;
+                counts.second += way.landed ? 1 : 0;
+            }
+        }
+        return counts;
+    }
+
+    /// Drops the records of `device`.
+    void ClearWord(u64 device) {
+        const size_t bucket = Bucket(device);
+        for (Prediction& way : predictions[bucket]) {
+            if (way.device == device) {
+                way = {};
+            }
+        }
+        if (evicted_plain[bucket] == device) {
+            evicted_plain[bucket] = 0;
+        }
+    }
+
+    /// Records of the writers the back checks (QMD and copy releases) that it never made, once
+    /// it ran well past them (`consumed` is published every 4096 words at most): phantoms. A few
+    /// buckets per call. Their words start over.
+    void Sweep(u64 consumed) {
+        if (!records_valid || consumed < 4096) {
+            return;
+        }
+        for (size_t step = 0; step < 4; ++step) {
+            const size_t bucket = sweep_bucket++ % Buckets;
+            for (Prediction& way : predictions[bucket]) {
+                if (way.position == 0 || way.matched || way.position + 4096 > consumed ||
+                    way.position < records_valid_from ||
+                    (way.writer != Writer::Qmd && way.writer != Writer::Dma)) {
+                    continue;
+                }
+                ++phantoms;
+                ++session_phantoms;
+                if (phantoms_logged < 16) {
+                    ++phantoms_logged;
+                    LOG_WARNING(HW_GPU,
+                                "QMD release prediction (EXP13=2): phantom {} record (the back "
+                                "never made it): QMD {:#x}, device {:#x}, kind {}, payload {:#x}, "
+                                "sent at {}, back at {}",
+                                way.writer == Writer::Qmd ? "QMD" : "copy", way.qmd, way.device,
+                                static_cast<u32>(way.kind), way.payload, way.position, consumed);
+                }
+                ClearWord(way.device);
+            }
+        }
+    }
+
+    /// Drops the records.
     void Clear() {
         predictions = {};
         next = {};
         evicted = {};
-        words.clear();
+        evicted_plain = {};
         pending_count = 0;
     }
 };
@@ -467,6 +568,7 @@ void Note(u64 device, const Record& record, u32 before, u64 position, u64 qmd) {
     }();
     (void)hooked;
     state.Insert(stored);
+    state.Sweep(GpuSplit::Get().ConsumedNow());
     switch (record.kind) {
     case Kind::Reduction:
         if (record.writer == Writer::Report) {
@@ -521,35 +623,90 @@ void NoteWait(GuestWriterCause cause, const char* what) {
     ++state.wait_whats_other;
 }
 
-void NoteLanded(u64 device, u32 value) {
+void NoteRangeWait(u32 kind, s64 offset, u64 size) {
+    auto& state = Get();
+    std::scoped_lock lock{state.mutex};
+    const s64 word = offset >= 0 ? offset / 4 : -((-offset + 3) / 4);
+    for (size_t i = 0; i < state.range_wait_count; ++i) {
+        State::RangeWait& entry = state.range_waits[i];
+        if (entry.kind == kind && entry.word == word && entry.size == size) {
+            ++entry.count;
+            return;
+        }
+    }
+    if (state.range_wait_count < state.range_waits.size()) {
+        state.range_waits[state.range_wait_count++] = {kind, word, size, 1};
+    } else {
+        ++state.range_waits_other;
+    }
+}
+
+void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing kind) {
     if (!MirrorMode()) {
         return;
     }
     auto& state = Get();
     std::scoped_lock lock{state.mutex};
-    const auto it = state.words.find(device);
-    if (it == state.words.end()) {
-        return;
-    }
-    State::Landings& landings = it->second;
-    if (landings.landed >= landings.sent) {
-        ++state.foreign_landings;
-        return;
-    }
-    // Fences land the word's writes in send order: this is its oldest unlanded record's, unless
-    // a write the table doesn't know landed (a plain one with another value, a max below it).
-    for (const Prediction& way : state.predictions[Bucket(device)]) {
-        if (way.position == 0 || way.device != device || way.nth != landings.landed + 1) {
+    // The record it belongs to: reductions land in send order among themselves (synchronously,
+    // in back order), a plain write is known by its payload, a max by a payload up to it. Kinds
+    // land out of order with each other (query completions run on the fencing thread).
+    Prediction* oldest = nullptr;
+    bool any = false;
+    const size_t bucket = Bucket(device);
+    for (Prediction& way : state.predictions[bucket]) {
+        if (way.position == 0 || way.device != device) {
             continue;
         }
-        if ((way.kind == Kind::Plain && value != way.payload) ||
-            (way.kind == Kind::AtLeast && value < way.payload)) {
-            ++state.foreign_landings;
-            return;
+        any = true;
+        if (way.landed) {
+            continue;
         }
-        break;
+        const bool fits = kind == Tegra::Nx2Landing::Reduction ? way.kind == Kind::Reduction
+                          : kind == Tegra::Nx2Landing::Max
+                              ? way.kind == Kind::AtLeast && way.payload <= value
+                              : way.kind == Kind::Plain && way.payload == value;
+        if (fits && (oldest == nullptr || way.sequence < oldest->sequence)) {
+            oldest = &way;
+        }
     }
-    ++landings.landed;
+    if (oldest != nullptr) {
+        oldest->landed = true;
+        return;
+    }
+    if (kind == Tegra::Nx2Landing::Plain && state.evicted_plain[bucket] == device) {
+        state.evicted_plain[bucket] = 0; // The evicted plain record's, most likely
+        return;
+    }
+    if (!any) {
+        return; // A word without records (counter reports, CPU-polled words)
+    }
+    ++state.foreign_landings;
+    ++state.session_foreign;
+    if (state.foreign_logged < 8) {
+        ++state.foreign_logged;
+        std::string kinds;
+        for (const Prediction& way : state.predictions[bucket]) {
+            if (way.position != 0 && way.device == device) {
+                kinds += fmt::format(" {}{}={:#x}{}",
+                                     way.kind == Kind::Plain     ? "plain"
+                                     : way.kind == Kind::AtLeast ? "max"
+                                                                 : "reduction",
+                                     way.writer == Writer::Qmd      ? ""
+                                     : way.writer == Writer::Dma    ? "(copy)"
+                                     : way.writer == Writer::Puller ? "(puller)"
+                                                                    : "(report)",
+                                     way.payload, way.landed ? " landed" : "");
+            }
+        }
+        LOG_INFO(HW_GPU,
+                 "QMD release prediction (EXP13=2): a landing no record fits: device {:#x}, "
+                 "{} {:#x}; the word's records:{}",
+                 device,
+                 kind == Tegra::Nx2Landing::Plain ? "plain"
+                 : kind == Tegra::Nx2Landing::Max ? "max"
+                                                  : "reduction",
+                 value, kinds);
+    }
 }
 
 void Verify(Writer writer, u64 device, u32 payload, u64 qmd, u64 entry_position, bool reduction) {
@@ -557,19 +714,23 @@ void Verify(Writer writer, u64 device, u32 payload, u64 qmd, u64 entry_position,
     std::scoped_lock lock{state.mutex};
     state.releases[Hash(device) % Releases] = {device, ++state.sequence, payload, writer,
                                                  reduction};
+    const bool mirror = MirrorMode();
     if (reduction) {
         ++state.back_reductions;
-        return;
+        if (!mirror) {
+            return;
+        }
     }
-    // The launch the back runs is the first one sent after the entry it runs starts.
-    const auto& ways = state.predictions[Bucket(device)];
-    const Prediction* found = nullptr;
+    // The launch the back runs is the first one sent after the entry it runs starts. With
+    // EXP13=2 each record is the prediction of one release (matched once).
+    auto& ways = state.predictions[Bucket(device)];
+    Prediction* found = nullptr;
     u32 same_device = 0;
     u64 oldest = ~u64{0};
-    for (const Prediction& way : ways) {
+    for (Prediction& way : ways) {
         oldest = (std::min)(oldest, way.position);
         if (way.position <= entry_position || way.device != device || way.writer != writer ||
-            way.kind == Kind::Reduction) {
+            (way.kind == Kind::Reduction) != reduction || (mirror && way.matched)) {
             continue;
         }
         if (way.qmd != qmd) {
@@ -582,6 +743,26 @@ void Verify(Writer writer, u64 device, u32 payload, u64 qmd, u64 entry_position,
         }
     }
     const size_t index = static_cast<size_t>(writer);
+    if (reduction) {
+        if (!found) {
+            ++state.unpredicted_reductions;
+            if (state.unpredicted_reductions_logged < 8) {
+                ++state.unpredicted_reductions_logged;
+                LOG_INFO(HW_GPU,
+                         "QMD release prediction (EXP13=2): unpredicted QMD reduction, QMD "
+                         "{:#x}, device {:#x} payload {:#x}, entry {}; queued predictions there "
+                         "from other QMDs: {}",
+                         qmd, device, payload, entry_position, same_device);
+            }
+        } else {
+            found->matched = true;
+            ++(found->payload == payload ? state.matched_reductions : state.differs_reductions);
+        }
+        return;
+    }
+    if (found) {
+        found->matched = true;
+    }
     if (!found) {
         ++state.unpredicted[index];
         // Every way was predicted after this entry: the prediction may have been evicted.
@@ -650,11 +831,6 @@ std::optional<Bound> CheckAcquire(const AcquireCheck& check) {
     }
     std::sort(records.begin(), records.begin() + static_cast<std::ptrdiff_t>(count),
               [](const Prediction* a, const Prediction* b) { return a->sequence < b->sequence; });
-    // Positions grow with the send order: the queued records are the last ones.
-    size_t queued_from = count;
-    while (queued_from > 0 && records[queued_from - 1]->position > check.done) {
-        --queued_from;
-    }
 
     // Coverage by the plain predictions: the newest release recorded for the word decides.
     const auto would_meet = [&](const Prediction& r) {
@@ -684,16 +860,24 @@ std::optional<Bound> CheckAcquire(const AcquireCheck& check) {
     }
     state.Tick();
 
-    // The reduction lower bound (6c section 3): the word only grows under the queued records.
+    // The reduction lower bound (6c section 3, 6e): the word only grows under the records that
+    // have not landed, whatever their position (`done` trails the back: a record past it may
+    // be inside the word already, and its mark says so; the back marks before it writes).
     const auto bail = [&](Bail reason) -> std::optional<Bound> {
         ++state.bails[static_cast<size_t>(reason)];
         return std::nullopt;
     };
     bool any_monotonic_record = false;
     bool plain_queued = false;
-    for (size_t i = queued_from; i < count; ++i) {
+    bool plain_unlanded = false;
+    for (size_t i = 0; i < count; ++i) {
+        if (State::Landed(*records[i])) {
+            continue;
+        }
         any_monotonic_record |= records[i]->kind != Kind::Plain;
-        plain_queued |= records[i]->kind == Kind::Plain;
+        if (records[i]->kind == Kind::Plain) {
+            (records[i]->position > check.done ? plain_queued : plain_unlanded) = true;
+        }
     }
     if (!any_monotonic_record) {
         return bail(Bail::NoRecords);
@@ -705,28 +889,22 @@ std::optional<Bound> CheckAcquire(const AcquireCheck& check) {
     if (!state.records_valid || state.records_valid_from > check.done) {
         return bail(Bail::MirrorOff);
     }
-    if (state.evicted[bucket] > check.done) {
+    if (state.evicted[bucket] > check.done || state.evicted_plain[bucket] == check.device) {
         return bail(Bail::Evicted);
     }
     if (plain_queued) {
         return bail(Bail::PlainQueued);
     }
-    bool unlanded = false;
-    for (size_t i = 0; i < queued_from; ++i) {
-        if (!state.Landed(*records[i])) {
-            if (records[i]->kind == Kind::Plain) {
-                // It lands later and sets the word, maybe below the bound.
-                return bail(Bail::PlainUnlanded);
-            }
-            unlanded = true;
-        }
+    if (plain_unlanded) {
+        // It lands later and sets the word, maybe below the bound.
+        return bail(Bail::PlainUnlanded);
     }
-    // Other writers of the word sent after `done`; this table's report reductions are noted as
+    // Other writers of the word sent after `done`; this table's report releases are noted as
     // writer ranges at their own positions.
     std::array<u64, Ways> own{};
     size_t own_count = 0;
-    for (size_t i = queued_from; i < count; ++i) {
-        if (records[i]->writer == Writer::Report) {
+    for (size_t i = 0; i < count; ++i) {
+        if (records[i]->writer == Writer::Report && records[i]->position > check.done) {
             own[own_count++] = records[i]->position;
         }
     }
@@ -739,9 +917,9 @@ std::optional<Bound> CheckAcquire(const AcquireCheck& check) {
     if (writers.unbounded != 0) {
         return bail(Bail::Unbounded);
     }
-    // Fold in send order from the word read before `done` was loaded: records that ran but did
-    // not land are left out (they only raise the word). The 2^31 guard keeps the true sum, with
-    // any unlanded contribution, from wrapping.
+    // Fold the unlanded records in send order from the word read before the marks (outside the
+    // lock: a record marked after the read is folded, one marked before is in the word). The
+    // 2^31 guard keeps the sum from wrapping.
     constexpr u64 Guard = 0x7fffffff;
     u64 bound = check.word;
     bool all_or = true;
@@ -749,8 +927,12 @@ std::optional<Bound> CheckAcquire(const AcquireCheck& check) {
         return bail(Bail::Wrap);
     }
     Bound result{};
-    for (size_t i = queued_from; i < count; ++i) {
+    for (size_t i = 0; i < count; ++i) {
         const Prediction& r = *records[i];
+        if (State::Landed(r)) {
+            continue;
+        }
+        result.sequences[result.folded] = r.sequence;
         result.payloads[result.folded++] = r.payload;
         result.payload_sum += r.payload;
         if (r.kind == Kind::AtLeast) {
@@ -799,13 +981,9 @@ std::optional<Bound> CheckAcquire(const AcquireCheck& check) {
                                                : Outcome::MaskShort;
         break;
     case Compare::Equal: {
-        // Exact only with every earlier record landed and the word unchanged since the first
-        // queued one was sent (a landed-count collision can fake "landed"). It also relies on
-        // fences running their callbacks in registration order.
-        const bool exact = !unlanded && records[queued_from]->before == check.word;
-        outcome = !exact                 ? Outcome::EqNotExact
-                  : value == check.value ? Outcome::EqMet
-                                         : Outcome::EqDiffers;
+        // With the marks every write still to land is folded (plain ones bailed above): the
+        // fold of monotonic ops is the word's final value, unless an unrecorded writer joins.
+        outcome = value == check.value ? Outcome::EqMet : Outcome::EqDiffers;
         break;
     }
     default:
@@ -817,7 +995,6 @@ std::optional<Bound> CheckAcquire(const AcquireCheck& check) {
     result.device = check.device;
     result.address = check.address;
     result.done = check.done;
-    result.nth = records[count - 1]->nth;
     result.since = Clock::now();
     result.pointer = check.pointer;
     result.operation = check.operation;
@@ -832,16 +1009,29 @@ void CheckBound(const Bound& bound, u32 word) {
     if (state.pending_count != 0) {
         state.ReRead(now, &bound.device);
     }
-    const u64 landed = state.LandedCount(bound.device);
-    if (landed < bound.nth) {
+    // Meaningful once every folded record landed (a record dropped since counts as not).
+    u32 folded_landed = 0;
+    for (u32 i = 0; i < bound.folded; ++i) {
+        for (const Prediction& way : state.predictions[Bucket(bound.device)]) {
+            if (way.position != 0 && way.sequence == bound.sequences[i]) {
+                folded_landed += way.landed ? 1 : 0;
+                break;
+            }
+        }
+    }
+    if (folded_landed < bound.folded) {
         ++state.bound_unlanded;
+        ++state.session_unlanded;
         return;
     }
     ++state.bound_checked;
+    ++state.session_checked;
     if (word >= bound.value) {
         return;
     }
     ++state.bound_violated;
+    ++state.session_violated;
+    const auto [word_records, word_landed] = state.Counts(bound.device);
     const u32 deficit = bound.value - word;
     Violation kind = Violation::Other;
     if (word < bound.word) {
@@ -865,12 +1055,11 @@ void CheckBound(const Bound& bound, u32 word) {
                     "QMD release prediction (EXP13=2): reduction bound violated ({}) at {:#x} "
                     "(device {:#x}): acquire op {} value {:#x}; folded from {:#x} at back "
                     "position {}: bound {:#x}, word {:#x} once met, deficit {:#x}; {} records "
-                    "folded, payloads summing to {:#x}; records of the word: newest folded "
-                    "{}, {} landed, {} sent; {} us after the acquire",
+                    "folded, payloads summing to {:#x}; records of the word: {}, {} landed; {} "
+                    "us after the acquire",
                     kinds[static_cast<size_t>(kind)], bound.address, bound.device,
                     bound.operation, bound.acquire_value, bound.word, bound.done, bound.value,
-                    word, deficit, bound.folded, bound.payload_sum, bound.nth, landed,
-                    state.SentCount(bound.device),
+                    word, deficit, bound.folded, bound.payload_sum, word_records, word_landed,
                     std::chrono::duration_cast<std::chrono::microseconds>(now - bound.since)
                         .count());
     }

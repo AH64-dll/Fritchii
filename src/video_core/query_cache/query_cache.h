@@ -384,6 +384,11 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         }
         query_base->value += streamer->GetAmendValue();
         streamer->SetAccumulationValue(query_base->value);
+        if (counter_type == QueryType::Payload) {
+            // EXP13=2: marked before the word is written (nx2.h).
+            Tegra::Nx2NoteLanded(cpu_addr, static_cast<u32>(query_base->value),
+                                 Tegra::Nx2Landing::Plain);
+        }
         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
             u64 timestamp = impl->gpu.GetTicks();
             std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
@@ -413,6 +418,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         impl->rasterizer.SignalFence(std::move(operation));
     } else {
         if (!VideoCore::Nx2Debug::AccuratePart(1) && counter_type == QueryType::Payload) {
+            // EXP13=2: marked before the word is written (nx2.h).
+            Tegra::Nx2NoteLanded(cpu_addr, payload, Tegra::Nx2Landing::Plain);
             if (has_timestamp) {
                 u64 timestamp = impl->gpu.GetTicks();
                 u64 value = static_cast<u64>(payload);

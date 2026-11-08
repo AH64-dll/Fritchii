@@ -452,15 +452,26 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
     return true;
 }
 
-// GPU semaphore writes that landed in guest memory: EXP13=2 tells a release the back ran but a
-// fence still holds back from one already written (#717's landed counter, tracked exactly per
-// word by VideoCommon::QmdPrediction::NoteLanded, which sets the hook once it records).
-inline std::atomic<void (*)(u64, u32)> g_nx2_landed_hook{};
+// GPU semaphore writes as they land in guest memory: EXP13=2 marks the release records they
+// belong to (#717's landed counter, per record: VideoCommon::QmdPrediction::NoteLanded, which
+// sets the hook once it records). The landing sites call it BEFORE they write the word, so a
+// front that reads the new word also finds the record marked.
+enum class Nx2Landing : u32 {
+    Plain,     ///< The payload (a query cache payload write)
+    Max,       ///< max(word, payload) (a QMD max release)
+    Reduction, ///< A reduction's result (QMD or compute report reduction)
+};
+inline std::atomic<void (*)(u64, u32, Nx2Landing)> g_nx2_landed_hook{};
 
-/// A GPU semaphore write of `value` to the u32 at `device_address` landed (counted only).
-inline void Nx2NoteLanded(u64 device_address, u32 value) {
+/// Whether anything listens for landings (EXP13=2 recorded once this session).
+[[nodiscard]] inline bool Nx2LandedHooked() {
+    return g_nx2_landed_hook.load(std::memory_order_relaxed) != nullptr;
+}
+
+/// A GPU semaphore write of `value` to the u32 at `device_address` is about to land.
+inline void Nx2NoteLanded(u64 device_address, u32 value, Nx2Landing kind) {
     if (const auto hook = g_nx2_landed_hook.load(std::memory_order_acquire)) [[unlikely]] {
-        hook(device_address, value);
+        hook(device_address, value, kind);
     }
 }
 
@@ -506,9 +517,8 @@ public:
 
     /// A GPU write of `value` to the u32 at `device_address`.
     void OnWrite(u64 device_address, u32 value) {
-        // (Common::Nx2GpuWrite::Notify, for Ocarina of Time's present poll, is called by each
-        // write site itself, with its path and host pointer.)
-        Nx2NoteLanded(device_address, value);
+        // (Common::Nx2GpuWrite::Notify, for Ocarina of Time's present poll, and Nx2NoteLanded
+        // are called by each write site itself.)
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
