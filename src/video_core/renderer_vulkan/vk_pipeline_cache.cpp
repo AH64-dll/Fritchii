@@ -28,6 +28,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "common/memory_detect.h"
 #include "common/shutdown_progress.h"
 #include "common/thread.h"
 #include "common/thread_worker.h"
@@ -990,6 +991,39 @@ size_t BackgroundPipelineThreads() {
     return std::clamp<size_t>(std::thread::hardware_concurrency() / 4, 1, 6);
 }
 
+/// Built graphics pipelines past which EvictUnusedPipelines destroys unused ones
+/// (EDEN_NX2_PIPELINE_EVICT_ABOVE, default 8,000: ~3.6 GB of driver memory at most).
+size_t EvictAbovePipelines() {
+    static const size_t evict_above = [] {
+        const char* value = std::getenv("EDEN_NX2_PIPELINE_EVICT_ABOVE");
+        return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10))
+                                : size_t{8000};
+    }();
+    return evict_above;
+}
+
+/// How many of the cached graphics pipelines boot skipped the background builds, newest first;
+/// the rest are built when a draw first needs them. A cache merged from a community pack held
+/// 60k pipelines: building all of them took 15 minutes on 6 threads and, at ~0.45 MB each, held
+/// ~25 GB of driver memory in pipelines no draw had asked for (none is evicted before a draw
+/// takes it), which shutting down then had to destroy one by one.
+/// EDEN_NX2_BACKGROUND_PIPELINE_LIMIT sets it.
+size_t BackgroundPipelineLimit(size_t built_at_boot) {
+    if (const char* value = std::getenv("EDEN_NX2_BACKGROUND_PIPELINE_LIMIT")) {
+        return static_cast<size_t>(std::strtoull(value, nullptr, 10));
+    }
+    // ~0.45 MB of driver memory each: at most a sixteenth of the RAM (16 GB: ~2,200), and no more
+    // than the eviction threshold leaves past what boot built.
+    constexpr u64 PipelineBytes = u64{460} << 10;
+    const u64 ram = Common::GetMemInfo().TotalPhysicalMemory;
+    const size_t by_ram = static_cast<size_t>(ram / 16 / PipelineBytes);
+    const size_t evict_above = EvictAbovePipelines();
+    const size_t by_eviction = evict_above > built_at_boot ? evict_above - built_at_boot : 0;
+    constexpr size_t MinPipelines = 500;
+    constexpr size_t MaxPipelines = 6000;
+    return std::clamp<size_t>((std::min)(by_ram, by_eviction), MinPipelines, MaxPipelines);
+}
+
 // EXPERIMENT EDEN_NX2_EXP5 (live, read by each background build): background pipeline builds
 // competed with the game's few busy threads (Ocarina of Time 49 instead of 60 fps for the 45-80 s
 // they took). 0 = as before (below normal priority, any core). 1 = idle priority, so every game
@@ -1821,6 +1855,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     compute_envs.clear();
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+    if (PreloadAllPipelines() && queued_graphics > 10000) {
+        LOG_WARNING(Render_Vulkan,
+                    "EDEN_NX2_PRELOAD_ALL_PIPELINES: building and keeping all {} cached graphics "
+                    "pipelines holds ~{} GB of driver memory all session",
+                    queued_graphics, queued_graphics * 460 / (1024 * 1024));
+    }
     if (skipped_pipelines != 0) {
         LOG_INFO(Render_Vulkan,
                  "{} cached graphics pipelines are built when first needed",
@@ -1834,11 +1874,15 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     workers.WaitForRequests(stop_loading);
 
-    if (!deferred_graphics.empty() && !stop_loading.stop_requested()) {
+    const size_t background_count =
+        (std::min)(deferred_graphics.size(), BackgroundPipelineLimit(queued_graphics));
+    if (background_count != 0 && !stop_loading.stop_requested()) {
         const size_t threads = BackgroundPipelineThreads();
-        LOG_INFO(Render_Vulkan, "Building {} cached graphics pipelines in the background ({} threads)",
-                 deferred_graphics.size(), threads);
-        background_left.store(deferred_graphics.size(), std::memory_order_relaxed);
+        LOG_INFO(Render_Vulkan,
+                 "Building {} of {} cached graphics pipelines in the background ({} threads), the "
+                 "rest when first needed",
+                 background_count, deferred_graphics.size(), threads);
+        background_left.store(background_count, std::memory_order_relaxed);
         background_start = std::chrono::steady_clock::now();
         background_last_save = background_start;
         background_active.store(true, std::memory_order_release);
@@ -1846,7 +1890,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                                                           Common::ThreadPlacement::Background));
         // Newest first: the cache file appends, so the end holds what the latest sessions
         // found, which the game is likelier to need soon than its oldest entries.
-        for (auto& deferred : std::views::reverse(deferred_graphics)) {
+        for (auto& deferred :
+             std::views::reverse(deferred_graphics) | std::views::take(background_count)) {
             background_workers->QueueWork([this, key = deferred.first,
                                            records_ = std::move(deferred.second)]() mutable {
                 thread_local const size_t slot =
@@ -2740,11 +2785,7 @@ void PipelineCache::EvictUnusedPipelines() {
     // pipelines are ~3.6 GB of driver memory at most. EDEN_NX2_PIPELINE_EVICT_ABOVE sets it.
     // Past it only the excess goes, least recently used first (from zortos293/Lichii#408), so
     // crossing it doesn't drop every stale pipeline at once.
-    static const size_t evict_above = [] {
-        const char* value = std::getenv("EDEN_NX2_PIPELINE_EVICT_ABOVE");
-        return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10))
-                                : size_t{8000};
-    }();
+    const size_t evict_above = EvictAbovePipelines();
     if (graphics_cache.size() <= evict_above) {
         return;
     }
