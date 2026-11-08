@@ -45,6 +45,7 @@
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/info_serialize.h"
+#include "shader_recompiler/translate_profile.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/ir_opt/oot_visual_workaround.h"
 #include "shader_recompiler/program_header.h"
@@ -4874,10 +4875,47 @@ void ReportWorstFrame() {
 }
 } // Anonymous namespace
 
+namespace {
+/// EDEN_NX2_TRANSLATE_PROFILE=1 (zortos293/Lichii#896's profiler, off by default): every 10 s the
+/// time each translation step took on all threads, the largest first.
+void ReportTranslateProfile() {
+    if (!Shader::TranslateProfile::Enabled()) {
+        return;
+    }
+    static auto window = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window < std::chrono::seconds{10}) {
+        return;
+    }
+    window = now;
+    namespace Profile = Shader::TranslateProfile;
+    const Profile::Totals totals = Profile::Take();
+    std::array<size_t, Profile::NumSteps> order{};
+    std::iota(order.begin(), order.end(), size_t{0});
+    std::ranges::sort(order, [&](size_t lhs, size_t rhs) {
+        return totals.nanoseconds[lhs] > totals.nanoseconds[rhs];
+    });
+    std::string steps;
+    for (const size_t step : order) {
+        if (totals.counts[step] == 0) {
+            continue;
+        }
+        steps += fmt::format("{}{} {:.1f} ms ({})", steps.empty() ? "" : ", ",
+                             Profile::Name(static_cast<Profile::Step>(step)),
+                             static_cast<double>(totals.nanoseconds[step]) / 1e6,
+                             totals.counts[step]);
+    }
+    if (!steps.empty()) {
+        LOG_INFO(Render_Vulkan, "Translation profile in the last 10 s (all threads): {}", steps);
+    }
+}
+} // Anonymous namespace
+
 void PipelineCache::TickFrame() {
     ++frame_count;
     ReportWorstFrame();
     ReportAsyncDiscard();
+    ReportTranslateProfile();
     if (PrecompiledFastMode() != 0) {
         CheckPrecompiledBuilds();
         ReportPrecompiled();

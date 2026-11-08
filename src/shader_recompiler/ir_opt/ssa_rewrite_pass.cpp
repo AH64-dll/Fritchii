@@ -18,6 +18,7 @@
 
 #include <deque>
 #include <map>
+#include <cstdlib>
 #include <span>
 #include "common/container/unordered_map.h"
 #include <variant>
@@ -29,6 +30,7 @@
 #include "shader_recompiler/frontend/ir/reg.h"
 #include "shader_recompiler/frontend/ir/value.h"
 #include "shader_recompiler/ir_opt/passes.h"
+#include "shader_recompiler/translate_profile.h"
 
 namespace Shader::Optimization {
 namespace {
@@ -57,6 +59,28 @@ using Variant = std::variant<IR::Reg, IR::Pred, ZeroFlagTag, SignFlagTag, CarryF
 // TODO: majority of these require stable iterators, test with XC beforehand
 using ValueMap = std::unordered_map<IR::Block*, IR::Value>;
 
+// EDEN_NX2_SSA_BLOCK_VALUES=1 (zortos293/Lichii#896's "cheaper reads in the SSA rewrite", off by
+// default; read on the first translation, after nx2_switches.txt): predicates, flags and the
+// indirect branch target are stored in the blocks like registers (IR::Block::SsaOtherValue)
+// instead of per-variable hash maps (a lookup, and an insertion on a miss, for every read of
+// one), and every read reuses one work stack instead of allocating its own. #896 measured the
+// SSA rewrite at 1.66 -> 1.31 ms per program with byte-identical SPIR-V for all 47,420
+// environments that translate.
+bool SsaBlockValues() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_SSA_BLOCK_VALUES");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+constexpr size_t ZeroFlagSlot = IR::NUM_USER_PREDS;
+constexpr size_t SignFlagSlot = ZeroFlagSlot + 1;
+constexpr size_t CarryFlagSlot = ZeroFlagSlot + 2;
+constexpr size_t OverflowFlagSlot = ZeroFlagSlot + 3;
+constexpr size_t IndirectBranchSlot = ZeroFlagSlot + 4;
+static_assert(IndirectBranchSlot < IR::Block::NumSsaOtherValues);
+
 struct DefTable {
     const IR::Value& Def(IR::Block* block, IR::Reg variable) {
         return block->SsaRegValue(variable);
@@ -66,9 +90,16 @@ struct DefTable {
     }
 
     const IR::Value& Def(IR::Block* block, IR::Pred variable) {
+        if (in_blocks) {
+            return block->SsaOtherValue(IR::PredIndex(variable));
+        }
         return preds[IR::PredIndex(variable)][block];
     }
     void SetDef(IR::Block* block, IR::Pred variable, const IR::Value& value) {
+        if (in_blocks) {
+            block->SetSsaOtherValue(IR::PredIndex(variable), value);
+            return;
+        }
         preds[IR::PredIndex(variable)].insert_or_assign(block, value);
     }
 
@@ -80,40 +111,76 @@ struct DefTable {
     }
 
     const IR::Value& Def(IR::Block* block, IndirectBranchVariable) {
+        if (in_blocks) {
+            return block->SsaOtherValue(IndirectBranchSlot);
+        }
         return indirect_branch_var[block];
     }
     void SetDef(IR::Block* block, IndirectBranchVariable, const IR::Value& value) {
+        if (in_blocks) {
+            block->SetSsaOtherValue(IndirectBranchSlot, value);
+            return;
+        }
         indirect_branch_var.insert_or_assign(block, value);
     }
 
     const IR::Value& Def(IR::Block* block, ZeroFlagTag) {
+        if (in_blocks) {
+            return block->SsaOtherValue(ZeroFlagSlot);
+        }
         return zero_flag[block];
     }
     void SetDef(IR::Block* block, ZeroFlagTag, const IR::Value& value) {
+        if (in_blocks) {
+            block->SetSsaOtherValue(ZeroFlagSlot, value);
+            return;
+        }
         zero_flag.insert_or_assign(block, value);
     }
 
     const IR::Value& Def(IR::Block* block, SignFlagTag) {
+        if (in_blocks) {
+            return block->SsaOtherValue(SignFlagSlot);
+        }
         return sign_flag[block];
     }
     void SetDef(IR::Block* block, SignFlagTag, const IR::Value& value) {
+        if (in_blocks) {
+            block->SetSsaOtherValue(SignFlagSlot, value);
+            return;
+        }
         sign_flag.insert_or_assign(block, value);
     }
 
     const IR::Value& Def(IR::Block* block, CarryFlagTag) {
+        if (in_blocks) {
+            return block->SsaOtherValue(CarryFlagSlot);
+        }
         return carry_flag[block];
     }
     void SetDef(IR::Block* block, CarryFlagTag, const IR::Value& value) {
+        if (in_blocks) {
+            block->SetSsaOtherValue(CarryFlagSlot, value);
+            return;
+        }
         carry_flag.insert_or_assign(block, value);
     }
 
     const IR::Value& Def(IR::Block* block, OverflowFlagTag) {
+        if (in_blocks) {
+            return block->SsaOtherValue(OverflowFlagSlot);
+        }
         return overflow_flag[block];
     }
     void SetDef(IR::Block* block, OverflowFlagTag, const IR::Value& value) {
+        if (in_blocks) {
+            block->SetSsaOtherValue(OverflowFlagSlot, value);
+            return;
+        }
         overflow_flag.insert_or_assign(block, value);
     }
 
+    const bool in_blocks{SsaBlockValues()};
     std::array<ValueMap, IR::NUM_USER_PREDS> preds;
     // TODO: Requires stable iterators
     std::unordered_map<u32, ValueMap> goto_vars;
@@ -147,7 +214,6 @@ enum class Status {
     PushPhiArgument,
 };
 
-template <typename Type>
 struct ReadState {
     ReadState(IR::Block* block_) : block{block_} {}
     ReadState() = default;
@@ -170,10 +236,14 @@ public:
     template <typename Type>
     IR::Value ReadVariable(Type variable, IR::Block* root_block) {
         // TODO: Windows commits sodoku if you use small_vector
-        std::vector<ReadState<Type>> stack{
-            ReadState<Type>(nullptr),
-            ReadState<Type>(root_block),
-        };
+        // EDEN_NX2_SSA_BLOCK_VALUES=1: one stack for every read (allocating one per read was a
+        // heap allocation for each register a program reads). ReadVariable never runs inside
+        // another ReadVariable (phi removal writes, it doesn't read), so it is free at entry.
+        std::vector<ReadState> own_stack;
+        auto& stack{current_def.in_blocks ? read_stack : own_stack};
+        stack.clear();
+        stack.emplace_back(nullptr);
+        stack.emplace_back(root_block);
         const auto prepare_phi_operand{[&] {
             if (stack.back().pred_it == stack.back().pred_end) {
                 IR::Inst* const phi{stack.back().phi};
@@ -303,6 +373,7 @@ private:
     // TODO: Windows dies with stack exhaustion?
     std::unordered_map<IR::Block*, std::map<Variant, IR::Inst*>> incomplete_phis;
     DefTable current_def;
+    std::vector<ReadState> read_stack;
 };
 
 void VisitInst(Pass& pass, IR::Block* block, IR::Inst& inst) {
@@ -369,9 +440,13 @@ void VisitInst(Pass& pass, IR::Block* block, IR::Inst& inst) {
 }
 
 void VisitBlock(Pass& pass, IR::Block* block) {
-    for (IR::Inst& inst : block->Instructions()) {
-        VisitInst(pass, block, inst);
+    {
+        TranslateProfile::Scope scope{TranslateProfile::Step::SsaVisit};
+        for (IR::Inst& inst : block->Instructions()) {
+            VisitInst(pass, block, inst);
+        }
     }
+    TranslateProfile::Scope scope{TranslateProfile::Step::SsaSeal};
     pass.SealBlock(block);
 }
 
@@ -402,6 +477,7 @@ void SsaRewritePass(IR::Program& program) {
     for (auto block = program.post_order_blocks.rbegin(); block != end; ++block) {
         VisitBlock(pass, *block);
     }
+    TranslateProfile::Scope scope{TranslateProfile::Step::SsaFinal};
     for (auto block = program.post_order_blocks.rbegin(); block != end; ++block) {
         for (IR::Inst& inst : (*block)->Instructions()) {
             if (inst.GetOpcode() == IR::Opcode::Phi) {

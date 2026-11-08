@@ -176,6 +176,8 @@ add_library(shader_recompiler STATIC
     host_translate_info.h
     info_serialize.cpp
     info_serialize.h
+    translate_profile.cpp
+    translate_profile.h
     ir_opt/collect_shader_info_pass.cpp
     ir_opt/conditional_barrier_pass.cpp
     ir_opt/constant_propagation_pass.cpp
