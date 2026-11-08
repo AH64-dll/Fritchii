@@ -210,6 +210,8 @@ add_executable(yuzu
     fritchii/home.cpp
     fritchii/home.h
     fritchii/main_window_fritchii.cpp
+    fritchii/precompile_gate.cpp
+    fritchii/precompile_gate.h
     fritchii/whats_new.cpp
     fritchii/whats_new.h
     util/export_log.cpp

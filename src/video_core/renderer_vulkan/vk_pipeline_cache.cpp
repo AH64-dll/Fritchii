@@ -1201,6 +1201,20 @@ void PlacePrebuildThread(bool quiet) {
     }
 }
 
+// Precompiled pipeline workers: idle priority on the background cores beside the game, or every
+// core at normal priority while the frontend holds the game for them (ShaderNotify full speed).
+void PlacePrecompileThread(bool full) {
+    if (full) {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Normal);
+        Common::SetCurrentThreadToAllCores();
+        Common::SetCurrentThreadCpuMask(0);
+    } else {
+        Common::SetCurrentThreadIdlePriority();
+        Common::SetCurrentThreadToEfficiencyCores();
+        Common::SetCurrentThreadCpuMask(Common::BackgroundWorkCpuMask());
+    }
+}
+
 // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
 bool PreloadAllPipelines() {
     static const bool all = [] {
@@ -3441,9 +3455,18 @@ void PipelineCache::StartPrecompiled(u64 title_id, const std::filesystem::path& 
     }
     // Taken here, before the GPU thread starts adding to it.
     precompile_disk_keys = std::make_shared<const std::unordered_set<u64>>(disk_pipelines);
+    // Pending until the first preparation ends (or there is nothing to prepare); set before the
+    // thread starts so a frontend asking right after loading sees it.
+    shader_notify.SetPrecompilePending(true);
     precompile_thread = std::jthread([this, title_id, base_dir](std::stop_token stop) {
         Common::SetCurrentThreadName("VkPrecompile");
         PlacePrebuildThread(true);
+        struct PendingGuard {
+            VideoCore::ShaderNotify& notify;
+            ~PendingGuard() {
+                notify.SetPrecompilePending(false);
+            }
+        } pending_guard{shader_notify};
         const auto file = VideoCommon::Nx2Precompile::EnsurePrecompiledFile(title_id, base_dir,
                                                                             CACHE_VERSION, stop);
         if (file.empty() || stop.stop_requested() || warm_cancel) {
@@ -3455,6 +3478,7 @@ void PipelineCache::StartPrecompiled(u64 title_id, const std::filesystem::path& 
             shader_notify.PrecompileStarted();
             PreparePrecompiled(base_dir, stop, {}, file, force);
             shader_notify.SetWarmProgress(0, 0, 0);
+            shader_notify.SetPrecompilePending(false);
             shader_notify.PrecompileEnded();
             // Prepare Shaders Now prepares the file once more, whatever the stamp says.
             while (!stop.stop_requested() && !warm_cancel && !shader_notify.PrecompileRequested()) {
@@ -3694,14 +3718,31 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                          .count());
         }
     };
-    const auto work = [&](std::stop_token stop) {
+    // Threads() workers beside the game; at full speed (the frontend holds the game for the
+    // preparation) one per host thread, at normal priority.
+    const size_t full_threads =
+        std::max<size_t>(threads, std::max(1U, std::thread::hardware_concurrency()));
+    const auto work = [&](std::stop_token stop, size_t worker) {
         Common::SetCurrentThreadName("VkPrecompile");
-        PlacePrebuildThread(true);
+        std::optional<bool> placed_full;
         // Shader libraries built here go to the driver's cache only, like the graphics warm-up.
         GraphicsPipelineLibraryCache::SetNoRetainOnThisThread(true);
         std::ifstream in(path, std::ios::binary);
         in.exceptions(std::ifstream::failbit);
         while (!stop.stop_requested() && !stop_loading.stop_requested() && !warm_cancel) {
+            const bool full = shader_notify.PrecompileFullSpeed();
+            if (worker >= (full ? full_threads : threads)) {
+                // Parked until full speed; done once every record is taken.
+                if (state.next.load() >= total) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds{100});
+                continue;
+            }
+            if (placed_full != full) {
+                PlacePrecompileThread(full);
+                placed_full = full;
+            }
             const size_t index = state.next.fetch_add(1);
             if (index >= total) {
                 break;
@@ -3803,16 +3844,17 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         }
     };
     LOG_INFO(Render_Vulkan,
-             "Preparing {} precompiled pipelines from {}, from record {}, on {} idle threads",
-             total, path_text, start_index, threads);
+             "Preparing {} precompiled pipelines from {}, from record {}, on {} idle threads ({} "
+             "at full speed)",
+             total, path_text, start_index, threads, full_threads);
     shader_notify.SetWarmProgress(3, start_index, total);
     if (callback) {
         callback(VideoCore::LoadCallbackStage::Build, start_index, total);
     }
     {
         std::vector<std::jthread> pool;
-        for (size_t i = 0; i < threads; ++i) {
-            pool.emplace_back(work);
+        for (size_t i = 0; i < full_threads; ++i) {
+            pool.emplace_back(work, i);
         }
         // Joined here: a jthread's destructor would ask it to stop first. They stop on their
         // own with stop_loading (the precompile thread's) and warm_cancel.
