@@ -54,6 +54,10 @@ void SetGameFiles(u64 title_id, GameFiles files);
 struct Recipe {
     std::filesystem::path path;
     Nx2Recipe::Header header;
+    /// Its size and a hash of its bytes: what the precompiled file's note remembers, so the same
+    /// recipe found elsewhere (a new build's folder) or copied again is not assembled again.
+    u64 size{};
+    u64 content_hash{};
 };
 
 /// The recipe for this title and cache version, searched as the file comment lists.

@@ -314,12 +314,19 @@ private:
     /// TickFrame: the fast path's counts of the last 10 s.
     void ReportPrecompiled();
     /// Publishes the kept file's index for the GPU thread (`kept`, or a finished `part` the
-    /// preparation could not rename over it); false when there is none for `stamp`.
+    /// preparation could not rename over it); false when there is none for `stamp`. With
+    /// `check` (a file another build may have written) it is published only when
+    /// CheckKeptSample finds it equal, and deleted otherwise.
     bool LoadKept(const std::filesystem::path& kept, const std::filesystem::path& part,
-                  const std::filesystem::path& precompiled, const std::string& stamp);
+                  const std::filesystem::path& precompiled, const std::string& stamp, bool check);
+    /// The boot check of a kept file: a sample of its pipelines (64 graphics, up to 16 compute,
+    /// spread over the index) translated again from their recorded environments with this build
+    /// and its settings, and compared with the kept SPIR-V and infos. True when all are equal.
+    bool CheckKeptSample(const PrecompiledKept::Index& index, std::string_view file_name);
     [[nodiscard]] std::shared_ptr<const PrecompiledKept::Index> KeptIndex() const;
-    /// What a kept file must have been written for, beyond the prepared stamp: this exe, the
-    /// settings and switches translation reads.
+    /// What a kept file must have been written for, beyond the prepared stamp (which holds the
+    /// release, driver and GPU): the cache version, the settings SPIR-V depends on, the library
+    /// split, the OoT visual workaround and canonical keys. Not the build: CheckKeptSample.
     [[nodiscard]] std::string KeptStamp(const std::string& prepared_stamp) const;
 
     /// Set by LoadKept; read by the GPU thread when a new key is looked up.
@@ -430,11 +437,14 @@ private:
     /// tools/nx2-precompile, or assembled from a recipe), so the driver's own cache holds them
     /// before they are first drawn. Draws never use these pipelines: they build their own from
     /// the guest's shaders and find the driver's compiled code. Runs once per precompiled file,
-    /// driver and emulator build (or again when `force`). Fritchii runs it on precompile_thread,
+    /// driver and release (or again when `force`). Fritchii runs it on precompile_thread,
     /// so `callback` (the loading screen in #895) is empty and progress goes to ShaderNotify.
     void PreparePrecompiled(const std::filesystem::path& base_dir, std::stop_token stop_loading,
                             const VideoCore::DiskResourceLoadCallback& callback,
                             const std::filesystem::path& file = {}, bool force = false);
+    /// A graphics key read from the precompiled file, as draws key it on this device: its driver
+    /// fields rewritten, canonical with EDEN_NX2_CANONICAL_KEYS=1.
+    void RecordedKeyForThisDevice(GraphicsPipelineCacheKey& key) const noexcept;
 
     /// Native pipelines: the key without state that cannot change the pipeline (see
     /// FixedPipelineState::CanonicalizeNative), with #895's attribute mask from the header. Not
