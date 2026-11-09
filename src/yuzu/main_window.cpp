@@ -63,6 +63,7 @@
 #include "util/controller_navigation.h"
 #include "util/export_log.h"
 #include "fritchii/fritchii_ui.h"
+#include "fritchii/perf_overlay.h"
 #include "util/overlay_dialog.h"
 
 #include "multiplayer/state.h"
@@ -3467,10 +3468,17 @@ bool MainWindow::ConfirmShutdownGame() {
 void MainWindow::OnLoadComplete() {
     loading_screen->OnLoadComplete();
 
-    perf_overlay = new PerformanceOverlay(this);
+    if (FritchiiUi::Enabled()) {
+        perf_overlay = new FritchiiUi::PerfOverlay(
+            this, [this] { ui->action_Show_Performance_Overlay->setChecked(false); });
+        perf_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
+        return;
+    }
+    auto* overlay = new PerformanceOverlay(this);
+    perf_overlay = overlay;
     perf_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
 
-    connect(perf_overlay, &PerformanceOverlay::closed, perf_overlay,
+    connect(overlay, &PerformanceOverlay::closed, overlay,
             [this]() { ui->action_Show_Performance_Overlay->setChecked(false); });
 }
 

@@ -11,6 +11,8 @@
 #include "qt_common/qt_common.h"
 #include "ui_main.h"
 #include "yuzu/fritchii/fritchii_ui.h"
+#include "yuzu/bootmanager.h"
+#include "yuzu/fritchii/game_controls.h"
 #include "yuzu/fritchii/home.h"
 #include "yuzu/fritchii/precompile_gate.h"
 #include "yuzu/fritchii/whats_new.h"
@@ -103,6 +105,19 @@ void MainWindow::SetUpFritchiiUi() {
                                          game_list_placeholder, std::move(home));
     connect(this, &MainWindow::EmulationStarting, fritchii_home,
             &FritchiiUi::Home::OnEmulationStarting);
+
+    // In-game controls: the menu bar is gone and the rail steps aside while a game runs.
+    auto* controls = new FritchiiUi::GameControls(
+        this, {.render = [this] { return static_cast<QWidget*>(render_window); },
+               .running = [] { return QtCommon::emu_thread && QtCommon::emu_thread->IsRunning(); },
+               .pause = ui->action_Pause,
+               .restart = ui->action_Restart,
+               .stop = ui->action_Stop,
+               .fullscreen = ui->action_Fullscreen,
+               .menus = {ui->menu_File, ui->menu_Emulation, ui->menu_View, ui->menu_Tools,
+                         ui->menu_Help}});
+    connect(this, &MainWindow::EmulationStarting, controls, &FritchiiUi::GameControls::Start);
+    connect(this, &MainWindow::EmulationStopping, controls, &FritchiiUi::GameControls::Stop);
 
     // "Preparing shaders" before the game starts when its precompiled pipelines need preparing.
     auto* gate = new FritchiiUi::PrecompileGate(

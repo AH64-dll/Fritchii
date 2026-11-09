@@ -13,5 +13,10 @@
         <file>icons/list.svg</file>
         <file>icons/check.svg</file>
         <file>icons/chevron-down.svg</file>
+        <file>icons/pause.svg</file>
+        <file>icons/stop.svg</file>
+        <file>icons/restart.svg</file>
+        <file>icons/fullscreen.svg</file>
+        <file>icons/fullscreen-exit.svg</file>
     </qresource>
 </RCC>

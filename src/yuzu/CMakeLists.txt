@@ -209,7 +209,11 @@ add_executable(yuzu
     fritchii/fritchii_ui.h
     fritchii/home.cpp
     fritchii/home.h
+    fritchii/game_controls.cpp
+    fritchii/game_controls.h
     fritchii/main_window_fritchii.cpp
+    fritchii/perf_overlay.cpp
+    fritchii/perf_overlay.h
     fritchii/precompile_gate.cpp
     fritchii/precompile_gate.h
     fritchii/whats_new.cpp
