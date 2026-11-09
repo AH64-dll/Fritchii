@@ -550,7 +550,7 @@ private:
     QElapsedTimer emu_force_stop_clock;
     u64 shutdown_progress_seen{};
     OverlayDialog* shutdown_dialog{};
-    PerformanceOverlay* perf_overlay = nullptr;
+    QWidget* perf_overlay = nullptr; ///< PerformanceOverlay, or Fritchii's (fritchii/perf_overlay)
 #ifdef HAS_RESHADE
     ConfigurePostProcessing* post_processing_dialog = nullptr;
 #endif

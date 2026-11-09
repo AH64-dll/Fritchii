@@ -174,6 +174,11 @@ QProgressBar#FritchiiPrepareBar { background: #1f1f24; border: none; border-radi
 QProgressBar#FritchiiPrepareBar::chunk { background: #a78bfa; border-radius: 6px; }
 QLabel#FritchiiStatusNote { color: #a78bfa; padding: 0 10px; }
 
+/* In-game control strip (fritchii/game_controls.cpp) */
+QToolButton#FritchiiStripButton { background: transparent; border: none; border-radius: 10px; }
+QToolButton#FritchiiStripButton:hover { background: #2b2640; }
+QToolButton#FritchiiStripButton:pressed { background: #3a3156; }
+
 /* Home and rail (fritchii/home.cpp) */
 QWidget#FritchiiRail { background: #0c0c0e; }
 QToolButton#FritchiiRailButton {
