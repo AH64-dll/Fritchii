@@ -929,7 +929,9 @@ void MaskKeyedAttributeTypes(GraphicsPipelineCacheKey& key, std::span<const File
 bool CanonicalKeys() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_CANONICAL_KEYS");
-        const bool on = value != nullptr && value[0] == '1';
+        // On by default since 2026-11-09: the precompiled fast path needs the draws' keys in the
+        // recipe's canonical form (without it 425-566 OoT keys a window missed). =0 turns it off.
+        const bool on = value == nullptr || value[0] != '0';
         if (on) {
             LOG_INFO(Render_Vulkan, "EDEN_NX2_CANONICAL_KEYS=1: native pipeline keys are canonical "
                                     "(blend state of attachments without blending, attachments "
@@ -948,7 +950,11 @@ bool CanonicalKeys() {
 int PrecompiledFastMode() {
     static const int mode = [] {
         const char* value = std::getenv("EDEN_NX2_PRECOMPILED_FAST");
-        const int parsed = value == nullptr ? 0 : value[0] == '1' ? 1 : value[0] == '2' ? 2 : 0;
+        // 1 by default since 2026-11-09 (owner: extra disk OK if no fps or RAM cost): OoT empty
+        // cache, precompile + fast path vs precompile only: GPU-thread pipeline time 3133 -> 44 ms,
+        // translation 1884 -> 2 ms, load 75 -> 58 s; audit 989 compared, 0 differ; index 10.2 MB,
+        // working set 11.6 -> 11.3 GB. =0 off, =2 audit.
+        const int parsed = value == nullptr ? 1 : value[0] == '0' ? 0 : value[0] == '2' ? 2 : 1;
         if (parsed != 0) {
             LOG_INFO(Render_Vulkan,
                      "EDEN_NX2_PRECOMPILED_FAST={}: precompiled pipelines are drawn from the "
