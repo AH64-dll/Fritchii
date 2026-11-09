@@ -790,6 +790,7 @@ void PinHostThread(HostThreadRole role, size_t index) {
         KAFFINITY back{};
         KAFFINITY worker{};
         std::array<KAFFINITY, 8> guest{};
+        KAFFINITY background{};
     };
     static const Layout layout = [] {
         Layout result{};
@@ -867,6 +868,12 @@ void PinHostThread(HostThreadRole role, size_t index) {
             }
             result.guest[i] = mask != 0 ? mask : all & ~gpu_mask;
         }
+        // EDEN_NX2_PIN_BACKGROUND=0 leaves background workers anywhere.
+        if (const char* value = std::getenv("EDEN_NX2_PIN_BACKGROUND");
+            value == nullptr || value[0] != '0') {
+            result.background = (result.front | result.back) != 0 ? all & ~(result.front | result.back)
+                                                                  : 0;
+        }
         LOG_INFO(Common, "Host thread pinning: front {:#x} back {:#x} worker {:#x} guest {:#x}",
                  result.front, result.back, result.worker, fmt::join(result.guest, " "));
         return result;
@@ -885,6 +892,9 @@ void PinHostThread(HostThreadRole role, size_t index) {
     case HostThreadRole::GuestCore:
         mask = index < layout.guest.size() ? layout.guest[index] : 0;
         break;
+    case HostThreadRole::Background:
+        mask = layout.background;
+        break;
     }
     if (mask != 0) {
         SetThreadAffinityMask(GetCurrentThread(), mask);
@@ -896,6 +906,9 @@ void PinHostThread(HostThreadRole role, size_t index) {
 }
 
 void SetCurrentThreadToEfficiencyCores() {
+#ifdef _WIN32
+    PinHostThread(HostThreadRole::Background);
+#endif
 #if defined(__ANDROID__)
     if (ADPF::AddCurrentThread(ADPF::Session::Background)) {
         SetCurrentThreadCoreGroup(CoreGroup::Unrestricted);
@@ -910,6 +923,9 @@ void SetCurrentThreadToEfficiencyCores() {
 }
 
 void SetCurrentThreadToBackgroundWork() {
+#ifdef _WIN32
+    PinHostThread(HostThreadRole::Background);
+#endif
 #if defined(__ANDROID__)
     ADPF::AddCurrentThread(ADPF::Session::Background);
     SetCurrentThreadCoreGroup(CoreGroup::Unrestricted);

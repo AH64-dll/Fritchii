@@ -160,6 +160,18 @@ public:
 
         // Allocate backing file map
         backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, SEC_COMMIT, backing_size, nullptr, nullptr, 0);
+        // Device build: the backing is committed in one request (14 GiB for a Switch 2 program).
+        // With a browser and chat open, a 23 GiB laptop's commit charge can leave less than that
+        // free; Windows then refuses the request and grows the system-managed page file only
+        // afterwards, and the emulator runs without fastmem (slower guest memory access). Retry
+        // while the page file grows, for up to about 4 s.
+        for (int attempt = 1; !backing_handle && attempt <= 8; ++attempt) {
+            LOG_WARNING(HW_Memory,
+                        "Could not commit {} MiB of backing memory (error {}), retrying ({}/8)",
+                        backing_size >> 20, GetLastError(), attempt);
+            Sleep(500);
+            backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, SEC_COMMIT, backing_size, nullptr, nullptr, 0);
+        }
         if (!backing_handle) {
             LOG_CRITICAL(HW_Memory, "Failed to allocate {} MiB of backing memory", backing_size >> 20);
             return false;

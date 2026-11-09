@@ -126,7 +126,9 @@ void PinCurrentThread(PinnedRole role);
 /// guest cores keep off them, so no heavy thread shares their core; the guest cores float over
 /// cores 0 and 4-7. EDEN_NX2_PIN_CORES and EDEN_NX2_PIN_GUEST set the layout (thread.cpp).
 /// `index`: the guest core.
-enum class HostThreadRole : u32 { GpuFront, GpuBack, VulkanWorker, GuestCore };
+/// Background: shader/pipeline builders and other low priority workers, kept off the GPU threads'
+/// physical cores (device build: a busy SMT sibling slowed the GPU threads on a 6-core Ryzen).
+enum class HostThreadRole : u32 { GpuFront, GpuBack, VulkanWorker, GuestCore, Background };
 void PinHostThread(HostThreadRole role, size_t index = 0);
 
 void RefreshThreadPolicies();

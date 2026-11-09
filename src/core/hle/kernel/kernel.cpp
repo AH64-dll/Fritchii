@@ -62,6 +62,36 @@ namespace {
 constinit thread_local KThread* t_nx2_current_thread = nullptr;
 constinit thread_local u8 t_nx2_host_thread_id = UINT8_MAX;
 
+// Guest threads run on fibers that can resume on another host thread (a KThread preempted on
+// core 0's host thread may be scheduled next on core 2's). LLVM treats a thread_local's address as
+// constant within a function, so once these accessors are inlined (ThinLTO inlines them into
+// KScheduler and KThread), an address computed before a fiber switch is reused after it and reads
+// the previous host thread's slot: the wrong KThread gets its dispatch count changed, and
+// Ocarina of Time aborts at boot (svcBreak 0xE401 on build-2's clang-cl ThinLTO release). Each
+// access goes through a function that is never inlined, so it computes the address on the host
+// thread it runs on.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define NX2_TLS_NOINLINE __declspec(noinline)
+#else
+#define NX2_TLS_NOINLINE __attribute__((noinline))
+#endif
+
+NX2_TLS_NOINLINE KThread* LoadFastCurrentThread() {
+    return t_nx2_current_thread;
+}
+
+NX2_TLS_NOINLINE void StoreFastCurrentThread(KThread* thread) {
+    t_nx2_current_thread = thread;
+}
+
+NX2_TLS_NOINLINE u8 LoadFastHostThreadId() {
+    return t_nx2_host_thread_id;
+}
+
+NX2_TLS_NOINLINE void StoreFastHostThreadId(u8 id) {
+    t_nx2_host_thread_id = id;
+}
+
 bool FastTlsEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_FAST_TLS");
@@ -406,14 +436,14 @@ struct KernelCore::Impl {
         // The first four slots are reserved for CPU core threads
         ASSERT(core_id < Core::Hardware::NUM_CPU_CORES);
         tls_data.host_thread_id = u8(core_id);
-        t_nx2_host_thread_id = u8(core_id);
+        StoreFastHostThreadId(u8(core_id));
         return tls_data.host_thread_id;
     }
 
     /// Gets the host thread ID for the caller
     u32 GetHostThreadId() const {
         if (fast_tls) {
-            return t_nx2_host_thread_id;
+            return LoadFastHostThreadId();
         }
         return tls_data.host_thread_id;
     }
@@ -467,13 +497,13 @@ struct KernelCore::Impl {
 
     KThread* GetCurrentEmuThread(ThreadLocalData& t) {
         if (fast_tls) {
-            if (KThread* const cached = t_nx2_current_thread; cached != nullptr) [[likely]] {
+            if (KThread* const cached = LoadFastCurrentThread(); cached != nullptr) [[likely]] {
                 return cached;
             }
             if (t.current_thread == nullptr) {
                 t.current_thread = GetHostDummyThread(t, nullptr);
             }
-            t_nx2_current_thread = t.current_thread;
+            StoreFastCurrentThread(t.current_thread);
             return t.current_thread;
         }
         return t.current_thread ? t.current_thread : (t.current_thread = GetHostDummyThread(t, nullptr));
@@ -481,7 +511,7 @@ struct KernelCore::Impl {
 
     void SetCurrentEmuThread(KThread* thread) {
         tls_data.current_thread = thread;
-        t_nx2_current_thread = thread;
+        StoreFastCurrentThread(thread);
     }
 
     void DeriveInitialMemoryLayout() {
