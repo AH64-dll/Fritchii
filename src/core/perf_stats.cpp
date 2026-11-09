@@ -114,8 +114,9 @@ void RecordGameFrameInterval() {
     std::sort(v.begin(), v.end());
     const size_t n = v.size();
     const double sum = std::accumulate(v.begin(), v.end(), 0.0);
-    const auto over = [&v](double ms) {
-        return static_cast<size_t>(v.end() - std::upper_bound(v.begin(), v.end(), ms));
+    const auto over = [](double ms) {
+        auto& iv = log.intervals_ms;
+        return static_cast<size_t>(iv.end() - std::upper_bound(iv.begin(), iv.end(), ms));
     };
     LOG_INFO(Core,
              "Frame pacing: {} frames in {:.1f} s, avg {:.2f} ms, p50 {:.2f}, p95 {:.2f}, p99 {:.2f}, "
