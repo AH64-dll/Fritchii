@@ -4168,7 +4168,9 @@ std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
     // found by). Not the exe nor the EDEN_NX2_ switches (2026-11-09, owner: every dev build and
     // every test switch prepared again): whether this build and its switches translate the
     // kept pipelines the same is checked at boot on a sample of them (CheckKeptSample).
-    return fmt::format("{}kept NX2KEPT2 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
+    // NX2KEPT3: the SPIR-V emitter changed under kept modules (zortos293/Lichii#902 clip
+    // distances, #820 noperspective varyings), which the sample only sees if it hits one.
+    return fmt::format("{}kept NX2KEPT3 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
                        "{}\n",
                        prepared_stamp, CACHE_VERSION, SpirvSettingsStamp(),
                        device.IsExtGraphicsPipelineLibrarySupported() ? 1 : 0,
