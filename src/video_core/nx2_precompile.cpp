@@ -6,15 +6,18 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <mutex>
+#include <span>
 #include <string>
 #include <system_error>
 #include <thread>
 
 #include <fmt/format.h>
 
+#include "common/cityhash.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "core/file_sys/nx2_shader_extract.h"
@@ -40,15 +43,43 @@ std::string FileStamp(const std::filesystem::path& path) {
     return fmt::format("{} {}", size, time.time_since_epoch().count());
 }
 
-/// <file>.recipe.txt: the recipe a precompiled file was assembled from, and its stamp then.
+/// <file>.recipe.txt: the recipe a precompiled file was assembled from, by its size and the
+/// hash of its bytes. Not its path nor its time: a recipe beside the exe moves with every build
+/// folder, and a rewritten file there would change the precompiled file's time, which the
+/// prepared stamp holds (the whole preparation would run again for the same pipelines).
 std::filesystem::path SourcePath(const std::filesystem::path& precompiled) {
     auto path = precompiled;
     path += ".recipe.txt";
     return path;
 }
 
-std::string SourceText(const std::filesystem::path& recipe) {
+std::string SourceText(const Recipe& recipe) {
+    return fmt::format("recipe {} {:016x}\n", recipe.size, recipe.content_hash);
+}
+
+/// The note as builds before 2026-11-09 wrote it: the recipe's path and its size and time.
+std::string LegacySourceText(const std::filesystem::path& recipe) {
     return fmt::format("{}\n{}\n", Common::FS::PathToUTF8String(recipe), FileStamp(recipe));
+}
+
+/// Whether the file at `path` holds exactly `bytes`.
+bool SameBytes(const std::filesystem::path& path, std::span<const u8> bytes) {
+    std::error_code error;
+    if (std::filesystem::file_size(path, error) != bytes.size() || error) {
+        return false;
+    }
+    std::ifstream file(path, std::ios::binary);
+    std::vector<char> chunk(size_t{1} << 20);
+    size_t at = 0;
+    while (at < bytes.size()) {
+        const size_t wanted = std::min(chunk.size(), bytes.size() - at);
+        if (!file.read(chunk.data(), static_cast<std::streamsize>(wanted)) ||
+            std::memcmp(chunk.data(), bytes.data() + at, wanted) != 0) {
+            return false;
+        }
+        at += wanted;
+    }
+    return true;
 }
 
 std::optional<std::vector<u8>> ReadWholeFile(const std::filesystem::path& path) {
@@ -151,7 +182,9 @@ std::optional<Recipe> FindRecipe(u64 title_id, const std::filesystem::path& titl
                         Common::FS::PathToUTF8String(path), header->cache_version, cache_version);
             continue;
         }
-        return Recipe{path, *header};
+        return Recipe{path, *header, bytes->size(),
+                      Common::CityHash64(reinterpret_cast<const char*>(bytes->data()),
+                                         bytes->size())};
     }
     return std::nullopt;
 }
@@ -181,7 +214,14 @@ std::filesystem::path EnsurePrecompiledFile(u64 title_id, const std::filesystem:
             return precompiled;
         }
         const std::string previous{std::istreambuf_iterator<char>(note), {}};
-        if (previous == SourceText(recipe->path)) {
+        if (previous == SourceText(*recipe)) {
+            return precompiled;
+        }
+        if (previous == LegacySourceText(recipe->path)) {
+            // The same recipe, noted the old way: noted again, the file stays.
+            note.close();
+            std::ofstream rewritten(SourcePath(precompiled), std::ios::binary | std::ios::trunc);
+            rewritten << SourceText(*recipe);
             return precompiled;
         }
         LOG_INFO(Render_Vulkan, "Precompiled pipelines: {} changed, assembling it again",
@@ -226,6 +266,16 @@ std::filesystem::path EnsurePrecompiledFile(u64 title_id, const std::filesystem:
     if (stop.stop_requested() || assembled.empty()) {
         return {};
     }
+    if (have_file && SameBytes(precompiled, assembled)) {
+        // The same file again (the recipe was copied or moved, not changed): it is left as it
+        // is, so its time and the preparation made for it stay valid.
+        std::ofstream note(SourcePath(precompiled), std::ios::binary | std::ios::trunc);
+        note << SourceText(*recipe);
+        LOG_INFO(Render_Vulkan,
+                 "Precompiled pipelines: {} assembled again in {:.1f} s, the same as before: kept",
+                 precompiled.filename().string(), seconds());
+        return precompiled;
+    }
     // The file is large (Ocarina of Time: 1.17 GB); a full disk must not end with half of one.
     const auto space = std::filesystem::space(title_dir, error);
     if (!error && space.available < assembled.size() + (u64{512} << 20)) {
@@ -258,7 +308,7 @@ std::filesystem::path EnsurePrecompiledFile(u64 title_id, const std::filesystem:
     }
     {
         std::ofstream note(SourcePath(precompiled), std::ios::binary | std::ios::trunc);
-        note << SourceText(recipe->path);
+        note << SourceText(*recipe);
     }
     LOG_INFO(Render_Vulkan,
              "Precompiled pipelines: assembled {} ({} MB) in {:.1f} s: {} pipelines, {} programs "
