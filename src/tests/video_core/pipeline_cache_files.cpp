@@ -52,11 +52,6 @@ std::string Header(u32 version) {
            std::string(reinterpret_cast<const char*>(&version), sizeof(version));
 }
 
-std::string Header(u32 version) {
-    return std::string(Magic.data(), Magic.size()) +
-           std::string(reinterpret_cast<const char*>(&version), sizeof(version));
-}
-
 // Merge tests use records of a key, a size and that many bytes.
 std::string Record(u32 key, std::string_view body) {
     std::string record(reinterpret_cast<const char*>(&key), sizeof(key));

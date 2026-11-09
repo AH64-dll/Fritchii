@@ -1937,6 +1937,18 @@ private:
             const char* value = std::getenv("EDEN_NX2_SWAP_INTERVAL");
             return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
         }();
+        // EDEN_NX2_TARGET_FPS=<fps> holds the game at that rate: 36 on a 144 Hz panel is four
+        // refreshes a frame. It only lengthens the interval (the genlock below then makes it whole
+        // refreshes), and it replaces Ocarina's 30 FPS mode.
+        static const double target_fps = [] {
+            const char* value = std::getenv("EDEN_NX2_TARGET_FPS");
+            const double fps = value ? std::strtod(value, nullptr) : 0.0;
+            if (fps > 0.0) {
+                LOG_INFO(Service, "nx2:vi2 frame rate target {:.1f} FPS (EDEN_NX2_TARGET_FPS)",
+                         fps);
+            }
+            return fps > 0.0 ? fps : 0.0;
+        }();
         const bool mkw_dynamic =
             process != nullptr && process->GetProgramId() == Settings::MarioKartWorldProgramId &&
             process->IsMkwDynamicFpsPatchApplied() && Settings::values.mkw_dynamic_fps.GetValue();
@@ -1950,8 +1962,8 @@ private:
         // Ocarina of Time's 30 FPS mode (lower-end PCs): two vblanks a frame. Its frame step
         // follows the time measured (Dynamic FPS by Dark), so it keeps full speed.
         constexpr u64 OcarinaOfTimeId = 0x0400486024DEC000ULL;
-        if (process != nullptr && process->GetProgramId() == OcarinaOfTimeId &&
-            Settings::values.oot_30fps.GetValue()) {
+        if (target_fps == 0.0 && process != nullptr &&
+            process->GetProgramId() == OcarinaOfTimeId && Settings::values.oot_30fps.GetValue()) {
             swap_interval = (std::max)(swap_interval, 2U);
         }
         const u32 refresh_rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
@@ -1970,6 +1982,10 @@ private:
         }
         auto interval = std::chrono::nanoseconds{
             100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
+        if (target_fps > 0.0) {
+            interval = (std::max)(interval, std::chrono::nanoseconds{static_cast<long long>(
+                                                1e11 / (target_fps * Settings::SpeedLimit()))});
+        }
         // Genlock: with the host frame pacer on, a frame period within 1% of a whole number of
         // display refreshes becomes exactly that many measured refreshes (a "120 Hz" display at
         // 119.98 Hz: 33.3389 ms instead of 33.3333). On the game's own clock its frames drifted

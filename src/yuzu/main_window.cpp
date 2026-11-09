@@ -9,6 +9,7 @@
 #endif
 
 #include <boost/algorithm/string/split.hpp>
+#include <cstdlib>
 #include "common/fs/path_util.h"
 #include "common/game_presets.h"
 #include "common/shutdown_progress.h"
@@ -5256,6 +5257,15 @@ void MainWindow::UpdateStatusBar() {
     game_fps_label->setText(fpsText);
 
     emu_frametime_label->setText(tr("Frame: %1 ms").arg(results.frametime * 1000.0, 0, 'f', 2));
+    static const bool log_fps = [] {
+        const char* value = std::getenv("EDEN_NX2_FPS_LOG");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (log_fps) {
+        LOG_INFO(Frontend, "FPS: {:.1f} speed: {:.0f}% frametime: {:.2f} ms",
+                 results.average_game_fps, results.emulation_speed * 100.0,
+                 results.frametime * 1000.0);
+    }
 
     res_scale_label->setVisible(true);
     emu_speed_label->setVisible(!Settings::values.use_multi_core.GetValue());
