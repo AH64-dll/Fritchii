@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -194,6 +195,21 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
     }
 
     const auto wait_with_frame_pacing = [this, may_flush] {
+    // EDEN_NX2_TARGET_FPS=<fps> overrides the frame pacing target, for rates that divide the
+    // display refresh evenly (36 or 48 on a 144 Hz panel; a Dynamic FPS add-on keeps game speed
+    // right at any rate).
+    static const double target_fps_override = [] {
+        const char* v = std::getenv("EDEN_NX2_TARGET_FPS");
+        const double fps = v != nullptr ? std::atof(v) : 0.0;
+        if (fps > 0.0) {
+            LOG_INFO(Render_Vulkan, "Frame pacing target overridden: {:.1f} FPS", fps);
+        }
+        return fps;
+    }();
+    if (target_fps_override > 0.0) {
+        scheduler.Wait(resource_ticks[image_index], target_fps_override, may_flush);
+        return;
+    }
     switch (Settings::values.frame_pacing_mode.GetValue()) {
     case Settings::FramePacingMode::Target_Auto:
         scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);

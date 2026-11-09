@@ -166,7 +166,10 @@ add_library(
 # spelling both clang and clang-cl accept; it overrides -fprofile-use from CMAKE_CXX_FLAGS.
 set_source_files_properties(zbic_compression.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${ZBIC_INCLUDE_DIR}"
-    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wno-unused-function;-Wno-missing-declarations;-Wno-shadow>;$<$<CXX_COMPILER_ID:MSVC>:/wd4505;/wd5245>;$<$<CXX_COMPILER_ID:AppleClang,Clang>:-fno-profile-instr-use>")
+    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wno-unused-function;-Wno-missing-declarations;-Wno-shadow>;$<$<CXX_COMPILER_ID:MSVC>:/wd4505;/wd5245>;$<$<CXX_COMPILER_ID:AppleClang,Clang>:-fno-profile-instr-use;-fno-profile-generate;-fno-lto>")
+# An instrumented (-fprofile-generate) ZBIC decoder fails every frame with "Data corruption
+# detected" (ZBIC round trip, clang 23, both -march=x86-64-v2 and znver4; plain zstd and
+# uninstrumented ZBIC are fine), so a training build cannot load the main NSO.
 
 if(WIN32)
     target_sources(common PRIVATE windows/timer_resolution.cpp

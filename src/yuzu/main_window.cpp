@@ -9,6 +9,7 @@
 #endif
 
 #include <QSysInfo>
+#include <cstdlib>
 #include <boost/algorithm/string/split.hpp>
 #include "common/fs/path_util.h"
 #include "common/game_presets.h"
@@ -5074,6 +5075,17 @@ void MainWindow::UpdateStatusBar() {
     game_fps_label->setText(fpsText);
 
     emu_frametime_label->setText(tr("Frame: %1 ms").arg(results.frametime * 1000.0, 0, 'f', 2));
+    // EDEN_NX2_FPS_LOG=1 writes the status-bar numbers to the log twice a second, for
+    // benchmarking without screenshots.
+    static const bool log_fps = [] {
+        const char* v = std::getenv("EDEN_NX2_FPS_LOG");
+        return v != nullptr && v[0] != 0 && v[0] != '0';
+    }();
+    if (log_fps) {
+        LOG_INFO(Frontend, "FPS: {:.1f} speed: {:.0f}% frametime: {:.2f} ms",
+                 results.average_game_fps, results.emulation_speed * 100.0,
+                 results.frametime * 1000.0);
+    }
 
     const auto frame_gen = QtCommon::system->GPU().Renderer().GetFrameGenStatus();
     frame_gen_generating = frame_gen.generated_frames > frame_gen_frames;

@@ -141,6 +141,7 @@ public:
 
 #ifdef _WIN32
     void SetTimerResolutionNs(std::chrono::nanoseconds ns);
+    void CoarseSleep(s64 deadline_ns);
 #endif
 
     struct Event;

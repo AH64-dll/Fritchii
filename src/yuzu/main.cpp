@@ -81,8 +81,27 @@ static Qt::HighDpiScaleFactorRoundingPolicy GetHighDpiRoundingPolicy() {
 #endif
 }
 
+#ifdef LICHII_PGO_GENERATE
+#include <chrono>
+#include <thread>
+extern "C" int __llvm_profile_write_file(void);
+// Instrumented (training) build: writes the profile every 20 s, so a session that ends in a kill
+// or a crash still leaves its counters (LLVM_PROFILE_FILE names the file).
+static void StartProfileDumper() {
+    std::thread([] {
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(20));
+            __llvm_profile_write_file();
+        }
+    }).detach();
+}
+#endif
+
 int main(int argc, char* argv[]) {
     LoadNx2Switches(argv[0]);
+#ifdef LICHII_PGO_GENERATE
+    StartProfileDumper();
+#endif
 #if YUZU_ROOM
     bool launch_room = false;
     for (int i = 1; i < argc; i++) {

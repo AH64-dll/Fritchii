@@ -6,16 +6,19 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <iterator>
 #include <mutex>
 #include <numeric>
 #include <sstream>
 #include <thread>
+#include <vector>
 #include <fmt/chrono.h>
 #include <fmt/ranges.h>
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/logging.h"
 #include "common/settings.h"
 #include "core/perf_stats.h"
 
@@ -83,8 +86,57 @@ void PerfStats::EndSystemFrame() {
     previous_frame_end = frame_end;
 }
 
+namespace {
+// EDEN_NX2_STUTTER_LOG=1 logs the spread of game frame intervals every 5 s, so single long frames
+// (stutters) show up instead of disappearing in the half-second average.
+struct StutterLog {
+    std::mutex mutex;
+    std::chrono::steady_clock::time_point last{};
+    std::chrono::steady_clock::time_point window_start{};
+    std::vector<double> intervals_ms;
+};
+
+void RecordGameFrameInterval() {
+    static StutterLog log;
+    const auto now = std::chrono::steady_clock::now();
+    std::scoped_lock lock{log.mutex};
+    if (log.last == std::chrono::steady_clock::time_point{}) {
+        log.last = now;
+        log.window_start = now;
+        return;
+    }
+    log.intervals_ms.push_back(std::chrono::duration<double, std::milli>(now - log.last).count());
+    log.last = now;
+    if (now - log.window_start < std::chrono::seconds{5}) {
+        return;
+    }
+    auto& v = log.intervals_ms;
+    std::sort(v.begin(), v.end());
+    const size_t n = v.size();
+    const double sum = std::accumulate(v.begin(), v.end(), 0.0);
+    const auto over = [](double ms) {
+        auto& iv = log.intervals_ms;
+        return static_cast<size_t>(iv.end() - std::upper_bound(iv.begin(), iv.end(), ms));
+    };
+    LOG_INFO(Core,
+             "Frame pacing: {} frames in {:.1f} s, avg {:.2f} ms, p50 {:.2f}, p95 {:.2f}, p99 {:.2f}, "
+             "max {:.1f}; over 40 ms: {}, over 67 ms: {}, over 100 ms: {}",
+             n, sum / 1000.0, sum / static_cast<double>(n), v[n / 2], v[(n * 95) / 100],
+             v[(std::min)(n - 1, (n * 99) / 100)], v.back(), over(40.0), over(67.0), over(100.0));
+    v.clear();
+    log.window_start = now;
+}
+} // namespace
+
 void PerfStats::EndGameFrame() {
     game_frames.fetch_add(1, std::memory_order_relaxed);
+    static const bool stutter_log = [] {
+        const char* v = std::getenv("EDEN_NX2_STUTTER_LOG");
+        return v != nullptr && v[0] != 0 && v[0] != '0';
+    }();
+    if (stutter_log) {
+        RecordGameFrameInterval();
+    }
 }
 
 double PerfStats::GetMeanFrametime() const {

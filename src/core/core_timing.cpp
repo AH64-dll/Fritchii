@@ -12,6 +12,9 @@
 #include "common/cpu_features.h"
 
 #ifdef _WIN32
+#include <windows.h>
+#undef CreateEvent
+#include <cstdlib>
 #include "common/windows/timer_resolution.h"
 #endif
 
@@ -60,6 +63,50 @@ struct CoreTiming::Event {
     }
 };
 
+#ifdef _WIN32
+// Event::WaitFor spins in MWAITX for the whole wait, so the HostTiming thread holds a logical
+// processor at 100% that the guest cores and the GPU threads need (Ryzen 5 8645HS, 6 cores).
+// Long waits sleep on a high resolution waitable timer instead, in chunks of at most
+// EDEN_NX2_TIMING_CHUNK_US (default 500) so an earlier event scheduled meanwhile (event.Set) is
+// late by no more than a chunk; the last EDEN_NX2_TIMING_SPIN_US (default 300) are left to the
+// precise MWAITX wait. EDEN_NX2_TIMING_SLEEP=0 restores the plain wait.
+void CoreTiming::CoarseSleep(s64 deadline_ns) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("EDEN_NX2_TIMING_SLEEP");
+        return v == nullptr || v[0] != '0';
+    }();
+    static const s64 spin_ns = [] {
+        const char* v = std::getenv("EDEN_NX2_TIMING_SPIN_US");
+        return (v ? std::atoll(v) : 300) * 1000;
+    }();
+    static const s64 chunk_ns = [] {
+        const char* v = std::getenv("EDEN_NX2_TIMING_CHUNK_US");
+        return (v ? std::atoll(v) : 500) * 1000;
+    }();
+    if (!enabled) {
+        return;
+    }
+    thread_local HANDLE timer = CreateWaitableTimerExW(
+        nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (timer == nullptr) {
+        return;
+    }
+    while (!event.IsSet() && !paused) {
+        const s64 left = deadline_ns - GetGlobalTimeNs().count();
+        if (left <= spin_ns) {
+            break;
+        }
+        const s64 chunk = (std::min)(left - spin_ns, chunk_ns);
+        LARGE_INTEGER due;
+        due.QuadPart = -static_cast<LONGLONG>((std::max<s64>)(chunk / 100, 1));
+        if (!SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) {
+            break;
+        }
+        WaitForSingleObject(timer, INFINITE);
+    }
+}
+#endif
+
 CoreTiming::CoreTiming() = default;
 CoreTiming::~CoreTiming() {
     Reset();
@@ -86,7 +133,15 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
                         // There are more events left in the queue, wait until the next event.
                         auto const wait_time = *next_time - GetGlobalTimeNs().count();
                         if (wait_time > 0) {
+#ifdef _WIN32
+                            CoarseSleep(*next_time);
+                            const auto left = *next_time - GetGlobalTimeNs().count();
+                            if (left > 0) {
+                                event.WaitFor(std::chrono::nanoseconds(left));
+                            }
+#else
                             event.WaitFor(std::chrono::nanoseconds(wait_time));
+#endif
                         }
                     } else {
                         // Queue is empty, wait until another event is scheduled and signals us to

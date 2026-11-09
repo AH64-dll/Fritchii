@@ -112,7 +112,9 @@ void SetCurrentThreadToEfficiencyCores();
 void SetCurrentThreadToBackgroundWork();
 void SetCurrentThreadToAllCores();
 
-enum class PinnedRole : u32 { GpuFront, GpuBack, GuestCore };
+/// Background: low-priority workers (shader compilers, texture decoders); placed on the guest
+/// cores' set so a busy SMT sibling never shares the GPU threads' physical cores.
+enum class PinnedRole : u32 { GpuFront, GpuBack, GuestCore, Background };
 
 /// The experimental pin_gpu_threads setting (Windows and Linux): the split GPU thread's front and
 /// back each get a physical performance core of their own and the guest cores keep off those two.
