@@ -7,7 +7,6 @@
 #include <cstring>
 #include <istream>
 #include <streambuf>
-#include <cwchar>
 #include <string_view>
 
 #ifdef _WIN32
@@ -15,7 +14,6 @@
 #else
 #include <fcntl.h>
 #include <unistd.h>
-extern char** environ;
 #endif
 
 #include "common/cityhash.h"
@@ -28,8 +26,9 @@ namespace Vulkan::PrecompiledKept {
 namespace {
 
 // A new layout, or a Shader::Info field the serializer learns (info_serialize.cpp), needs a new
-// magic: kept files written before are then prepared again.
-constexpr std::string_view Magic{"NX2KEPT1"};
+// magic: kept files written before are then prepared again. 2: the precompiled record offsets
+// (the boot check reads each sampled record's key from them).
+constexpr std::string_view Magic{"NX2KEPT2"};
 constexpr std::string_view EndMagic{"NX2KEPTE"};
 constexpr u8 EntryInfo = 1;
 constexpr u8 EntrySpirv = 2;
@@ -112,7 +111,7 @@ std::atomic<u64>& BytesRead() {
     return bytes;
 }
 
-std::string ExeAndSwitchesStamp() {
+u64 SampleSeed() {
     std::filesystem::path exe;
 #ifdef _WIN32
     std::wstring buffer(32768, L'\0');
@@ -126,39 +125,35 @@ std::string ExeAndSwitchesStamp() {
 #endif
     std::error_code error;
     const u64 size = exe.empty() ? 0 : std::filesystem::file_size(exe, error);
-    const auto modified =
-        exe.empty() ? 0 : std::filesystem::last_write_time(exe, error).time_since_epoch().count();
-    std::vector<std::string> switches;
-#ifdef _WIN32
-    if (wchar_t* const block = GetEnvironmentStringsW()) {
-        for (const wchar_t* entry = block; *entry != L'\0'; entry += wcslen(entry) + 1) {
-            std::string text;
-            for (const wchar_t* c = entry; *c != L'\0'; ++c) {
-                text.push_back(*c < 128 ? static_cast<char>(*c) : '?');
-            }
-            switches.push_back(std::move(text));
+    const s64 modified =
+        exe.empty() ? 0
+                    : static_cast<s64>(
+                          std::filesystem::last_write_time(exe, error).time_since_epoch().count());
+    const std::array<u64, 2> identity{size, static_cast<u64>(modified)};
+    return Common::CityHash64(reinterpret_cast<const char*>(identity.data()), sizeof(identity));
+}
+
+std::vector<size_t> SamplePositions(size_t count, size_t wanted, u64 seed) {
+    std::vector<size_t> positions;
+    if (count <= wanted) {
+        positions.resize(count);
+        for (size_t i = 0; i < count; ++i) {
+            positions[i] = i;
         }
-        FreeEnvironmentStringsW(block);
+        return positions;
     }
-#else
-    for (char** entry = environ; entry && *entry; ++entry) {
-        switches.emplace_back(*entry);
+    positions.reserve(wanted);
+    for (size_t i = 0; i < wanted; ++i) {
+        // SplitMix64 of the seed and the stretch.
+        u64 z = seed + 0x9E3779B97F4A7C15ULL * (i + 1);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        z ^= z >> 31;
+        const size_t first = i * count / wanted;
+        const size_t last = (i + 1) * count / wanted;
+        positions.push_back(first + static_cast<size_t>(z % (last - first)));
     }
-#endif
-    std::erase_if(switches, [](const std::string& entry) {
-        const std::string_view text{entry};
-        return !text.starts_with("EDEN_NX2_") || text.starts_with("EDEN_NX2_PRECOMPILE") ||
-               text.starts_with("EDEN_NX2_ASYNC_") || text.starts_with("EDEN_NX2_CANONICAL_KEYS");
-    });
-    std::ranges::sort(switches);
-    std::string joined;
-    for (const std::string& entry : switches) {
-        joined += entry;
-        joined += '\n';
-    }
-    return std::to_string(size) + " " + std::to_string(modified) + " " +
-           std::to_string(switches.size()) + ":" +
-           std::to_string(Common::CityHash64(joined.data(), joined.size()));
+    return positions;
 }
 
 PositionalFile::PositionalFile(const std::filesystem::path& path) {
@@ -250,13 +245,13 @@ std::shared_ptr<const Index> Index::Load(const std::filesystem::path& kept,
         return nullptr;
     }
     if (stamp_size != stamp.size()) {
-        why = "made for another file, driver, build or settings";
+        why = "made for another file, driver, release or settings";
         return nullptr;
     }
     std::string file_stamp(stamp_size, '\0');
     if (!file.ReadAt(12, std::span(reinterpret_cast<u8*>(file_stamp.data()), stamp_size)) ||
         file_stamp != stamp) {
-        why = "made for another file, driver, build or settings";
+        why = "made for another file, driver, release or settings";
         return nullptr;
     }
     // Trailer and index.
@@ -275,7 +270,8 @@ std::shared_ptr<const Index> Index::Load(const std::filesystem::path& kept,
     }
     const u64 records_bytes = (u64{counts[0]} + counts[1]) * sizeof(Record);
     const u64 blobs_bytes = u64{counts[2]} * 16;
-    if (index_offset + 12 + records_bytes + blobs_bytes + 16 != kept_size) {
+    const u64 offsets_bytes = (u64{counts[0]} + counts[1]) * sizeof(u64);
+    if (index_offset + 12 + records_bytes + blobs_bytes + offsets_bytes + 16 != kept_size) {
         why = "damaged";
         return nullptr;
     }
@@ -293,6 +289,7 @@ std::shared_ptr<const Index> Index::Load(const std::filesystem::path& kept,
         why = "damaged";
         return nullptr;
     }
+    index->record_offsets_at = at + records_bytes + blobs_bytes;
     index->blobs.reserve(blob_entries.size());
     for (const auto& entry : blob_entries) {
         const u64 offset = u64{entry[0]} | (u64{entry[1]} << 32);
@@ -351,6 +348,29 @@ std::span<const Record> Index::Compute(u64 key_hash) const {
 size_t Index::MemoryBytes() const noexcept {
     return (graphics.capacity() + compute.capacity()) * sizeof(Record) +
            blobs.capacity() * sizeof(blobs[0]) + environments.capacity() * sizeof(environments[0]);
+}
+
+bool Index::ReadPrecompiled(u64 offset, std::span<u8> out) const {
+    if (!precompiled_file.ReadAt(offset, out)) {
+        return false;
+    }
+    BytesRead().fetch_add(out.size(), std::memory_order_relaxed);
+    return true;
+}
+
+bool Index::RecordOffset(bool compute_record, size_t position, u64& offset) const {
+    if (position >= (compute_record ? compute.size() : graphics.size())) {
+        return false;
+    }
+    const size_t slot = compute_record ? graphics.size() + position : position;
+    if (!record_offsets.empty()) {
+        if (slot >= record_offsets.size()) {
+            return false;
+        }
+        offset = record_offsets[slot];
+        return true;
+    }
+    return Get(kept_file, record_offsets_at + slot * sizeof(u64), offset);
 }
 
 bool Index::ReadBlob(u32 blob, std::vector<u8>& bytes) const {
@@ -611,9 +631,69 @@ void Writer::Flush() {
     }
 }
 
-bool Writer::Finish() {
+void Writer::SortedRecords(std::span<const u64> record_offsets, std::vector<Record>& graphics,
+                           std::vector<Record>& compute, std::vector<u64>& offsets) const {
+    std::vector<size_t> graphics_order;
+    std::vector<size_t> compute_order;
+    for (size_t index = 0; index < records.size(); ++index) {
+        if (present[index]) {
+            (records[index].kind == 1 ? compute_order : graphics_order).push_back(index);
+        }
+    }
+    const auto by_key = [this](size_t index) { return records[index].key_hash; };
+    std::ranges::stable_sort(graphics_order, {}, by_key);
+    std::ranges::stable_sort(compute_order, {}, by_key);
+    graphics.clear();
+    compute.clear();
+    offsets.clear();
+    offsets.reserve(graphics_order.size() + compute_order.size());
+    for (const size_t index : graphics_order) {
+        graphics.push_back(records[index]);
+        offsets.push_back(index < record_offsets.size() ? record_offsets[index] : 0);
+    }
+    for (const size_t index : compute_order) {
+        compute.push_back(records[index]);
+        offsets.push_back(index < record_offsets.size() ? record_offsets[index] : 0);
+    }
+}
+
+std::shared_ptr<const Index> Writer::PartIndex(
+    const std::filesystem::path& part, const std::filesystem::path& precompiled,
+    std::span<const std::pair<u64, u64>> environments, std::span<const u64> record_offsets) {
     std::scoped_lock lock{mutex};
-    if (!file.is_open() || failed) {
+    if (record_offsets.size() != records.size()) {
+        return nullptr;
+    }
+    auto index = std::make_shared<Index>(part, precompiled);
+    if (!index->kept_file.IsOpen() || !index->precompiled_file.IsOpen()) {
+        return nullptr;
+    }
+    std::vector<Record> graphics;
+    std::vector<Record> compute;
+    std::vector<u64> offsets;
+    SortedRecords(record_offsets, graphics, compute, offsets);
+    index->blobs = blobs;
+    index->environments.assign(environments.begin(), environments.end());
+    // Records a damaged log could hold are left out of the check (the finished file's index is
+    // checked whole when it is loaded).
+    std::vector<u64> compute_offsets;
+    for (size_t i = 0; i < graphics.size() + compute.size(); ++i) {
+        const bool is_compute = i >= graphics.size();
+        const Record& record = is_compute ? compute[i - graphics.size()] : graphics[i];
+        if (!ValidRecord(record, index->blobs.size(), index->environments.size())) {
+            continue;
+        }
+        (is_compute ? index->compute : index->graphics).push_back(record);
+        (is_compute ? compute_offsets : index->record_offsets).push_back(offsets[i]);
+    }
+    index->record_offsets.insert(index->record_offsets.end(), compute_offsets.begin(),
+                                 compute_offsets.end());
+    return index;
+}
+
+bool Writer::Finish(std::span<const u64> record_offsets) {
+    std::scoped_lock lock{mutex};
+    if (!file.is_open() || failed || record_offsets.size() != records.size()) {
         file.close();
         return false;
     }
@@ -622,13 +702,8 @@ bool Writer::Finish() {
     const u64 index_offset = offset;
     std::vector<Record> graphics;
     std::vector<Record> compute;
-    for (size_t index = 0; index < records.size(); ++index) {
-        if (present[index]) {
-            (records[index].kind == 1 ? compute : graphics).push_back(records[index]);
-        }
-    }
-    std::ranges::stable_sort(graphics, {}, &Record::key_hash);
-    std::ranges::stable_sort(compute, {}, &Record::key_hash);
+    std::vector<u64> offsets;
+    SortedRecords(record_offsets, graphics, compute, offsets);
     Put(file, static_cast<u32>(graphics.size()));
     Put(file, static_cast<u32>(compute.size()));
     Put(file, static_cast<u32>(blobs.size()));
@@ -643,9 +718,13 @@ bool Writer::Finish() {
         Put(file, size);
         Put(file, u32{0});
     }
+    for (const u64 record_offset : offsets) {
+        Put(file, record_offset);
+    }
     Put(file, index_offset);
     file.write(EndMagic.data(), EndMagic.size());
-    offset += 12 + (graphics.size() + compute.size()) * sizeof(Record) + blobs.size() * 16 + 16;
+    offset += 12 + (graphics.size() + compute.size()) * (sizeof(Record) + sizeof(u64)) +
+              blobs.size() * 16 + 16;
     file.flush();
     const bool ok = static_cast<bool>(file);
     file.close();

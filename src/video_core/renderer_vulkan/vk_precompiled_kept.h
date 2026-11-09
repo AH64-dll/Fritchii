@@ -12,12 +12,20 @@
 // 10 MB for 132k pipelines); every info, SPIR-V and recorded environment is read from disk with
 // a positional read when a pipeline needs it, never the whole file.
 //
-// Layout: "NX2KEPT1", u32 stamp size, the stamp, then entries: u8 1 (info) or 2 (SPIR-V, one
+// Layout: "NX2KEPT2", u32 stamp size, the stamp, then entries: u8 1 (info) or 2 (SPIR-V, one
 // zstd frame of its words), u64 content hash, u32 size, the bytes; u8 3 (record), u32 record
 // index in the precompiled file, then a Record (72 bytes); u8 4 ends the entries. Then the
 // index: u32 graphics count, u32 compute count, u32 blob count, the Records of each kind sorted
-// by key hash, per blob u64 offset, u32 size, u32 0. Last, u64 index offset and "NX2KEPTE".
+// by key hash, per blob u64 offset, u32 size, u32 0, then per Record (graphics, then compute)
+// the u64 offset of its record in the precompiled file. Last, u64 index offset and "NX2KEPTE".
 // Blob ids number the info and SPIR-V blobs together, in the order they were written.
+//
+// Validity: the stamp holds what is cheap and decisive (the prepared stamp with the release
+// version, driver and GPU, the cache version, the SPIR-V settings, graphics pipeline library
+// support, the OoT visual workaround, canonical keys). The build itself is not in it: at boot a
+// sample of the kept pipelines is translated again from their recorded environments and compared
+// word for word (PipelineCache::CheckKeptSample), so a new build whose translation is the same
+// keeps the file, and one whose translation changed prepares it again.
 
 #pragma once
 
@@ -68,11 +76,14 @@ static_assert(sizeof(Record) == 72 && std::is_trivially_copyable_v<Record> &&
 /// Bytes read from kept files and recorded environments at run time (for the 10 s line).
 std::atomic<u64>& BytesRead();
 
-/// For the kept file's stamp: the running exe's size and modification time (a local build that
-/// changes the translator without reconfiguring keeps its scm_rev), and a hash of the EDEN_NX2_
-/// switches set (EDEN_NX2_PRECOMPILE*, EDEN_NX2_ASYNC_* and EDEN_NX2_CANONICAL_KEYS left out:
-/// they do not change a translation, and the canonical keys go in the stamp on their own).
-std::string ExeAndSwitchesStamp();
+/// The seed of the boot check's sample: the running exe's size and modification time, hashed.
+/// The same build checks the same pipelines on every boot; each new build checks others, so a
+/// translation change the sample of one build misses can be found by the next.
+u64 SampleSeed();
+
+/// `wanted` positions out of `count` (all of them when there are fewer), one in each of `wanted`
+/// equal stretches of the index, picked in it from `seed`.
+std::vector<size_t> SamplePositions(size_t count, size_t wanted, u64 seed);
 
 /// A file read with positional reads, safe from several threads at once; opened so the file can
 /// still be renamed or deleted while it is open.
@@ -114,6 +125,19 @@ public:
     [[nodiscard]] bool ReadInfo(u32 blob, Shader::Info& info) const;
     [[nodiscard]] bool ReadSpirv(u32 blob, std::vector<u32>& words) const;
     [[nodiscard]] bool ReadEnvironment(u32 env, VideoCommon::FileEnvironment& out) const;
+    /// Bytes of the precompiled file (a record's environment ids and key, for the boot check).
+    [[nodiscard]] bool ReadPrecompiled(u64 offset, std::span<u8> out) const;
+
+    /// Every record of a kind, sorted by key hash (the boot check samples them).
+    [[nodiscard]] std::span<const Record> AllGraphics() const noexcept {
+        return graphics;
+    }
+    [[nodiscard]] std::span<const Record> AllCompute() const noexcept {
+        return compute;
+    }
+    /// Where the precompiled file's record of AllGraphics()[position] (compute: of
+    /// AllCompute()[position]) starts.
+    [[nodiscard]] bool RecordOffset(bool compute_record, size_t position, u64& offset) const;
 
     [[nodiscard]] size_t GraphicsCount() const noexcept {
         return graphics.size();
@@ -127,12 +151,18 @@ public:
     Index(const std::filesystem::path& kept, const std::filesystem::path& precompiled);
 
 private:
+    friend class Writer;
+
     [[nodiscard]] bool ReadBlob(u32 blob, std::vector<u8>& bytes) const;
 
     std::vector<Record> graphics; ///< Sorted by key hash
     std::vector<Record> compute;  ///< Sorted by key hash
     std::vector<std::pair<u64, u32>> blobs;        ///< Offset, size
     std::vector<std::pair<u64, u64>> environments; ///< The precompiled file's: offset, size
+    /// Where the precompiled record offsets start in the kept file (read per sampled record), or
+    /// for an unfinished file (Writer::PartIndex) the offsets themselves, graphics then compute.
+    u64 record_offsets_at{};
+    std::vector<u64> record_offsets;
     PositionalFile kept_file;
     PositionalFile precompiled_file;
 };
@@ -155,10 +185,18 @@ public:
               const std::array<std::vector<u8>, 5>& infos,
               const std::array<std::vector<u32>, 5>& spirv);
 
+    /// The records kept so far (an earlier, interrupted preparation resumed: maybe by another
+    /// build), as an index over `part` for the boot check. `environments` and `record_offsets`
+    /// are the precompiled file's environment table and where each of its records starts.
+    [[nodiscard]] std::shared_ptr<const Index> PartIndex(
+        const std::filesystem::path& part, const std::filesystem::path& precompiled,
+        std::span<const std::pair<u64, u64>> environments, std::span<const u64> record_offsets);
+
     /// Flushes the log (before a checkpoint is written).
     void Flush();
     /// Writes the index and closes the file; false when it could not be written.
-    bool Finish();
+    /// `record_offsets`: where each record of the precompiled file starts.
+    bool Finish(std::span<const u64> record_offsets);
     /// Closes the file as it is (an interrupted preparation), to be resumed.
     void Close();
 
@@ -173,6 +211,10 @@ public:
 
 private:
     bool Scan(const std::filesystem::path& part, const std::string& stamp, u64& valid_end);
+    /// The kept records of each kind sorted by key hash, and their precompiled record offsets
+    /// (graphics, then compute). Under the mutex.
+    void SortedRecords(std::span<const u64> record_offsets, std::vector<Record>& graphics,
+                       std::vector<Record>& compute, std::vector<u64>& offsets) const;
     u32 KeepBlob(u8 type, u64 hash, std::span<const u8> bytes);
 
     std::mutex mutex;
